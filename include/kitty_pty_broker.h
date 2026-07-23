@@ -1,0 +1,133 @@
+#ifndef KITTY_PTY_BROKER_H
+#define KITTY_PTY_BROKER_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define KPB_VERSION_MAJOR 0
+#define KPB_VERSION_MINOR 1
+#define KPB_VERSION_PATCH 0
+
+#define KPB_SESSION_ID_MAX 64
+#define KPB_PATH_MAX 4096
+#define KPB_COMMAND_MAX 512
+#define KPB_IO_CHUNK (32U * 1024U)
+#define KPB_DEFAULT_JOURNAL_LIMIT (64ULL * 1024ULL * 1024ULL)
+
+typedef enum {
+    KPB_OK = 0,
+    KPB_ERR_INVALID = 1,
+    KPB_ERR_SYSTEM = 2,
+    KPB_ERR_SECURITY = 3,
+    KPB_ERR_EXISTS = 4,
+    KPB_ERR_NOT_FOUND = 5,
+    KPB_ERR_BUSY = 6,
+    KPB_ERR_PROTOCOL = 7,
+    KPB_ERR_BUFFER = 8,
+    KPB_ERR_CHILD = 9
+} kpb_result;
+
+typedef struct {
+    const char *runtime_dir;
+    const char *session_id;
+    const char *cwd;
+    char *const *argv;
+    uint64_t journal_limit;
+    unsigned short rows;
+    unsigned short columns;
+    unsigned short xpixel;
+    unsigned short ypixel;
+} kpb_spawn_options;
+
+typedef struct {
+    int fd;
+    char session_id[KPB_SESSION_ID_MAX + 1];
+} kpb_connection;
+
+typedef struct {
+    char session_id[KPB_SESSION_ID_MAX + 1];
+    pid_t broker_pid;
+    pid_t child_pid;
+    pid_t foreground_pgrp;
+    uint64_t started_millis;
+    uint64_t journal_bytes;
+    uint64_t journal_epoch;
+    int attached;
+    int replay_complete;
+    unsigned short rows;
+    unsigned short columns;
+    char cwd[KPB_PATH_MAX];
+    char command[KPB_COMMAND_MAX];
+} kpb_status;
+
+typedef enum {
+    KPB_EVENT_OUTPUT = 1,
+    KPB_EVENT_REPLAY_DONE = 2,
+    KPB_EVENT_EXIT = 3,
+    KPB_EVENT_ERROR = 4
+} kpb_event_type;
+
+typedef struct {
+    kpb_event_type type;
+    size_t size;
+    int exit_status;
+} kpb_event;
+
+typedef int (*kpb_list_callback)(const kpb_status *status, void *data);
+
+void kpb_spawn_options_init(kpb_spawn_options *options);
+const char *kpb_result_string(kpb_result result);
+int kpb_protocol_version(void);
+
+kpb_result kpb_generate_session_id(char output[KPB_SESSION_ID_MAX + 1]);
+kpb_result kpb_validate_session_id(const char *session_id);
+kpb_result kpb_prepare_runtime(const char *runtime_dir);
+
+kpb_result kpb_spawn(const kpb_spawn_options *options, kpb_status *status);
+kpb_result kpb_attach(
+    const char *runtime_dir,
+    const char *session_id,
+    unsigned short rows,
+    unsigned short columns,
+    unsigned short xpixel,
+    unsigned short ypixel,
+    kpb_connection *connection
+);
+kpb_result kpb_send_input(kpb_connection *connection, const void *data, size_t size);
+kpb_result kpb_resize(
+    kpb_connection *connection,
+    unsigned short rows,
+    unsigned short columns,
+    unsigned short xpixel,
+    unsigned short ypixel
+);
+kpb_result kpb_receive(
+    kpb_connection *connection,
+    void *buffer,
+    size_t capacity,
+    kpb_event *event
+);
+void kpb_detach(kpb_connection *connection);
+
+kpb_result kpb_query_status(
+    const char *runtime_dir,
+    const char *session_id,
+    kpb_status *status
+);
+kpb_result kpb_terminate(const char *runtime_dir, const char *session_id);
+kpb_result kpb_list(
+    const char *runtime_dir,
+    kpb_list_callback callback,
+    void *data
+);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
