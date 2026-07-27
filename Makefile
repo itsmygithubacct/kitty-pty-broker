@@ -11,6 +11,7 @@ LDLIBS += -lutil
 
 LIB_OBJECT := $(BUILD_DIR)/kitty_pty_broker.o
 CLI_OBJECT := $(BUILD_DIR)/main.o
+TUI_OBJECT := $(BUILD_DIR)/tui.o
 TEST_OBJECT := $(BUILD_DIR)/test_broker.o
 STATIC_LIB := $(BUILD_DIR)/libkitty-pty-broker.a
 SHARED_LIB := $(BUILD_DIR)/libkitty-pty-broker.so
@@ -30,6 +31,9 @@ $(LIB_OBJECT): src/kitty_pty_broker.c src/protocol.h include/kitty_pty_broker.h 
 $(CLI_OBJECT): src/main.c include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
+$(TUI_OBJECT): src/tui.c src/tui.h include/kitty_pty_broker.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
+
 $(TEST_OBJECT): tests/test_broker.c include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
@@ -39,13 +43,13 @@ $(STATIC_LIB): $(LIB_OBJECT)
 $(SHARED_LIB): $(LIB_OBJECT)
 	$(CC) -shared $(LDFLAGS) -Wl,-soname,libkitty-pty-broker.so -o "$@" "$<" $(LDLIBS)
 
-$(CLI): $(CLI_OBJECT) $(SHARED_LIB)
-	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(CLI_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
+$(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB)
+	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(CLI_OBJECT) $(TUI_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
 $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(TEST_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
-test: $(TEST)
+test: $(TEST) $(CLI)
 	"$(TEST)"
 
 sanitize:

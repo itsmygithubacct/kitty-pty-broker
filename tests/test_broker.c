@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pty.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -170,6 +171,116 @@ test_terminate(void) {
     CHECK(!"terminated session disappeared");
 }
 
+static size_t
+read_pty_until(
+    int fd,
+    unsigned char *output,
+    size_t used,
+    size_t capacity,
+    const char *needle
+) {
+    size_t needle_size = strlen(needle);
+    while (!memmem(output, used, needle, needle_size)) {
+        ssize_t count;
+        wait_readable(fd);
+        count = read(fd, output + used, capacity - used);
+        CHECK(count > 0);
+        used += (size_t)count;
+        CHECK(used < capacity);
+    }
+    return used;
+}
+
+static void
+test_tui(void) {
+    static const char injected[] = "\033]KPB_INJECT";
+    char *command[] = {
+        "/bin/sh", "-c",
+        "trap '' TERM; while :; do sleep 1; done # \033]KPB_INJECT",
+        NULL
+    };
+    char cli_path[KPB_PATH_MAX];
+    const char *slash;
+    size_t directory_size;
+    kpb_spawn_options options;
+    kpb_status status;
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    size_t used = 0;
+    int master;
+    int wait_status;
+    pid_t child;
+
+    slash = strrchr(test_program_path, '/');
+    CHECK(slash != NULL);
+    directory_size = (size_t)(slash - test_program_path);
+    CHECK(directory_size + sizeof "/kitty-pty-broker" < sizeof cli_path);
+    memcpy(cli_path, test_program_path, directory_size);
+    memcpy(
+        cli_path + directory_size,
+        "/kitty-pty-broker",
+        sizeof "/kitty-pty-broker"
+    );
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "tui-session";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(
+            cli_path,
+            cli_path,
+            "--runtime-dir",
+            runtime_dir,
+            "tui",
+            (char *)NULL
+        );
+        _exit(127);
+    }
+    used = read_pty_until(
+        master, output, used, sizeof output, "Kilix PTY Sessions"
+    );
+    used = read_pty_until(
+        master, output, used, sizeof output, "tui-session"
+    );
+    CHECK(memmem(output, used, injected, sizeof injected - 1U) == NULL);
+
+    /* A split arrow-key escape sequence must not be mistaken for quit. */
+    CHECK(write(master, "\033", 1) == 1);
+    usleep(10000);
+    CHECK(write(master, "[B", 2) == 2);
+    CHECK(write(master, "x", 1) == 1);
+    used = read_pty_until(
+        master, output, used, sizeof output, "Terminate tui-session"
+    );
+    CHECK(write(master, "n", 1) == 1);
+    used = read_pty_until(
+        master, output, used, sizeof output, "Termination cancelled."
+    );
+    CHECK(kpb_query_status(runtime_dir, "tui-session", &status) == KPB_OK);
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status));
+    CHECK(WEXITSTATUS(wait_status) == 0);
+    close(master);
+
+    CHECK(kpb_terminate(runtime_dir, "tui-session") == KPB_OK);
+    for (wait_status = 0; wait_status < 40; wait_status++) {
+        if (kpb_query_status(
+                runtime_dir, "tui-session", &status
+            ) == KPB_ERR_NOT_FOUND) {
+            return;
+        }
+        usleep(100000);
+    }
+    CHECK(!"TUI test session disappeared");
+}
+
 static int
 reader_child(void) {
     static unsigned char buffer[8192];
@@ -249,6 +360,7 @@ main(int argc, char **argv) {
     CHECK(kpb_prepare_runtime(runtime_dir) == KPB_OK);
     test_spawn_detach_replay_and_exit();
     test_large_input_backpressure();
+    test_tui();
     test_terminate();
     {
         char sessions[4096];

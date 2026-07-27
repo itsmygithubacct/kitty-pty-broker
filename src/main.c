@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kitty_pty_broker.h"
+#include "tui.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -280,6 +281,7 @@ usage(FILE *stream) {
         "  kitty-pty-broker [--runtime-dir DIR] list [--json]\n"
         "  kitty-pty-broker [--runtime-dir DIR] status ID [--json]\n"
         "  kitty-pty-broker [--runtime-dir DIR] kill ID\n"
+        "  kitty-pty-broker [--runtime-dir DIR] tui\n"
         "  kitty-pty-broker version\n",
         stream
     );
@@ -367,6 +369,21 @@ main(int argc, char **argv) {
             return 2;
         }
         return bridge(runtime_dir, argv[index]);
+    }
+    if (strcmp(command, "tui") == 0) {
+        char session_id[KPB_SESSION_ID_MAX + 1];
+        int tui_result;
+        if (index != argc) {
+            usage(stderr);
+            return 2;
+        }
+        tui_result = kpb_tui_run(runtime_dir, session_id);
+        if (tui_result == KPB_TUI_ATTACH) {
+            resize_pending = 0;
+            stop_pending = 0;
+            return bridge(runtime_dir, session_id);
+        }
+        return tui_result == KPB_TUI_QUIT ? 0 : 1;
     }
     if (strcmp(command, "kill") == 0) {
         kpb_result result;

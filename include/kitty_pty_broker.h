@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 #define KPB_VERSION_MAJOR 0
-#define KPB_VERSION_MINOR 1
+#define KPB_VERSION_MINOR 2
 #define KPB_VERSION_PATCH 0
 
 #define KPB_SESSION_ID_MAX 64

@@ -39,12 +39,18 @@ kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" list --json
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" status work --json
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" kill work
+kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" tui
 ```
 
 `run` starts the broker and attaches the current terminal. Disconnecting that
 client leaves the session alive. `kill` is the deliberate termination path;
 the broker first sends `SIGTERM` to every process group in the pane's terminal
 session, then `SIGKILL` after a bounded grace period.
+
+`tui` opens the interactive session manager. Detached sessions are sorted
+first; use the arrow keys or `j`/`k` to select one, Enter to attach, `x` to
+request termination (with confirmation), `r` to refresh, and `q` to quit. The
+interface uses only ANSI terminal controls and adds no runtime dependency.
 
 ## Library contract
 
