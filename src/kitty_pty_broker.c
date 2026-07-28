@@ -60,6 +60,7 @@ typedef struct {
     int listener_fd;
     int pty_fd;
     int journal_fd;
+    int transcript_fd;
     int client_fd;
     pid_t child_pid;
     uint64_t started_millis;
@@ -67,6 +68,11 @@ typedef struct {
     uint64_t journal_epoch;
     uint64_t journal_limit;
     bool journal_complete;
+    uint64_t transcript_bytes;
+    uint64_t transcript_limit;
+    int transcript_graphics;
+    int transcript_scan;
+    uint64_t transcript_elided;
     bool terminate_requested;
     uint64_t terminate_deadline;
     struct winsize size;
@@ -383,6 +389,8 @@ kpb_spawn_options_init(kpb_spawn_options *options) {
     if (!options) return;
     memset(options, 0, sizeof *options);
     options->journal_limit = KPB_DEFAULT_JOURNAL_LIMIT;
+    options->transcript_limit = KPB_DEFAULT_TRANSCRIPT_LIMIT;
+    options->transcript_graphics = KPB_TRANSCRIPT_GRAPHICS_ELIDE;
     options->rows = 24;
     options->columns = 80;
 }
@@ -568,6 +576,184 @@ append_journal(server_state *server, const unsigned char *data, size_t size) {
     }
     if (write_all_fd(server->journal_fd, data, size, false) < 0) return -1;
     server->journal_bytes += size;
+    return 0;
+}
+
+/* Transcript scanner states.  Kitty ships images as APC sequences
+ * (ESC _ G ... ESC \) whose payload is base64 pixel data, so a pane running
+ * the desktop, a browser, or icat can emit megabytes per second.  Writing that
+ * verbatim would evict every readable line from a bounded transcript within
+ * seconds, so by default the payload is replaced with a short marker. */
+enum {
+    TRANSCRIPT_TEXT = 0,
+    TRANSCRIPT_ESCAPE,
+    TRANSCRIPT_APC,
+    TRANSCRIPT_GRAPHICS,
+    TRANSCRIPT_GRAPHICS_ESCAPE
+};
+
+static ssize_t
+pwrite_all_fd(int fd, const void *data, size_t size, off_t offset) {
+    const unsigned char *cursor = data;
+    size_t written = 0;
+    while (written < size) {
+        ssize_t count = pwrite(fd, cursor + written, size - written, offset + (off_t)written);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (count == 0) return -1;
+        written += (size_t)count;
+    }
+    return (ssize_t)written;
+}
+
+/* Slide the newest ``keep`` bytes to the front of the transcript and drop the
+ * rest.  Rewriting in place (rather than renaming to a .1 file) keeps the
+ * single long-lived writer attached to the same inode, matching how the rest
+ * of the stack bounds its session logs. */
+static int
+rotate_transcript(server_state *server, uint64_t keep) {
+    unsigned char buffer[KPB_IO_CHUNK];
+    off_t read_offset;
+    off_t write_offset = 0;
+    if (keep > server->transcript_bytes) keep = server->transcript_bytes;
+    read_offset = (off_t)(server->transcript_bytes - keep);
+    while (keep) {
+        size_t wanted = keep < sizeof buffer ? (size_t)keep : sizeof buffer;
+        ssize_t count = pread(server->transcript_fd, buffer, wanted, read_offset);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (count == 0) break;
+        if (pwrite_all_fd(server->transcript_fd, buffer, (size_t)count, write_offset) < 0) return -1;
+        read_offset += count;
+        write_offset += count;
+        keep -= (uint64_t)count;
+    }
+    if (ftruncate(server->transcript_fd, write_offset) != 0) return -1;
+    if (lseek(server->transcript_fd, write_offset, SEEK_SET) < 0) return -1;
+    server->transcript_bytes = (uint64_t)write_offset;
+    return 0;
+}
+
+static int
+write_transcript(server_state *server, const unsigned char *data, size_t size) {
+    if (!size) return 0;
+    if (server->transcript_limit && server->transcript_bytes + size > server->transcript_limit) {
+        /* Keep three quarters of the budget so a busy pane rotates rarely
+         * instead of once per write. */
+        uint64_t keep = server->transcript_limit - server->transcript_limit / 4;
+        if (size >= keep) {
+            if (ftruncate(server->transcript_fd, 0) != 0 ||
+                lseek(server->transcript_fd, 0, SEEK_SET) < 0) {
+                return -1;
+            }
+            server->transcript_bytes = 0;
+            data += size - (size_t)keep;
+            size = (size_t)keep;
+        } else if (rotate_transcript(server, keep - size) != 0) {
+            return -1;
+        }
+    }
+    if (write_all_fd(server->transcript_fd, data, size, false) < 0) return -1;
+    server->transcript_bytes += size;
+    return 0;
+}
+
+#define TRANSCRIPT_MARKER_MAX 96
+
+static size_t
+format_elided_graphics(server_state *server, unsigned char *out) {
+    int length = snprintf(
+        (char *)out, TRANSCRIPT_MARKER_MAX,
+        "\r\n[kitty-pty-broker: %llu bytes of graphics elided]\r\n",
+        (unsigned long long)server->transcript_elided
+    );
+    server->transcript_elided = 0;
+    if (length <= 0 || length >= TRANSCRIPT_MARKER_MAX) return 0;
+    return (size_t)length;
+}
+
+/* Copy PTY output into the transcript, dropping kitty graphics payloads.
+ *
+ * The scanner must survive buffer boundaries, because one APC sequence
+ * routinely spans many reads.  The ESC and ESC _ prefixes are therefore held
+ * in the scan state rather than written eagerly: by the time the payload is
+ * recognised, nothing belonging to the sequence has reached the file yet.  A
+ * session killed mid-prefix loses at most those two bytes. */
+static int
+append_transcript(server_state *server, const unsigned char *data, size_t size) {
+    unsigned char out[KPB_IO_CHUNK + TRANSCRIPT_MARKER_MAX * 2];
+    size_t out_length = 0;
+    size_t index;
+    if (server->transcript_fd < 0 || !size) return 0;
+    if (server->transcript_graphics == KPB_TRANSCRIPT_GRAPHICS_KEEP) {
+        return write_transcript(server, data, size);
+    }
+    for (index = 0; index < size; index++) {
+        unsigned char byte = data[index];
+        /* Guarantee room for the widest single-step emission: a marker, or a
+         * held ESC _ prefix plus the byte that disproved it. */
+        if (out_length + TRANSCRIPT_MARKER_MAX > sizeof out) {
+            if (write_transcript(server, out, out_length) != 0) return -1;
+            out_length = 0;
+        }
+        switch (server->transcript_scan) {
+            case TRANSCRIPT_ESCAPE:
+                if (byte == '_') {
+                    server->transcript_scan = TRANSCRIPT_APC;
+                    break;
+                }
+                out[out_length++] = 0x1b;
+                server->transcript_scan = TRANSCRIPT_TEXT;
+                /* fall through: reconsider this byte as ordinary text */
+                __attribute__((fallthrough));
+            case TRANSCRIPT_TEXT:
+                if (byte == 0x1b) server->transcript_scan = TRANSCRIPT_ESCAPE;
+                else out[out_length++] = byte;
+                break;
+            case TRANSCRIPT_APC:
+                if (byte == 'G') {
+                    server->transcript_scan = TRANSCRIPT_GRAPHICS;
+                    server->transcript_elided = 3;
+                    break;
+                }
+                out[out_length++] = 0x1b;
+                out[out_length++] = '_';
+                if (byte == 0x1b) {
+                    server->transcript_scan = TRANSCRIPT_ESCAPE;
+                } else {
+                    out[out_length++] = byte;
+                    server->transcript_scan = TRANSCRIPT_TEXT;
+                }
+                break;
+            case TRANSCRIPT_GRAPHICS:
+                server->transcript_elided++;
+                if (byte == 0x1b) {
+                    server->transcript_scan = TRANSCRIPT_GRAPHICS_ESCAPE;
+                } else if (byte == 0x07) {
+                    server->transcript_scan = TRANSCRIPT_TEXT;
+                    out_length += format_elided_graphics(server, out + out_length);
+                }
+                break;
+            case TRANSCRIPT_GRAPHICS_ESCAPE:
+                server->transcript_elided++;
+                if (byte == '\\') {
+                    server->transcript_scan = TRANSCRIPT_TEXT;
+                    out_length += format_elided_graphics(server, out + out_length);
+                } else if (byte != 0x1b) {
+                    server->transcript_scan = TRANSCRIPT_GRAPHICS;
+                }
+                break;
+            default:
+                server->transcript_scan = TRANSCRIPT_TEXT;
+                out[out_length++] = byte;
+                break;
+        }
+    }
+    if (out_length) return write_transcript(server, out, out_length);
     return 0;
 }
 
@@ -781,6 +967,44 @@ wait_status_to_exit_code(int status) {
     return 255;
 }
 
+/* Consume output the child wrote just before exiting.
+ *
+ * Reaping the child does not empty the PTY: bytes written immediately before
+ * exit are still buffered, and the main loop would discard them on its next
+ * condition check.  Those are the most valuable bytes in the stream — the
+ * error a pane printed on its way out — so they are drained here into the
+ * journal, the transcript, and any attached client.  Bounded, because a
+ * surviving grandchild can hold the slave open and keep writing forever. */
+static void
+drain_pty(server_state *server) {
+    unsigned char buffer[KPB_IO_CHUNK];
+    const uint64_t deadline = now_millis() + 200;
+    while (now_millis() < deadline) {
+        struct pollfd descriptor = {.fd = server->pty_fd, .events = POLLIN, .revents = 0};
+        ssize_t count;
+        int ready = poll(&descriptor, 1, 20);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (ready == 0) return;
+        count = read(server->pty_fd, buffer, sizeof buffer);
+        if (count <= 0) {
+            if (count < 0 && errno == EINTR) continue;
+            return;
+        }
+        if (append_journal(server, buffer, (size_t)count) != 0) return;
+        if (append_transcript(server, buffer, (size_t)count) != 0) {
+            close(server->transcript_fd);
+            server->transcript_fd = -1;
+        }
+        if (server->client_fd >= 0 &&
+            send_frame(server->client_fd, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != KPB_OK) {
+            close_client(server);
+        }
+    }
+}
+
 static int
 server_loop(server_state *server) {
     unsigned char buffer[KPB_IO_CHUNK];
@@ -819,6 +1043,12 @@ server_loop(server_state *server) {
                 ssize_t count = read(server->pty_fd, buffer, sizeof buffer);
                 if (count > 0) {
                     if (append_journal(server, buffer, (size_t)count) != 0) return -1;
+                    /* A transcript is best-effort: a full disk or a revoked
+                     * directory must not take down a live shell. */
+                    if (append_transcript(server, buffer, (size_t)count) != 0) {
+                        close(server->transcript_fd);
+                        server->transcript_fd = -1;
+                    }
                     if (server->client_fd >= 0 &&
                         send_frame(server->client_fd, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != KPB_OK) {
                         close_client(server);
@@ -835,6 +1065,7 @@ server_loop(server_state *server) {
             if (flush_input(server) != 0) return -1;
         }
     }
+    drain_pty(server);
     {
         kpb_wire_exit wire;
         wire.wait_status = htonl(child_status);
@@ -852,6 +1083,7 @@ cleanup_server(server_state *server) {
     if (server->pty_fd >= 0) close(server->pty_fd);
     if (server->listener_fd >= 0) close(server->listener_fd);
     if (server->journal_fd >= 0) close(server->journal_fd);
+    if (server->transcript_fd >= 0) close(server->transcript_fd);
     free(server->input_buffer);
     unlink(server->paths.socket_path);
     unlink(server->paths.journal_path);
@@ -891,9 +1123,13 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     int exit_code = 255;
     memset(&server, 0, sizeof server);
     server.listener_fd = server.pty_fd = server.journal_fd = server.client_fd = -1;
+    server.transcript_fd = -1;
     server.child_pid = -1;
     server.started_millis = now_millis();
     server.journal_limit = options->journal_limit;
+    server.transcript_limit = options->transcript_limit;
+    server.transcript_graphics = options->transcript_graphics;
+    server.transcript_scan = TRANSCRIPT_TEXT;
     server.journal_complete = true;
     server.size.ws_row = options->rows ? options->rows : 24;
     server.size.ws_col = options->columns ? options->columns : 80;
@@ -920,6 +1156,32 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         0600
     );
     if (server.journal_fd < 0) goto fail;
+    if (options->transcript_path && options->transcript_path[0] == '/') {
+        /* Existing transcripts are continued rather than replaced, so a
+         * recovered pane keeps its history.  Deliberately NOT O_APPEND: on
+         * Linux pwrite() ignores the offset on an O_APPEND descriptor and
+         * appends instead, which would corrupt rotation.  O_NOFOLLOW stops a
+         * planted symlink from redirecting session output.  A transcript that
+         * cannot be opened is reported by its absence, never by refusing to
+         * start the pane. */
+        struct stat transcript_status;
+        server.transcript_fd = open(
+            options->transcript_path,
+            O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+            0600
+        );
+        if (server.transcript_fd >= 0) {
+            if (fstat(server.transcript_fd, &transcript_status) == 0 &&
+                S_ISREG(transcript_status.st_mode) &&
+                transcript_status.st_uid == geteuid() &&
+                lseek(server.transcript_fd, 0, SEEK_END) >= 0) {
+                server.transcript_bytes = (uint64_t)transcript_status.st_size;
+            } else {
+                close(server.transcript_fd);
+                server.transcript_fd = -1;
+            }
+        }
+    }
     server.child_pid = forkpty(&server.pty_fd, NULL, NULL, &server.size);
     if (server.child_pid < 0) goto fail;
     if (server.child_pid == 0) {
@@ -927,6 +1189,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         close(ready_fd);
         close(server.listener_fd);
         close(server.journal_fd);
+        if (server.transcript_fd >= 0) close(server.transcript_fd);
         if (chdir(options->cwd) != 0) _exit(126);
         setenv("KITTY_PTY_BROKER", "1", 1);
         setenv("KITTY_PTY_BROKER_SESSION", session_id, 1);

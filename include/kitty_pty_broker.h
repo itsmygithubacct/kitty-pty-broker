@@ -18,6 +18,16 @@ extern "C" {
 #define KPB_COMMAND_MAX 512
 #define KPB_IO_CHUNK (32U * 1024U)
 #define KPB_DEFAULT_JOURNAL_LIMIT (64ULL * 1024ULL * 1024ULL)
+#define KPB_DEFAULT_TRANSCRIPT_LIMIT (8ULL * 1024ULL * 1024ULL)
+
+/* The replay journal and the transcript are deliberately different things.
+ * The journal is a bounded buffer whose only job is to repaint a reattaching
+ * client, so it discards all history when it overflows.  A transcript is a
+ * durable session log: it keeps the newest bytes and never resets the screen. */
+typedef enum {
+    KPB_TRANSCRIPT_GRAPHICS_ELIDE = 0,
+    KPB_TRANSCRIPT_GRAPHICS_KEEP = 1
+} kpb_transcript_graphics;
 
 typedef enum {
     KPB_OK = 0,
@@ -38,6 +48,9 @@ typedef struct {
     const char *cwd;
     char *const *argv;
     uint64_t journal_limit;
+    const char *transcript_path;
+    uint64_t transcript_limit;
+    int transcript_graphics;
     unsigned short rows;
     unsigned short columns;
     unsigned short xpixel;

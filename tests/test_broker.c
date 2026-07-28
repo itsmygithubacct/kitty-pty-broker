@@ -347,6 +347,198 @@ test_large_input_backpressure(void) {
     kpb_detach(&connection);
 }
 
+static size_t
+read_whole_file(const char *path, unsigned char *buffer, size_t capacity) {
+    size_t used = 0;
+    FILE *stream = fopen(path, "rb");
+    CHECK(stream != NULL);
+    while (used < capacity) {
+        size_t count = fread(buffer + used, 1, capacity - used, stream);
+        if (!count) break;
+        used += count;
+    }
+    fclose(stream);
+    return used;
+}
+
+/* Wait for a session to run to completion and be reaped.  Transcripts are
+ * written by the broker itself, so these tests deliberately never attach a
+ * client: that also proves output is captured for an unattached pane. */
+static void
+wait_for_session_end(const char *session_id) {
+    int attempt;
+    for (attempt = 0; attempt < 600; attempt++) {
+        kpb_status status;
+        if (kpb_query_status(runtime_dir, session_id, &status) == KPB_ERR_NOT_FOUND) return;
+        usleep(20000);
+    }
+    CHECK(!"session did not finish");
+}
+
+static size_t
+run_with_transcript(
+    const char *session_id,
+    char *const *command,
+    const char *transcript_path,
+    uint64_t limit,
+    int graphics,
+    unsigned char *buffer,
+    size_t capacity
+) {
+    kpb_spawn_options options;
+    kpb_status status;
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = session_id;
+    options.cwd = "/tmp";
+    options.argv = command;
+    options.transcript_path = transcript_path;
+    options.transcript_limit = limit;
+    options.transcript_graphics = graphics;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    wait_for_session_end(session_id);
+    return read_whole_file(transcript_path, buffer, capacity);
+}
+
+static void
+test_transcript_elides_graphics(void) {
+    /* A 40 KiB payload deliberately exceeds KPB_IO_CHUNK so the APC sequence
+     * spans several PTY reads and exercises the resumable scanner. */
+    char *command[] = {
+        "/bin/sh", "-c",
+        "printf 'visible-before\\n'; "
+        "printf '\\033_Ga=T,f=100;'; "
+        "i=0; while [ $i -lt 640 ]; do "
+        "printf 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJz'; "
+        "i=$((i+1)); done; "
+        "printf '\\033\\\\'; "
+        "printf 'visible-after\\n'",
+        NULL
+    };
+    char transcript[KPB_PATH_MAX];
+    unsigned char buffer[262144];
+    struct stat status;
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/elide.log", runtime_dir);
+    used = run_with_transcript(
+        "elide", command, transcript, KPB_DEFAULT_TRANSCRIPT_LIMIT,
+        KPB_TRANSCRIPT_GRAPHICS_ELIDE, buffer, sizeof buffer
+    );
+
+    CHECK(memmem(buffer, used, "visible-before", 14) != NULL);
+    CHECK(memmem(buffer, used, "visible-after", 13) != NULL);
+    /* No fragment of the payload, and no APC introducer, survives. */
+    CHECK(memmem(buffer, used, "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph", 36) == NULL);
+    CHECK(memmem(buffer, used, "\033_G", 3) == NULL);
+    CHECK(memmem(buffer, used, "bytes of graphics elided", 24) != NULL);
+    /* The elided transcript is a tiny fraction of the ~40 KiB that was sent. */
+    CHECK(used < 4096);
+
+    CHECK(stat(transcript, &status) == 0);
+    CHECK((status.st_mode & 0777) == 0600);
+    CHECK(unlink(transcript) == 0);
+}
+
+static void
+test_transcript_keeps_graphics_when_asked(void) {
+    char *command[] = {
+        "/bin/sh", "-c", "printf '\\033_Ga=q;PAYLOAD_KEPT\\033\\\\done\\n'", NULL
+    };
+    char transcript[KPB_PATH_MAX];
+    unsigned char buffer[65536];
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/keep.log", runtime_dir);
+    used = run_with_transcript(
+        "keep", command, transcript, KPB_DEFAULT_TRANSCRIPT_LIMIT,
+        KPB_TRANSCRIPT_GRAPHICS_KEEP, buffer, sizeof buffer
+    );
+
+    CHECK(memmem(buffer, used, "\033_Ga=q;PAYLOAD_KEPT\033\\", 21) != NULL);
+    CHECK(memmem(buffer, used, "done", 4) != NULL);
+    CHECK(unlink(transcript) == 0);
+}
+
+static void
+test_transcript_rotates_and_keeps_newest(void) {
+    char *command[] = {
+        "/bin/sh", "-c",
+        "printf 'OLDEST_LINE\\n'; "
+        "i=0; while [ $i -lt 2000 ]; do printf 'filler-%s\\n' \"$i\"; i=$((i+1)); done; "
+        "printf 'NEWEST_LINE\\n'",
+        NULL
+    };
+    char transcript[KPB_PATH_MAX];
+    unsigned char buffer[262144];
+    const uint64_t limit = 16384;
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/rotate.log", runtime_dir);
+    used = run_with_transcript(
+        "rotate", command, transcript, limit,
+        KPB_TRANSCRIPT_GRAPHICS_ELIDE, buffer, sizeof buffer
+    );
+
+    /* Bounded, and bounded by the newest bytes rather than the oldest. */
+    CHECK(used <= limit);
+    CHECK(memmem(buffer, used, "NEWEST_LINE", 11) != NULL);
+    CHECK(memmem(buffer, used, "OLDEST_LINE", 11) == NULL);
+    CHECK(unlink(transcript) == 0);
+}
+
+/* A pane's most useful output is what it printed on its way out.  The child
+ * here floods the PTY and exits with no pause, so the bytes are still buffered
+ * when it is reaped.
+ *
+ * This asserts the contract rather than guarding the race: with no client
+ * attached the loop drains often enough to pass even without drain_pty().
+ * The loss is reproducible through the CLI, where a client is attached and
+ * the tail was truncated mid-stream before that drain existed. */
+static void
+test_transcript_captures_output_written_just_before_exit(void) {
+    char *command[] = {
+        "/bin/sh", "-c",
+        "i=0; while [ $i -lt 400 ]; do "
+        "printf 'burst-line-%s-padding-padding-padding-padding\\n' \"$i\"; "
+        "i=$((i+1)); done; printf 'FINAL_DYING_WORDS\\n'",
+        NULL
+    };
+    char transcript[KPB_PATH_MAX];
+    unsigned char buffer[262144];
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/dying.log", runtime_dir);
+    used = run_with_transcript(
+        "dying", command, transcript, KPB_DEFAULT_TRANSCRIPT_LIMIT,
+        KPB_TRANSCRIPT_GRAPHICS_ELIDE, buffer, sizeof buffer
+    );
+
+    CHECK(memmem(buffer, used, "burst-line-0-", 13) != NULL);
+    CHECK(memmem(buffer, used, "burst-line-399-", 15) != NULL);
+    CHECK(memmem(buffer, used, "FINAL_DYING_WORDS", 17) != NULL);
+    CHECK(unlink(transcript) == 0);
+}
+
+static void
+test_transcript_absent_by_default(void) {
+    char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
+    kpb_spawn_options options;
+    kpb_status status;
+
+    kpb_spawn_options_init(&options);
+    CHECK(options.transcript_path == NULL);
+    CHECK(options.transcript_limit == KPB_DEFAULT_TRANSCRIPT_LIMIT);
+    CHECK(options.transcript_graphics == KPB_TRANSCRIPT_GRAPHICS_ELIDE);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "notranscript";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    wait_for_session_end("notranscript");
+}
+
 int
 main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--reader-child") == 0) {
@@ -359,6 +551,11 @@ main(int argc, char **argv) {
     test_ids();
     CHECK(kpb_prepare_runtime(runtime_dir) == KPB_OK);
     test_spawn_detach_replay_and_exit();
+    test_transcript_elides_graphics();
+    test_transcript_keeps_graphics_when_asked();
+    test_transcript_rotates_and_keeps_newest();
+    test_transcript_captures_output_written_just_before_exit();
+    test_transcript_absent_by_default();
     test_large_input_backpressure();
     test_tui();
     test_terminate();

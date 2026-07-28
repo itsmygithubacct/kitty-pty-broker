@@ -276,7 +276,9 @@ static void
 usage(FILE *stream) {
     fputs(
         "usage:\n"
-        "  kitty-pty-broker [--runtime-dir DIR] run [--id ID] [--journal-limit BYTES] -- COMMAND [ARG...]\n"
+        "  kitty-pty-broker [--runtime-dir DIR] run [--id ID] [--journal-limit BYTES]\n"
+        "                   [--transcript PATH] [--transcript-limit BYTES]\n"
+        "                   [--transcript-graphics elide|keep] -- COMMAND [ARG...]\n"
         "  kitty-pty-broker [--runtime-dir DIR] attach ID\n"
         "  kitty-pty-broker [--runtime-dir DIR] list [--json]\n"
         "  kitty-pty-broker [--runtime-dir DIR] status ID [--json]\n"
@@ -332,6 +334,32 @@ main(int argc, char **argv) {
                     return 2;
                 }
                 options.journal_limit = value;
+                index += 2;
+            } else if (strcmp(argv[index], "--transcript") == 0 && index + 1 < argc) {
+                if (argv[index + 1][0] != '/') {
+                    fprintf(stderr, "kitty-pty-broker: transcript path must be absolute\n");
+                    return 2;
+                }
+                options.transcript_path = argv[index + 1];
+                index += 2;
+            } else if (strcmp(argv[index], "--transcript-limit") == 0 && index + 1 < argc) {
+                char *end = NULL;
+                unsigned long long value = strtoull(argv[index + 1], &end, 10);
+                if (!end || *end) {
+                    fprintf(stderr, "kitty-pty-broker: invalid transcript limit\n");
+                    return 2;
+                }
+                options.transcript_limit = value;
+                index += 2;
+            } else if (strcmp(argv[index], "--transcript-graphics") == 0 && index + 1 < argc) {
+                if (strcmp(argv[index + 1], "elide") == 0) {
+                    options.transcript_graphics = KPB_TRANSCRIPT_GRAPHICS_ELIDE;
+                } else if (strcmp(argv[index + 1], "keep") == 0) {
+                    options.transcript_graphics = KPB_TRANSCRIPT_GRAPHICS_KEEP;
+                } else {
+                    fprintf(stderr, "kitty-pty-broker: transcript graphics must be elide or keep\n");
+                    return 2;
+                }
                 index += 2;
             } else {
                 usage(stderr);

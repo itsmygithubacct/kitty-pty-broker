@@ -35,6 +35,8 @@ Linux).
 
 ```sh
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" run --id work -- bash
+kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" \
+    run --id work --transcript ~/.local/state/work.log -- bash
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" list --json
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" status work --json
@@ -61,7 +63,8 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
 - attach, input, resize, output, detach, status, list, and terminate operations;
 - bounded input queuing so large pastes respect PTY backpressure without loss;
 - versioned framed communication over owner-only Unix sockets;
-- a bounded replay journal for reconstructing a newly attached terminal.
+- a bounded replay journal for reconstructing a newly attached terminal;
+- an optional durable transcript of session output.
 
 Runtime and session directories must be absolute, real directories owned by
 the current user. They are forced to mode `0700`; sockets and metadata are
@@ -75,6 +78,34 @@ frontend can reconstruct terminal state. The default journal limit is 64 MiB.
 When the limit is reached, the broker starts a new replay epoch with a terminal
 reset and marks the status as incomplete; this bounds storage without
 pretending an arbitrarily long raw terminal stream is a serializable snapshot.
+
+## Transcripts
+
+`--transcript PATH` additionally records session output to a durable log. This
+is a different guarantee from the replay journal, and the two are deliberately
+not shared: the journal exists to repaint one reattaching client and therefore
+discards all history when it overflows, while a transcript keeps the newest
+bytes and never emits a terminal reset.
+
+- `--transcript-limit BYTES` bounds the file (default 8 MiB). On overflow the
+  newest three quarters of the budget are slid to the front of the same inode
+  and the rest is dropped, so a single long-lived writer keeps its descriptor.
+- `--transcript-graphics elide|keep` selects payload handling. The default
+  `elide` replaces the body of kitty graphics APC sequences (`ESC _ G … ESC \`)
+  with a short byte-count marker, because one pane running a pixel desktop, a
+  browser, or `icat` can emit megabytes per second and would otherwise evict
+  every readable line within seconds. `keep` records the stream verbatim.
+- The transcript is written by the broker itself, so an unattached or detached
+  pane is still captured. Only PTY *output* is recorded; input reaches the file
+  solely through terminal echo, so a password prompt that suppresses echo is
+  not captured.
+- The file is created `0600` and opened `O_NOFOLLOW`. An existing transcript is
+  continued, not truncated, so a recovered pane keeps its history. Transcript
+  failures are non-fatal: the broker closes the log and the pane keeps running.
+
+Elision makes a default transcript a faithful record of *text*, not a byte-exact
+capture of the stream. Use `keep` when the graphics bytes themselves are the
+subject of the investigation.
 
 Local file or shared-memory graphics resources can be consumed and removed by
 the first frontend, so their historical escape sequences are not independently
