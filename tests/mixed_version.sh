@@ -13,12 +13,21 @@
 #
 #   tests/mixed_version.sh [BASE_REVISION]
 #
-# BASE_REVISION defaults to the merge base with main, i.e. the last revision
-# that predates this branch's protocol work.
+# BASE_REVISION is the last revision that predates the protocol-2 work, and it
+# is a fixed commit rather than something derived from a branch.
+#
+# It used to default to `merge-base HEAD main`, which was right exactly while
+# this work sat on a feature branch and silently wrong the moment it was merged:
+# from then on the "old" side resolved to the same commit as the new one, both
+# binaries reported protocol-max=2, and the check that an old broker REFUSES an
+# observe failed - correctly, because the thing being called old was not old.
+# A compatibility test whose notion of "old" moves with the branch stops being a
+# compatibility test on the day it matters.
 set -u
 
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-base=${1:-$(git -C "$root" merge-base HEAD main)}
+KPB_PRE_V2=12ac22a3c95b34c70d4c05b650411b44b738e066
+base=${1:-$KPB_PRE_V2}
 work=$(mktemp -d /tmp/kpbmv.XXXXXX)
 old_tree="$work/old"
 failures=0
