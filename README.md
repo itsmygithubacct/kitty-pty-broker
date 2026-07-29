@@ -38,6 +38,9 @@ kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" run --id work -- bash
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" \
     run --id work --transcript ~/.local/state/work.log -- bash
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work
+kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work --resume 0:4096
+kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" observe work
+kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" observe work --from 0:4096
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" list --json
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" status work --json
 kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" kill work
@@ -54,6 +57,80 @@ first; use the arrow keys or `j`/`k` to select one, Enter to attach, `x` to
 request termination (with confirmation), `r` to refresh, and `q` to quit. The
 interface uses only ANSI terminal controls and adds no runtime dependency.
 
+`observe` attaches read-only. It renders the pane but forwards nothing: keys
+are consumed locally and `Ctrl-]` leaves. `SIGWINCH` is ignored, so watching a
+pane cannot resize it. Any number of observers may watch a pane that is already
+attached, or one that is not attached at all.
+
+Both `attach` and `observe` print `cursor=EPOCH:OFFSET` to stderr on exit. Pass
+that back as `--resume` or `--from` to continue where you stopped instead of
+repainting from the start of the journal.
+
+## Protocol version 2
+
+Version 2 adds observers and resumable replay. It is negotiated per connection
+and is invisible to anything that does not ask for it.
+
+**The frame-format version stays at 1 and must never be bumped.** Both peers
+reject any other value on every frame, so raising it would break every deployed
+peer in both directions at once — including a plain `status` query. That is not
+hypothetical here: a broker outlives its frontend by design, and an update
+replaces the client binary while brokers from the previous build keep running.
+
+The session version is negotiated inside the attach payload instead, and is
+discriminated structurally rather than by a version field:
+
+| Request | Payload | Meaning |
+|---|---|---|
+| `ATTACH` | 8 bytes | version 1 attach, exactly as before |
+| `ATTACH` | 32 bytes | version 2 attach |
+| `OBSERVE` | 32 bytes | version 2 read-only attach |
+
+The broker emits an `ATTACH_REPLY` **if and only if** the request was 32 bytes,
+so a version 1 peer can never receive a frame type it does not parse. A broker
+that predates version 2 answers a 32-byte request with its existing
+`invalid request` error, which a version 2 client reports as a protocol error
+rather than silently degrading. `attach ID` with no flags still emits an 8-byte
+request, so the shipped path works against any broker.
+
+The reply carries the selected version, the journal epoch, the stream offset of
+the first byte that follows, and flags for resumed, complete, and truncated. A
+client adopts that offset as a cursor and advances it by the size of every
+output payload it then receives.
+
+### Resume
+
+Within one epoch the journal is strictly append-only, so a resume offset only
+becomes invalid when the epoch rolls over — which is exactly what eviction is
+here. A request is honoured when the epoch matches and the offset is within the
+journal; anything else silently becomes a full replay, reported by the absence
+of the resumed flag. Resume never widens what a peer can see: it can only ask
+for less than a full replay.
+
+### Observers
+
+- Read-only, enforced by the broker rather than by the client's restraint. Any
+  frame an observer sends ends its connection: `DETACH` closes silently,
+  `INPUT` and `RESIZE` are refused with an error first. Only the frame header
+  is ever read, so an observer cannot make the broker read an attacker-chosen
+  payload size.
+- Capped at `KPB_OBSERVER_MAX` (8). The next request is refused with
+  `KPB_ERR_BUSY` and disturbs neither the accepted set nor the pane.
+- **Non-blocking, with a bounded queue.** The read-write client keeps its
+  blocking write, which is correct for it: a frontend that stops reading should
+  stop the shell. An observer must not have that power, so one that falls
+  behind is disconnected rather than buffered. Resume is what makes that cheap —
+  a dropped observer reattaches and asks for the bytes it missed.
+- Replay on attach is bounded to the newest `KPB_OBSERVER_REPLAY_MAX` (1 MiB),
+  prefixed with a terminal reset and flagged as truncated. That bound is kept
+  strictly below the queue limit so a fresh replay can never by itself trip the
+  drop policy.
+- An observer never reaches the PTY: not `apply_size` at admission, not
+  `queue_input` afterwards.
+- `attached` in the status reply still means the read-write slot is taken.
+  Observers deliberately do not set it, because callers filter reusable panes on
+  that flag. Observer count is not exposed.
+
 ## Library contract
 
 The public API is in `include/kitty_pty_broker.h`. It supports:
@@ -61,6 +138,9 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
 - cryptographically random or caller-supplied stable session IDs;
 - spawning a command under an independently owned PTY;
 - attach, input, resize, output, detach, status, list, and terminate operations;
+- read-only observation and resumable replay through `kpb_observe` and
+  `kpb_attach_with_options`; the original `kpb_attach` is unchanged and remains
+  the version 1 entry point;
 - bounded input queuing so large pastes respect PTY backpressure without loss;
 - versioned framed communication over owner-only Unix sockets;
 - a bounded replay journal for reconstructing a newly attached terminal;

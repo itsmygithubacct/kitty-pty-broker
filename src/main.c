@@ -77,25 +77,55 @@ exit_code_from_wait_status(int status) {
     return 255;
 }
 
+/* `options` NULL keeps the plain version-1 attach that every existing caller
+ * uses, which is also what makes this safe against a broker left running by a
+ * previous build. */
 static int
-bridge(const char *runtime_dir, const char *session_id) {
+bridge(
+    const char *runtime_dir,
+    const char *session_id,
+    const kpb_attach_options *options
+) {
     unsigned char buffer[KPB_IO_CHUNK];
     struct termios saved;
     struct termios raw;
     struct sigaction action;
     struct winsize size;
     kpb_connection connection;
+    kpb_attach_result attached;
+    bool observing = options && options->mode == KPB_ATTACH_OBSERVE;
     bool have_termios = false;
     bool replay_done = false;
+    bool track_cursor = false;
+    uint64_t cursor_epoch = 0;
+    uint64_t cursor_offset = 0;
     int exit_code = 0;
     kpb_result result;
 
     get_size(&size);
-    result = kpb_attach(
-        runtime_dir, session_id,
-        size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel,
-        &connection
-    );
+    memset(&attached, 0, sizeof attached);
+    if (options) {
+        kpb_attach_options request = *options;
+        if (!observing) {
+            request.rows = size.ws_row;
+            request.columns = size.ws_col;
+            request.xpixel = size.ws_xpixel;
+            request.ypixel = size.ws_ypixel;
+        }
+        result = kpb_attach_with_options(
+            runtime_dir, session_id, &request, &connection, &attached);
+        if (result == KPB_OK && attached.version >= 2) {
+            track_cursor = true;
+            cursor_epoch = attached.journal_epoch;
+            cursor_offset = attached.journal_offset;
+        }
+    } else {
+        result = kpb_attach(
+            runtime_dir, session_id,
+            size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel,
+            &connection
+        );
+    }
     if (result != KPB_OK) {
         fprintf(stderr, "kitty-pty-broker: attach %s: %s", session_id, kpb_result_string(result));
         if (result == KPB_ERR_SYSTEM) fprintf(stderr, ": %s", strerror(errno));
@@ -124,10 +154,13 @@ bridge(const char *runtime_dir, const char *session_id) {
         int count;
         if (resize_pending) {
             resize_pending = 0;
-            get_size(&size);
-            (void)kpb_resize(
-                &connection, size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel
-            );
+            /* An observer must never resize the pane it is watching. */
+            if (!observing) {
+                get_size(&size);
+                (void)kpb_resize(
+                    &connection, size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel
+                );
+            }
         }
         descriptors[0].fd = connection.fd;
         descriptors[0].events = POLLIN;
@@ -149,6 +182,7 @@ bridge(const char *runtime_dir, const char *session_id) {
                 break;
             }
             if (event.type == KPB_EVENT_OUTPUT) {
+                cursor_offset += event.size;
                 if (write_all(STDOUT_FILENO, buffer, event.size) != 0) {
                     exit_code = 1;
                     break;
@@ -169,6 +203,13 @@ bridge(const char *runtime_dir, const char *session_id) {
         }
         if (descriptors[1].revents & POLLIN) {
             ssize_t received = read(STDIN_FILENO, buffer, sizeof buffer);
+            if (observing) {
+                /* Read-only: local keys are consumed here, never forwarded.
+                 * Ctrl-] leaves, matching the usual escape idiom. */
+                if (received == 0) break;
+                if (received > 0 && memchr(buffer, 0x1d, (size_t)received)) break;
+                continue;
+            }
             if (received > 0) {
                 result = kpb_send_input(&connection, buffer, (size_t)received);
                 if (result != KPB_OK) {
@@ -186,7 +227,34 @@ bridge(const char *runtime_dir, const char *session_id) {
 
     kpb_detach(&connection);
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    if (track_cursor) {
+        /* Where to resume from next time.  Printed to stderr so it does not
+         * contaminate the pane's own output. */
+        fprintf(
+            stderr, "kitty-pty-broker: cursor=%llu:%llu\n",
+            (unsigned long long)cursor_epoch,
+            (unsigned long long)cursor_offset);
+    }
     return exit_code;
+}
+
+/* EPOCH:OFFSET, fully consumed, exactly one separator. */
+static int
+parse_cursor(const char *text, uint64_t *epoch, uint64_t *offset) {
+    char *end = NULL;
+    unsigned long long value;
+    if (!text || !*text) return -1;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno || !end || *end != ':' || end == text) return -1;
+    *epoch = (uint64_t)value;
+    text = end + 1;
+    if (!*text) return -1;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno || !end || *end != '\0') return -1;
+    *offset = (uint64_t)value;
+    return 0;
 }
 
 static void
@@ -279,7 +347,8 @@ usage(FILE *stream) {
         "  kitty-pty-broker [--runtime-dir DIR] run [--id ID] [--journal-limit BYTES]\n"
         "                   [--transcript PATH] [--transcript-limit BYTES]\n"
         "                   [--transcript-graphics elide|keep] -- COMMAND [ARG...]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] attach ID\n"
+        "  kitty-pty-broker [--runtime-dir DIR] attach ID [--resume EPOCH:OFFSET]\n"
+        "  kitty-pty-broker [--runtime-dir DIR] observe ID [--from EPOCH:OFFSET]\n"
         "  kitty-pty-broker [--runtime-dir DIR] list [--json]\n"
         "  kitty-pty-broker [--runtime-dir DIR] status ID [--json]\n"
         "  kitty-pty-broker [--runtime-dir DIR] kill ID\n"
@@ -310,7 +379,10 @@ main(int argc, char **argv) {
     }
     command = argv[index++];
     if (strcmp(command, "version") == 0) {
-        printf("%d.%d.%d protocol=%d\n", KPB_VERSION_MAJOR, KPB_VERSION_MINOR, KPB_VERSION_PATCH, kpb_protocol_version());
+        printf(
+            "%d.%d.%d protocol=%d protocol-max=%d\n",
+            KPB_VERSION_MAJOR, KPB_VERSION_MINOR, KPB_VERSION_PATCH,
+            kpb_protocol_version(), kpb_protocol_version_max());
         return 0;
     }
     if (strcmp(command, "run") == 0) {
@@ -389,14 +461,60 @@ main(int argc, char **argv) {
         options.ypixel = size.ws_ypixel;
         result = kpb_spawn(&options, &status);
         if (result != KPB_OK) return report_result("start session", result);
-        return bridge(runtime_dir, id);
+        return bridge(runtime_dir, id, NULL);
     }
-    if (strcmp(command, "attach") == 0) {
-        if (index + 1 != argc) {
+    if (strcmp(command, "observe") == 0) {
+        kpb_attach_options options;
+        kpb_attach_options_init(&options);
+        options.mode = KPB_ATTACH_OBSERVE;
+        if (index >= argc) {
             usage(stderr);
             return 2;
         }
-        return bridge(runtime_dir, argv[index]);
+        {
+            const char *session_id = argv[index++];
+            if (index < argc) {
+                if (strcmp(argv[index], "--from") != 0 || index + 1 >= argc ||
+                    parse_cursor(
+                        argv[index + 1],
+                        &options.resume_epoch, &options.resume_offset) != 0) {
+                    usage(stderr);
+                    return 2;
+                }
+                options.resume = 1;
+                index += 2;
+            }
+            if (index != argc) {
+                usage(stderr);
+                return 2;
+            }
+            return bridge(runtime_dir, session_id, &options);
+        }
+    }
+    if (strcmp(command, "attach") == 0) {
+        const char *session_id;
+        if (index >= argc) {
+            usage(stderr);
+            return 2;
+        }
+        session_id = argv[index++];
+        /* Plain `attach ID` still emits a version-1 attach, so the shipped
+         * path is unchanged and works against any broker. */
+        if (index == argc) return bridge(runtime_dir, session_id, NULL);
+        {
+            kpb_attach_options options;
+            kpb_attach_options_init(&options);
+            if (strcmp(argv[index], "--resume") != 0 || index + 1 >= argc ||
+                parse_cursor(
+                    argv[index + 1],
+                    &options.resume_epoch, &options.resume_offset) != 0 ||
+                index + 2 != argc) {
+                usage(stderr);
+                return 2;
+            }
+            options.resume = 1;
+            return bridge(runtime_dir, session_id, &options);
+        }
     }
     if (strcmp(command, "tui") == 0) {
         char session_id[KPB_SESSION_ID_MAX + 1];
@@ -409,7 +527,7 @@ main(int argc, char **argv) {
         if (tui_result == KPB_TUI_ATTACH) {
             resize_pending = 0;
             stop_pending = 0;
-            return bridge(runtime_dir, session_id);
+            return bridge(runtime_dir, session_id, NULL);
         }
         return tui_result == KPB_TUI_QUIT ? 0 : 1;
     }
