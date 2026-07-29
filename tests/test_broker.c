@@ -1187,17 +1187,21 @@ static void
 test_stalled_observer_does_not_wedge_pane(void) {
     char *command[] = {(char *)test_program, "--writer-child", NULL};
     kpb_connection client;
-    kpb_connection watcher;
+    kpb_connection watchers[KPB_OBSERVER_MAX];
     unsigned char buffer[KPB_IO_CHUNK];
     size_t x_count = 0;
+    size_t index;
     int wait_status = -1;
     int attempts;
     bool closed = false;
 
     spawn_session("stalled", command, KPB_DEFAULT_JOURNAL_LIMIT);
     CHECK(kpb_attach(runtime_dir, "stalled", 30, 100, 0, 0, &client) == KPB_OK);
-    /* Attached and then never read again. */
-    CHECK(kpb_observe(runtime_dir, "stalled", &watcher, NULL) == KPB_OK);
+    /* A full complement, every one of them attached and then never read
+     * again.  If any of them could apply back-pressure, the pane stops. */
+    for (index = 0; index < KPB_OBSERVER_MAX; index++) {
+        CHECK(kpb_observe(runtime_dir, "stalled", &watchers[index], NULL) == KPB_OK);
+    }
 
     while (true) {
         kpb_event event;
@@ -1226,24 +1230,28 @@ test_stalled_observer_does_not_wedge_pane(void) {
     CHECK(WIFEXITED(wait_status));
     CHECK(WEXITSTATUS(wait_status) == 0);
 
-    /* The stalled observer was dropped rather than allowed to block anything:
+    /* Each stalled observer was dropped rather than allowed to block anything:
      * drain whatever it had buffered and expect the connection to end. */
-    for (attempts = 0; attempts < 4096; attempts++) {
-        ssize_t count = recv(watcher.fd, buffer, sizeof buffer, MSG_DONTWAIT);
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd descriptor = {.fd = watcher.fd, .events = POLLIN, .revents = 0};
-                CHECK(poll(&descriptor, 1, 3000) > 0);
-                continue;
+    for (index = 0; index < KPB_OBSERVER_MAX; index++) {
+        for (attempts = 0; attempts < 8192; attempts++) {
+            ssize_t count = recv(
+                watchers[index].fd, buffer, sizeof buffer, MSG_DONTWAIT);
+            if (count == 0) break;
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    struct pollfd descriptor = {
+                        .fd = watchers[index].fd, .events = POLLIN, .revents = 0};
+                    CHECK(poll(&descriptor, 1, 3000) > 0);
+                    continue;
+                }
+                break;
             }
-            break;
         }
+        CHECK(attempts < 8192);
+        close(watchers[index].fd);
+        watchers[index].fd = -1;
     }
-    CHECK(attempts < 4096);
-    close(watcher.fd);
-    watcher.fd = -1;
     kpb_detach(&client);
     wait_for_session_end("stalled");
 }
