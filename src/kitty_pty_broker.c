@@ -78,11 +78,13 @@ typedef struct {
     uint32_t generation;
 } observer_slot;
 
+/* Strictly above KPB_OBSERVER_REPLAY_MAX: a fresh replay must never by itself
+ * fill the queue and trip the drop policy, or observers would be disconnected
+ * at the moment they attach. */
 #define KPB_OBSERVER_QUEUE_LIMIT (2U * 1024U * 1024U)
-/* Strictly below the queue limit: a fresh replay must never by itself fill the
- * queue and trip the drop policy, or observers would be disconnected at the
- * moment they attach. */
-#define KPB_OBSERVER_REPLAY_MAX (1024U * 1024U)
+_Static_assert(
+    KPB_OBSERVER_REPLAY_MAX < KPB_OBSERVER_QUEUE_LIMIT,
+    "a fresh observer replay must fit in the queue with headroom to spare");
 
 typedef struct {
     session_paths paths;
@@ -2011,11 +2013,17 @@ kpb_receive(
             if (payload_size != 0) return KPB_ERR_PROTOCOL;
             event->type = KPB_EVENT_REPLAY_DONE;
             return KPB_OK;
-        case KPB_FRAME_EXIT:
-            if (payload_size != sizeof(kpb_wire_exit)) return KPB_ERR_PROTOCOL;
+        case KPB_FRAME_EXIT: {
+            /* The caller chooses this buffer and may legitimately hand us an
+             * offset into a byte array, so it carries no alignment guarantee.
+             * Casting it to the wire struct is undefined behaviour. */
+            kpb_wire_exit wire;
+            if (payload_size != sizeof wire) return KPB_ERR_PROTOCOL;
+            memcpy(&wire, buffer, sizeof wire);
             event->type = KPB_EVENT_EXIT;
-            event->exit_status = ntohl(((kpb_wire_exit *)buffer)->wait_status);
+            event->exit_status = ntohl(wire.wait_status);
             return KPB_OK;
+        }
         case KPB_FRAME_ERROR:
             event->type = KPB_EVENT_ERROR;
             event->size = payload_size;

@@ -19,6 +19,11 @@ extern "C" {
 #define KPB_OBSERVER_MAX 8
 #define KPB_PROTOCOL_VERSION_MAX 2
 
+/* The most history an observer is given on attach.  Beyond this the replay is
+ * trimmed to the newest bytes, prefixed with a terminal reset, and reported as
+ * truncated - the same contract the journal's own overflow uses. */
+#define KPB_OBSERVER_REPLAY_MAX (1024ULL * 1024ULL)
+
 #define KPB_SESSION_ID_MAX 64
 #define KPB_PATH_MAX 4096
 #define KPB_COMMAND_MAX 512
