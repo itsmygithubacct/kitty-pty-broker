@@ -34,7 +34,7 @@ $(CLI_OBJECT): src/main.c include/kitty_pty_broker.h | $(BUILD_DIR)
 $(TUI_OBJECT): src/tui.c src/tui.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
-$(TEST_OBJECT): tests/test_broker.c include/kitty_pty_broker.h | $(BUILD_DIR)
+$(TEST_OBJECT): tests/test_broker.c src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(STATIC_LIB): $(LIB_OBJECT)
@@ -49,13 +49,29 @@ $(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB)
 $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(TEST_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
-test: $(TEST) $(CLI)
-	"$(TEST)"
+TEST_ENVIRONMENT ?=
 
+test: $(TEST) $(CLI)
+	$(TEST_ENVIRONMENT) "$(TEST)"
+
+# The broker dup2s /dev/null over stderr and leaves through _exit, so a
+# sanitizer report raised inside it would otherwise be written to nowhere and
+# the run would look clean.  Redirect reports to files and fail if any appear.
 sanitize:
 	$(MAKE) clean
 	$(MAKE) CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -fPIC -fsanitize=address,undefined" \
-		LDFLAGS="-fsanitize=address,undefined" test
+		LDFLAGS="-fsanitize=address,undefined" \
+		TEST_ENVIRONMENT="ASAN_OPTIONS=log_path=$(BUILD_DIR)/asan UBSAN_OPTIONS=log_path=$(BUILD_DIR)/ubsan:halt_on_error=1:print_stacktrace=1" \
+		test
+	@if ls $(BUILD_DIR)/asan.* $(BUILD_DIR)/ubsan.* >/dev/null 2>&1; then \
+		echo "sanitizer reports were produced:" >&2; \
+		for report in $(BUILD_DIR)/asan.* $(BUILD_DIR)/ubsan.*; do \
+			[ -e "$$report" ] || continue; \
+			echo "--- $$report" >&2; cat "$$report" >&2; \
+		done; \
+		exit 1; \
+	fi
+	@echo "no sanitizer reports"
 
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/bin"
