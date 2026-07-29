@@ -930,6 +930,63 @@ raw_read_exactly(int fd, void *data, size_t size) {
     return true;
 }
 
+/* A peer that stops mid-frame must not stop the broker.
+ *
+ * The accept path was bounded first and that was not enough: an attached
+ * client's frames are read from the same event loop, so a client that sends one
+ * byte of a header and then nothing held the loop indefinitely - no pane
+ * output, no status, no accept, and `kill` could not recover it.  Measured on
+ * the build that bounded only the accept path, status never returned; with the
+ * client read bounded it returns at the deadline.
+ *
+ * The alarm is deliberate: if this regresses the symptom is a hang, and a test
+ * suite that hangs tells you far less than one that dies. */
+static void
+test_a_stalled_client_does_not_stop_the_broker(void) {
+    kpb_wire_winsize size;
+    kpb_status status;
+    int fd;
+
+    {
+        static char *const command[] = {"sleep", "3600", NULL};
+        spawn_session("clientstall", command, KPB_DEFAULT_JOURNAL_LIMIT);
+    }
+    fd = raw_connect("clientstall");
+    size.rows = htons(24);
+    size.columns = htons(80);
+    size.xpixel = 0;
+    size.ypixel = 0;
+    raw_send_frame(fd, KPB_FRAME_ATTACH, &size, sizeof size);
+    {
+        /* The attach has to have landed, or the stall would hit the accept
+         * path - which is already bounded and is not what this is about. */
+        int waited = 0;
+        kpb_status probe;
+        while (waited++ < 200) {
+            if (kpb_query_status(runtime_dir, "clientstall", &probe) == KPB_OK &&
+                probe.attached == 1) {
+                break;
+            }
+            usleep(10000);
+        }
+        CHECK(waited < 200);
+    }
+
+    /* One byte of a twelve-byte header, then silence.  The pause matters: the
+     * broker has to have noticed the byte and entered the read before the
+     * status query arrives, or poll reports both at once, the listener is
+     * serviced first, and the test passes without ever reaching the stall. */
+    raw_write(fd, "\x4b", 1);
+    usleep(300000);
+
+    alarm(20);
+    CHECK(kpb_query_status(runtime_dir, "clientstall", &status) == KPB_OK);
+    alarm(0);
+
+    close(fd);
+    terminate_and_reap("clientstall");
+}
+
 /* Every frame a v1 peer receives must carry version 1 and a type it already
  * parses.  This is the test that catches an unconditionally emitted reply. */
 static void
@@ -1868,6 +1925,7 @@ main(int argc, char **argv) {
     RUN(test_resume_offset_past_end_falls_back);
     RUN(test_observer_replay_truncation_is_flagged);
     RUN(test_tui);
+    RUN(test_a_stalled_client_does_not_stop_the_broker);
     RUN(test_terminate);
     {
         char sessions[4096];

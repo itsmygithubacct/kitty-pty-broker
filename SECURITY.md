@@ -95,6 +95,25 @@ connection and can reconnect. Removing the cost entirely means driving the
 handshake from the poll loop the way `kilix-multiplexer` does, which is a
 larger change than this branch should carry.
 
+**And a correction to the correction.** The paragraph above was written when
+only `handle_new_connection()` had been bounded, and it was wrong in the same
+way the original claim was: `handle_client_frame()` — the next read from the
+same peer, once it has attached, in the same event loop — was still calling the
+unbounded `receive_frame()`. So a client that completed the handshake and then
+sent one byte of a header stopped the broker exactly as completely, one frame
+later. Measured: with only the accept path bounded, a status query never
+returned; with the client read bounded it returns at the deadline.
+
+Both reads are now bounded — 500 ms in the accept path, 2 s for an attached
+client, the longer budget because `send_frame()` writes the header and the
+payload as two separate writes, so a legitimate client descheduled between them
+is normal rather than hostile. `test_a_stalled_client_does_not_stop_the_broker`
+asserts it, and dies on an alarm against the previous build rather than hanging.
+
+The lesson worth recording is not the bug. It is that the first fix was
+verified against the case that prompted it and not against the shape of it, and
+the document was updated to match the fix rather than the property.
+
 ### 6. An observer cannot see more than the frontend
 
 An observer receives the replay journal and subsequent output — the same bytes

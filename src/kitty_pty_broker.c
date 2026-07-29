@@ -275,6 +275,19 @@ read_all_fd(int fd, void *data, size_t size) {
     return (ssize_t)received;
 }
 
+/* A deadline `millis` from now, normalised.  One place, because open-coding
+ * the tv_nsec carry at each call site is how one of them ends up wrong. */
+static void
+deadline_in(struct timespec *out, long millis) {
+    clock_gettime(CLOCK_MONOTONIC, out);
+    out->tv_sec += millis / 1000L;
+    out->tv_nsec += (millis % 1000L) * 1000000L;
+    if (out->tv_nsec >= 1000000000L) {
+        out->tv_nsec -= 1000000000L;
+        out->tv_sec += 1;
+    }
+}
+
 /* read_all_fd under a wall-clock deadline.
  *
  * The server reads a new peer's first frame from inside its event loop, so time
@@ -1389,10 +1402,25 @@ handle_new_connection(server_state *server) {
 static void
 handle_client_frame(server_state *server) {
     unsigned char payload[KPB_IO_CHUNK];
+    struct timespec deadline;
     uint32_t payload_size = 0;
     uint16_t type = 0;
-    kpb_result result = receive_frame(
-        server->client_fd, &type, payload, sizeof payload, &payload_size
+    kpb_result result;
+
+    /* Bounded for the same reason the accept path is, and it was a mistake to
+     * bound only that one: an attached client's frames are read from the same
+     * event loop, so a peer that stops mid-frame stops the broker just as
+     * completely one frame later.  Measured on the version that fixed only the
+     * accept path - a client sending one byte of a header held the loop
+     * indefinitely, and `kill` could not recover it.
+     *
+     * Two seconds rather than the accept path's half, because this peer is
+     * legitimate and send_frame writes the header and the payload separately:
+     * a client descheduled between those two writes is normal, not hostile. */
+    deadline_in(&deadline, 2000);
+    result = receive_frame_bounded(
+        server->client_fd, &type, payload, sizeof payload, &payload_size,
+        &deadline
     );
     if (result != KPB_OK) {
         close_client(server);
