@@ -521,6 +521,175 @@ test_transcript_captures_output_written_just_before_exit(void) {
     CHECK(unlink(transcript) == 0);
 }
 
+/* ---- protocol v1 regression fences ------------------------------------
+ *
+ * These two tests were written and landed against the pre-v2 tree.  They exist
+ * to pin the behaviour that protocol v2 must not disturb, so that a later
+ * failure points at the v2 change rather than at a rewritten expectation. */
+
+typedef struct {
+    unsigned char bytes[65536];
+    size_t used;
+    int events[16];
+    size_t event_count;
+    int wait_status;
+} capture;
+
+/* A deliberately deterministic child: no dates, no pids, no terminal-size
+ * queries.  Input is delivered only once the sentinel that invites it has been
+ * seen, so the byte stream cannot depend on scheduling. */
+static char *const *
+deterministic_command(void) {
+    static char *command[] = {
+        "/bin/sh", "-c",
+        "stty -echo; printf 'S0:'; "
+        "IFS= read -r a; printf 'A=%s:' \"$a\"; "
+        "IFS= read -r b; printf 'B=%s:DONE\\n' \"$b\"",
+        NULL
+    };
+    return command;
+}
+
+static void
+capture_record_event(capture *out, int type) {
+    CHECK(out->event_count < sizeof out->events / sizeof out->events[0]);
+    out->events[out->event_count++] = type;
+}
+
+/* Drive one full session through a v1 attach and record every payload byte and
+ * the ordered sequence of non-OUTPUT events. */
+static void
+capture_run(const char *session_id, capture *out) {
+    kpb_spawn_options options;
+    kpb_connection connection;
+    kpb_status status;
+    bool sent_a = false;
+    bool sent_b = false;
+
+    memset(out, 0, sizeof *out);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = session_id;
+    options.cwd = "/tmp";
+    options.argv = (char *const *)deterministic_command();
+    options.rows = 30;
+    options.columns = 100;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(kpb_attach(runtime_dir, session_id, 30, 100, 0, 0, &connection) == KPB_OK);
+
+    while (true) {
+        kpb_event event;
+        if (!sent_a && memmem(out->bytes, out->used, "S0:", 3)) {
+            CHECK(kpb_send_input(&connection, "alpha\n", 6) == KPB_OK);
+            sent_a = true;
+        } else if (sent_a && !sent_b && memmem(out->bytes, out->used, "A=alpha:", 8)) {
+            CHECK(kpb_send_input(&connection, "omega\n", 6) == KPB_OK);
+            sent_b = true;
+        }
+        wait_readable(connection.fd);
+        CHECK(kpb_receive(
+            &connection, out->bytes + out->used,
+            sizeof out->bytes - out->used, &event) == KPB_OK);
+        if (event.type == KPB_EVENT_OUTPUT) {
+            out->used += event.size;
+            CHECK(out->used < sizeof out->bytes);
+            continue;
+        }
+        capture_record_event(out, (int)event.type);
+        if (event.type == KPB_EVENT_EXIT) {
+            out->wait_status = event.exit_status;
+            break;
+        }
+        CHECK(event.type == KPB_EVENT_REPLAY_DONE);
+    }
+    kpb_detach(&connection);
+    wait_for_session_end(session_id);
+}
+
+/* A second read-write attach is refused with the exact v1 error frame, and the
+ * refusal touches nothing: the incumbent keeps working afterwards. */
+static void
+test_busy_refusal_v1(void) {
+    static const char expected[] = "session already attached";
+    char *command[] = {
+        "/bin/sh", "-c",
+        "stty -echo; printf 'READY:'; "
+        "while IFS= read -r line; do printf 'GOT=%s:' \"$line\"; done",
+        NULL
+    };
+    kpb_spawn_options options;
+    kpb_connection first;
+    kpb_connection second;
+    kpb_event event;
+    unsigned char output[16384];
+    unsigned char refusal[256];
+    size_t used;
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "busy-v1";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+
+    CHECK(kpb_attach(runtime_dir, "busy-v1", 24, 80, 0, 0, &first) == KPB_OK);
+    used = read_until_replay_done(&first, output, sizeof output);
+    while (!memmem(output, used, "READY:", 6)) {
+        wait_readable(first.fd);
+        CHECK(kpb_receive(&first, output + used, sizeof output - used, &event) == KPB_OK);
+        CHECK(event.type == KPB_EVENT_OUTPUT);
+        used += event.size;
+    }
+
+    /* Attach is fire-and-forget, so the refusal arrives as the first frame. */
+    CHECK(kpb_attach(runtime_dir, "busy-v1", 24, 80, 0, 0, &second) == KPB_OK);
+    wait_readable(second.fd);
+    CHECK(kpb_receive(&second, refusal, sizeof refusal, &event) == KPB_OK);
+    CHECK(event.type == KPB_EVENT_ERROR);
+    CHECK(event.size == sizeof expected - 1);
+    CHECK(memcmp(refusal, expected, sizeof expected - 1) == 0);
+    kpb_detach(&second);
+
+    /* Non-vacuity: the incumbent is undisturbed. */
+    CHECK(kpb_send_input(&first, "still-here\n", 11) == KPB_OK);
+    while (!memmem(output, used, "GOT=still-here:", 15)) {
+        wait_readable(first.fd);
+        CHECK(kpb_receive(&first, output + used, sizeof output - used, &event) == KPB_OK);
+        CHECK(event.type == KPB_EVENT_OUTPUT);
+        used += event.size;
+    }
+    kpb_detach(&first);
+    CHECK(kpb_terminate(runtime_dir, "busy-v1") == KPB_OK);
+    wait_for_session_end("busy-v1");
+}
+
+/* The same scripted session, run twice, must produce the same bytes.  This is
+ * the control half of the headline v2 guarantee: once observers exist, the
+ * second run attaches them and the assertion below must still hold. */
+static void
+test_v1_stream_byte_identical(void) {
+    static capture run_a;
+    static capture run_b;
+
+    capture_run("identical-a", &run_a);
+    capture_run("identical-b", &run_b);
+
+    CHECK(run_a.used == run_b.used);
+    CHECK(memcmp(run_a.bytes, run_b.bytes, run_a.used) == 0);
+    CHECK(run_a.wait_status == run_b.wait_status);
+    CHECK(WIFEXITED(run_a.wait_status));
+    CHECK(WEXITSTATUS(run_a.wait_status) == 0);
+    CHECK(run_a.event_count == run_b.event_count);
+    CHECK(memcmp(run_a.events, run_b.events,
+                 run_a.event_count * sizeof run_a.events[0]) == 0);
+    /* Exactly one replay boundary and one exit, in that order. */
+    CHECK(run_a.event_count == 2);
+    CHECK(run_a.events[0] == KPB_EVENT_REPLAY_DONE);
+    CHECK(run_a.events[1] == KPB_EVENT_EXIT);
+    /* Non-vacuity: the capture really contains the scripted conversation. */
+    CHECK(memmem(run_a.bytes, run_a.used, "B=omega:DONE", 12) != NULL);
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -557,6 +726,8 @@ main(int argc, char **argv) {
     test_transcript_captures_output_written_just_before_exit();
     test_transcript_absent_by_default();
     test_large_input_backpressure();
+    test_busy_refusal_v1();
+    test_v1_stream_byte_identical();
     test_tui();
     test_terminate();
     {
