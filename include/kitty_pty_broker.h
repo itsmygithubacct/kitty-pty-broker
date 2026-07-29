@@ -93,7 +93,12 @@ typedef enum {
     KPB_EVENT_OUTPUT = 1,
     KPB_EVENT_REPLAY_DONE = 2,
     KPB_EVENT_EXIT = 3,
-    KPB_EVENT_ERROR = 4
+    KPB_EVENT_ERROR = 4,
+    /* A screen reset to apply before what follows, carried in the buffer.
+     * Distinct from KPB_EVENT_OUTPUT because it occupies no journal position:
+     * a consumer tracking its offset must write these bytes and NOT count
+     * them. */
+    KPB_EVENT_RESET = 5
 } kpb_event_type;
 
 typedef struct {

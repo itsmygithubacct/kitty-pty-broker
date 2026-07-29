@@ -39,7 +39,16 @@ enum kpb_frame_type {
     KPB_FRAME_STATUS_REPLY = 11,
     KPB_FRAME_ACK = 12,
     KPB_FRAME_OBSERVE = 13,
-    KPB_FRAME_ATTACH_REPLY = 14
+    KPB_FRAME_ATTACH_REPLY = 14,
+    /* A screen reset the broker synthesised, sent ahead of a trimmed replay.
+     *
+     * Its own type rather than an OUTPUT frame because OUTPUT means "these
+     * bytes are at this position in the journal", and this sequence is at no
+     * position in it - the pane never wrote it.  Sending it as OUTPUT put
+     * every consumer that counts received bytes two ahead of the truth, so a
+     * later resume from that offset silently skipped two bytes of real
+     * output. */
+    KPB_FRAME_RESET = 15
 };
 
 /* Attach modes, carried in kpb_wire_attach.mode. */

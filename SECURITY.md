@@ -77,6 +77,24 @@ missed.
 Asserted by test: eight observers attached and never read while a pane floods
 a megabyte, and the read-write client still receives every byte.
 
+**Scope, and a correction.** That covers an observer that has finished
+connecting. It did not cover the step before, and an earlier version of this
+document implied it did. `handle_new_connection()` reads a peer's first frame
+inside the event loop, and until 2026-07-29 it read it with no time limit at
+all — so a peer that connected and then said nothing stopped the broker
+outright: no pane output, no client, no shutdown, until that peer went away.
+Reachable by any process running as the same user, which is the trust boundary
+this whole document sits inside, but "an observer cannot stall the pane" was
+still the wrong thing to have written. The bug predates the observer work; the
+v1 accept path has the same shape.
+
+That read now carries an absolute 500 ms budget, shared across the whole frame
+so that dribbling a byte at a time cannot extend it. What that buys is a
+bound, not immunity: a same-uid peer can still cost the loop half a second per
+connection and can reconnect. Removing the cost entirely means driving the
+handshake from the poll loop the way `kilix-multiplexer` does, which is a
+larger change than this branch should carry.
+
 ### 6. An observer cannot see more than the frontend
 
 An observer receives the replay journal and subsequent output — the same bytes

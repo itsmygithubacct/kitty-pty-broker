@@ -275,6 +275,60 @@ read_all_fd(int fd, void *data, size_t size) {
     return (ssize_t)received;
 }
 
+/* read_all_fd under a wall-clock deadline.
+ *
+ * The server reads a new peer's first frame from inside its event loop, so time
+ * spent in that read is time nothing else is served - not the pane, not the
+ * attached client, not another connection.  A per-read timeout does not fix
+ * that on its own, because a peer sending one byte per timeout period resets it
+ * forever; the budget has to be absolute and shared across the whole frame,
+ * which is what this is.
+ *
+ * A caller passing NULL gets the old blocking behaviour, which is correct for
+ * the client side of the protocol: there the peer is the broker, the process is
+ * doing nothing else, and a hang is visible to whoever ran it. */
+static ssize_t
+read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadline) {
+    unsigned char *cursor = data;
+    size_t received = 0;
+    if (!deadline) return read_all_fd(fd, data, size);
+    while (received < size) {
+        struct timespec moment;
+        struct pollfd waiting;
+        long remaining;
+        ssize_t count;
+        clock_gettime(CLOCK_MONOTONIC, &moment);
+        remaining = (long)(deadline->tv_sec - moment.tv_sec) * 1000L +
+                    (deadline->tv_nsec - moment.tv_nsec) / 1000000L;
+        if (remaining <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        waiting.fd = fd;
+        waiting.events = POLLIN;
+        waiting.revents = 0;
+        if (poll(&waiting, 1, (int)remaining) < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!(waiting.revents & (POLLIN | POLLHUP | POLLERR))) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        count = read(fd, cursor + received, size - received);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (count == 0) {
+            errno = ECONNRESET;
+            return -1;
+        }
+        received += (size_t)count;
+    }
+    return (ssize_t)received;
+}
+
 static kpb_result
 send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
     kpb_frame_header header;
@@ -297,17 +351,18 @@ send_error(int fd, const char *message) {
 }
 
 static kpb_result
-receive_frame(
+receive_frame_bounded(
     int fd,
     uint16_t *type,
     void *payload,
     size_t capacity,
-    uint32_t *payload_size
+    uint32_t *payload_size,
+    const struct timespec *deadline
 ) {
     kpb_frame_header header;
     uint32_t size;
     unsigned char discard[4096];
-    if (read_all_fd(fd, &header, sizeof header) < 0) return KPB_ERR_SYSTEM;
+    if (read_all_bounded(fd, &header, sizeof header, deadline) < 0) return KPB_ERR_SYSTEM;
     if (ntohl(header.magic) != KPB_PROTOCOL_MAGIC ||
         ntohs(header.version) != KPB_PROTOCOL_VERSION) {
         return KPB_ERR_PROTOCOL;
@@ -320,13 +375,24 @@ receive_frame(
         uint32_t left = size;
         while (left) {
             size_t chunk = left < sizeof discard ? left : sizeof discard;
-            if (read_all_fd(fd, discard, chunk) < 0) return KPB_ERR_SYSTEM;
+            if (read_all_bounded(fd, discard, chunk, deadline) < 0) return KPB_ERR_SYSTEM;
             left -= (uint32_t)chunk;
         }
         return KPB_ERR_BUFFER;
     }
-    if (size && read_all_fd(fd, payload, size) < 0) return KPB_ERR_SYSTEM;
+    if (size && read_all_bounded(fd, payload, size, deadline) < 0) return KPB_ERR_SYSTEM;
     return KPB_OK;
+}
+
+static kpb_result
+receive_frame(
+    int fd,
+    uint16_t *type,
+    void *payload,
+    size_t capacity,
+    uint32_t *payload_size
+) {
+    return receive_frame_bounded(fd, type, payload, capacity, payload_size, NULL);
 }
 
 static kpb_result
@@ -968,8 +1034,11 @@ replay_journal(
 ) {
     unsigned char buffer[KPB_IO_CHUNK];
     uint64_t at = plan->start;
+    /* Sent as its own frame type, not as OUTPUT: these two bytes are not in
+     * the journal, and a peer that counted them as journal content would carry
+     * a two-byte error in its resume offset for the life of the session. */
     if (plan->truncated &&
-        peer_send(observer, client_fd, KPB_FRAME_OUTPUT, "\033c", 2) != KPB_OK) {
+        peer_send(observer, client_fd, KPB_FRAME_RESET, "\033c", 2) != KPB_OK) {
         return -1;
     }
     while (at < plan->end) {
@@ -1252,6 +1321,7 @@ handle_v2_handshake(
 static void
 handle_new_connection(server_state *server) {
     unsigned char payload[sizeof(kpb_wire_status)];
+    struct timespec deadline;
     uint32_t payload_size = 0;
     uint16_t type = 0;
     int fd = accept4(server->listener_fd, NULL, NULL, SOCK_CLOEXEC);
@@ -1261,7 +1331,22 @@ handle_new_connection(server_state *server) {
         close(fd);
         return;
     }
-    if (receive_frame(fd, &type, payload, sizeof payload, &payload_size) != KPB_OK) {
+    /* Half a second.  A local peer writes its first frame immediately after
+     * connect, so this is generous by orders of magnitude, and it is kept short
+     * deliberately: the budget is also the longest the loop can be held by one
+     * connection, so it is the number that bounds how much a same-user peer can
+     * degrade responsiveness by connecting and saying nothing.  It cannot stop
+     * the broker, which is what the old unbounded read allowed; it can still
+     * slow it, which a non-blocking handshake driven from the loop would fix
+     * and this does not. */
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_nsec += 500L * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec += 1;
+    }
+    if (receive_frame_bounded(
+            fd, &type, payload, sizeof payload, &payload_size, &deadline) != KPB_OK) {
         close(fd);
         return;
     }
@@ -2007,6 +2092,10 @@ kpb_receive(
     switch (type) {
         case KPB_FRAME_OUTPUT:
             event->type = KPB_EVENT_OUTPUT;
+            event->size = payload_size;
+            return KPB_OK;
+        case KPB_FRAME_RESET:
+            event->type = KPB_EVENT_RESET;
             event->size = payload_size;
             return KPB_OK;
         case KPB_FRAME_REPLAY_DONE:

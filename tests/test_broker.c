@@ -1777,16 +1777,26 @@ test_observer_replay_truncation_is_flagged(void) {
         wait_readable(watcher.fd);
         CHECK(kpb_receive(&watcher, buffer, sizeof buffer, &event) == KPB_OK);
         if (event.type == KPB_EVENT_REPLAY_DONE) break;
-        CHECK(event.type == KPB_EVENT_OUTPUT);
         if (first_payload) {
-            /* The trimmed stream is self-correcting: it opens with a reset. */
+            /* The trimmed stream is self-correcting: it opens with a reset.
+             * That reset arrives as its own event, not as output, because it
+             * is not journal content - see the drift check below. */
+            CHECK(event.type == KPB_EVENT_RESET);
             CHECK(event.size == 2);
             CHECK(memcmp(buffer, "\033c", 2) == 0);
             first_payload = false;
+            continue;
         }
+        CHECK(event.type == KPB_EVENT_OUTPUT);
         replayed += event.size;
     }
-    CHECK(replayed == 2 + KPB_OBSERVER_REPLAY_MAX);
+    /* The reset is not in this total, and that is the point: a consumer that
+     * starts at result.journal_offset and adds every OUTPUT byte lands exactly
+     * on the journal's end.  While the reset was sent as OUTPUT it landed two
+     * bytes past it, and a later resume from that offset skipped two bytes of
+     * real output. */
+    CHECK(replayed == KPB_OBSERVER_REPLAY_MAX);
+    CHECK(result.journal_offset + replayed == status.journal_bytes);
 
     /* Not dropped: it is still attached and still receives terminal state. */
     CHECK(kpb_send_input(&client, "\004", 1) == KPB_OK);

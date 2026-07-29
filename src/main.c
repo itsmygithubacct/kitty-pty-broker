@@ -187,6 +187,14 @@ bridge(
                     exit_code = 1;
                     break;
                 }
+            } else if (event.type == KPB_EVENT_RESET) {
+                /* Written but deliberately not counted: it holds no journal
+                 * position, and adding it would push cursor_offset past the
+                 * end of what has actually been received. */
+                if (write_all(STDOUT_FILENO, buffer, event.size) != 0) {
+                    exit_code = 1;
+                    break;
+                }
             } else if (event.type == KPB_EVENT_REPLAY_DONE) {
                 replay_done = true;
             } else if (event.type == KPB_EVENT_EXIT) {
