@@ -18,6 +18,14 @@
 #define TUI_SESSION_LIMIT 2048U
 #define TUI_MESSAGE_MAX 256U
 
+#define TUI_RESET "\033[0m"
+#define TUI_TITLE "\033[1;37m"
+#define TUI_ACCENT "\033[34m"
+#define TUI_ALERT "\033[31m"
+#define TUI_MUTED "\033[2;37m"
+#define TUI_SELECTED "\033[1;37;44m"
+#define TUI_DANGER "\033[1;37;41m"
+
 typedef struct {
     kpb_status *items;
     size_t count;
@@ -308,45 +316,95 @@ draw_screen(
     size_t page_rows;
     size_t start;
     size_t offset;
+    size_t attached = 0;
     terminal_size(&rows, &columns);
-    fputs("\033[H\033[2J", stdout);
+    fputs(TUI_RESET "\033[H\033[2J", stdout);
+
+    /*
+     * Keep this frame in lockstep with kilix_tui.shell: identity/application,
+     * numbered navigation, one divider, one status row, then the body and a
+     * quiet footer.  Blue, red, white, and grey are the complete palette.
+     */
+    line_width = columns > 0U ? (unsigned int)columns - 1U : 0U;
+    move_to(1, 2);
+    fputs(TUI_TITLE "KILIX TUI" TUI_RESET, stdout);
+    if (columns > sizeof "PTY Sessions" + sizeof "KILIX TUI") {
+        move_to(1, (unsigned short)(columns - (sizeof "PTY Sessions" - 1U)));
+        fputs(TUI_MUTED "PTY Sessions" TUI_RESET, stdout);
+    }
+    move_to(2, 2);
+    fputs(TUI_SELECTED "▶1 Sessions " TUI_RESET, stdout);
+    move_to(3, 1);
+    fputs(TUI_MUTED, stdout);
+    for (offset = 0; offset < line_width; offset++) fputs("─", stdout);
+    fputs(TUI_RESET, stdout);
+
+    for (offset = 0; offset < list->count; offset++) {
+        if (list->items[offset].attached) attached++;
+    }
+    move_to(4, 2);
+    if (message && *message) {
+        fputs(TUI_ACCENT, stdout);
+        print_sanitized_field(
+            message, columns > 2U ? (unsigned int)columns - 2U : 0U
+        );
+        fputs(TUI_RESET, stdout);
+    } else {
+        char sizing[96];
+        int prefix_width = snprintf(
+            sizing,
+            sizeof sizing,
+            "%zu SESSIONS | %zu ATTACHED | RUNTIME ",
+            list->count,
+            attached
+        );
+        fputs(TUI_MUTED, stdout);
+        printf("%zu SESSIONS · %zu ATTACHED · RUNTIME ", list->count, attached);
+        print_sanitized_field(
+            runtime_dir,
+            prefix_width > 0 && (unsigned int)prefix_width + 2U < columns
+                ? (unsigned int)columns - (unsigned int)prefix_width - 2U
+                : 0U
+        );
+        fputs(TUI_RESET, stdout);
+    }
+
     if (rows < 12U || columns < 56U) {
-        move_to(1, 1);
-        fputs("\033[1;7m PTY Sessions \033[0m", stdout);
-        move_to(3, 1);
-        fputs("Terminal must be at least 56 columns by 12 rows.", stdout);
+        if (rows > 5U) {
+            move_to(5, 2);
+            fputs(
+                TUI_ALERT
+                "Terminal must be at least 56 columns by 12 rows."
+                TUI_RESET,
+                stdout
+            );
+        }
         move_to(rows, 1);
-        fputs("q: quit", stdout);
+        fputs(TUI_MUTED " q quit" TUI_RESET, stdout);
         fflush(stdout);
         return;
     }
 
-    line_width = columns;
-    move_to(1, 1);
-    fputs("\033[1;7m", stdout);
-    print_sanitized_field(" Kilix PTY Sessions", line_width);
-    fputs("\033[0m", stdout);
-    move_to(2, 1);
-    fputs("Runtime: ", stdout);
-    print_sanitized_field(runtime_dir, columns > 9U ? columns - 9U : 0U);
-
     id_width = columns / 4U;
     if (id_width < 12U) id_width = 12U;
     if (id_width > 24U) id_width = 24U;
-    command_width = columns - id_width - 31U;
-    move_to(4, 1);
-    fputs("  ", stdout);
+    command_width = columns - id_width - 32U;
+    move_to(5, 2);
+    fputs(TUI_TITLE "PTY SESSIONS" TUI_RESET, stdout);
+    move_to(7, 2);
+    fputs(TUI_MUTED "  ", stdout);
     print_sanitized_field("SESSION", id_width);
     fputs("  STATE     AGE      SIZE     COMMAND", stdout);
+    fputs(TUI_RESET, stdout);
 
-    page_rows = (size_t)rows - 9U;
+    page_rows = (size_t)rows - 10U;
     start = visible_page_start(selected, list->count, page_rows);
     for (offset = 0; offset < page_rows; offset++) {
         size_t index = start + offset;
-        unsigned short row = (unsigned short)(5U + offset);
-        move_to(row, 1);
+        unsigned short row = (unsigned short)(8U + offset);
+        move_to(row, 2);
         if (index >= list->count) {
-            print_sanitized_field("", columns);
+            print_sanitized_field("", columns - 2U);
             continue;
         }
         {
@@ -360,8 +418,8 @@ draw_screen(
                 dimensions, sizeof dimensions, "%ux%u",
                 status->columns, status->rows
             );
-            if (index == selected) fputs("\033[7m", stdout);
-            fputs(index == selected ? "> " : "  ", stdout);
+            if (index == selected) fputs(TUI_SELECTED, stdout);
+            fputs(index == selected ? "▶ " : "  ", stdout);
             print_sanitized_field(status->session_id, id_width);
             fputs("  ", stdout);
             print_sanitized_field(
@@ -371,20 +429,23 @@ draw_screen(
             print_sanitized_field(age, 8);
             print_sanitized_field(dimensions, 9);
             print_sanitized_field(status->command, command_width);
-            if (index == selected) fputs("\033[0m", stdout);
+            if (index == selected) fputs(TUI_RESET, stdout);
         }
     }
 
-    move_to((unsigned short)(rows - 3U), 1);
+    move_to((unsigned short)(rows - 2U), 2);
     if (list->count) {
         const kpb_status *status = &list->items[selected];
         char journal[20];
         format_bytes(status->journal_bytes, journal);
-        fputs("cwd: ", stdout);
-        print_sanitized_field(status->cwd, columns > 5U ? columns - 5U : 0U);
-        move_to((unsigned short)(rows - 2U), 1);
+        fputs(TUI_MUTED "cwd     " TUI_RESET, stdout);
+        print_sanitized_field(
+            status->cwd, columns > 9U ? columns - 9U : 0U
+        );
+        move_to((unsigned short)(rows - 1U), 2);
         printf(
-            "pid %ld  journal %s  replay %s",
+            TUI_MUTED "pid     " TUI_RESET
+            "%ld · journal %s · replay %s",
             (long)status->child_pid,
             journal,
             status->replay_complete ? "complete" : "partial"
@@ -397,35 +458,34 @@ draw_screen(
         }
     } else {
         fputs("No persistent PTY sessions are running.", stdout);
-        move_to((unsigned short)(rows - 2U), 1);
+        move_to((unsigned short)(rows - 1U), 2);
         fputs("Start a Kilix terminal; it will appear here automatically.", stdout);
     }
-    if (message && *message) {
-        move_to((unsigned short)(rows - 1U), 1);
-        print_sanitized_field(message, columns);
-    } else if (list->truncated) {
-        move_to((unsigned short)(rows - 1U), 1);
-        fputs("Session list truncated.", stdout);
+    if ((!message || !*message) && list->truncated) {
+        move_to(4, 2);
+        fputs(TUI_ALERT "Session list truncated." TUI_RESET, stdout);
     }
 
     move_to(rows, 1);
-    fputs("\033[7m", stdout);
     if (confirmation_id && confirmation_id[0]) {
         char prompt[TUI_MESSAGE_MAX];
         snprintf(
             prompt,
             sizeof prompt,
-            " Terminate %.64s and its process group?  y: yes  n: cancel",
+            " Terminate %.64s and its process group? · y yes · n cancel",
             confirmation_id
         );
+        fputs(TUI_DANGER, stdout);
         print_sanitized_field(prompt, line_width);
+        fputs(TUI_RESET, stdout);
     } else {
-        print_sanitized_field(
-            " Enter: attach   x: terminate   r: refresh   j/k or arrows: move   q: quit",
-            line_width
+        fputs(
+            TUI_MUTED
+            " Enter attach · x end · ↑/↓ move · r refresh · q quit"
+            TUI_RESET,
+            stdout
         );
     }
-    fputs("\033[0m", stdout);
     fflush(stdout);
 }
 

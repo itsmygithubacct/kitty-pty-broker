@@ -255,11 +255,15 @@ test_tui(void) {
         _exit(127);
     }
     used = read_pty_until(
-        master, output, used, sizeof output, "Kilix PTY Sessions"
+        master, output, used, sizeof output, "KILIX TUI"
+    );
+    used = read_pty_until(
+        master, output, used, sizeof output, "▶1 Sessions"
     );
     used = read_pty_until(
         master, output, used, sizeof output, "tui-session"
     );
+    CHECK(memmem(output, used, "─", sizeof "─" - 1U) != NULL);
     CHECK(memmem(output, used, injected, sizeof injected - 1U) == NULL);
 
     /* A split arrow-key escape sequence must not be mistaken for quit. */
