@@ -14,9 +14,11 @@ check it instead of believing it.
 
 A process running as the same user as the broker. `SO_PEERCRED` is checked at
 accept (`peer_is_owner`, `src/kitty_pty_broker.c`) and a peer with a different
-uid is closed before it can send anything, so this is not a boundary between
-users. It is a boundary between **roles**: something that should watch a pane
-versus something that should drive it.
+uid is closed before it can send anything. Connecting clients perform the same
+check on the broker, so a planted socket from another uid cannot forge status
+or terminal output. This is not a boundary between users; it is a boundary
+between **roles**: something that should watch a pane versus something that
+should drive it.
 
 That distinction matters because the multiplexer attaches as an observer. A
 bug there should not become control of the shell.
@@ -105,10 +107,10 @@ later. Measured: with only the accept path bounded, a status query never
 returned; with the client read bounded it returns at the deadline.
 
 Both reads are now bounded — 500 ms in the accept path, 2 s for an attached
-client, the longer budget because `send_frame()` writes the header and the
-payload as two separate writes, so a legitimate client descheduled between them
-is normal rather than hostile. `test_a_stalled_client_does_not_stop_the_broker`
-asserts it, and dies on an alarm against the previous build rather than hanging.
+client, the longer budget because a legitimate client may be briefly
+descheduled or backpressured while transmitting a maximum-sized frame.
+`test_a_stalled_client_does_not_stop_the_broker` asserts it, and dies on an
+alarm against the previous build rather than hanging.
 
 The lesson worth recording is not the bug. It is that the first fix was
 verified against the case that prompted it and not against the shape of it, and
@@ -157,5 +159,6 @@ descriptor 0.
 ```sh
 make test        # includes every claim above that is assertable
 make sanitize    # ASan + UBSan, with reports routed to files
-tests/mixed_version.sh
+make compatibility
+make fuzz        # framed protocol parser under libFuzzer + ASan + UBSan
 ```

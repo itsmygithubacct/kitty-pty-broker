@@ -11,7 +11,7 @@ extern "C" {
 
 #define KPB_VERSION_MAJOR 0
 #define KPB_VERSION_MINOR 3
-#define KPB_VERSION_PATCH 0
+#define KPB_VERSION_PATCH 1
 
 /* Read-only observers may attach alongside the single read-write client. They
  * never claim the read-write slot, never reach the PTY, and are disconnected
@@ -154,6 +154,10 @@ kpb_result kpb_generate_session_id(char output[KPB_SESSION_ID_MAX + 1]);
 kpb_result kpb_validate_session_id(const char *session_id);
 kpb_result kpb_prepare_runtime(const char *runtime_dir);
 
+/* Caller descriptors that survive normal FD_CLOEXEC handling remain available
+ * to the spawned command, while the persistent broker closes its copies.  The
+ * command starts with an empty signal mask; dispositions changed by the broker
+ * for its own lifecycle are restored to their conventional defaults. */
 kpb_result kpb_spawn(const kpb_spawn_options *options, kpb_status *status);
 kpb_result kpb_attach(
     const char *runtime_dir,

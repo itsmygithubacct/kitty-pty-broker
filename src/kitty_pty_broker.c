@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <pty.h>
 #include <signal.h>
@@ -136,10 +137,20 @@ be64_to_host(uint64_t value) {
 }
 
 static uint64_t
-now_millis(void) {
+clock_millis(clockid_t clock) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    if (clock_gettime(clock, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
+}
+
+static uint64_t
+realtime_millis(void) {
+    return clock_millis(CLOCK_REALTIME);
+}
+
+static uint64_t
+monotonic_millis(void) {
+    return clock_millis(CLOCK_MONOTONIC);
 }
 
 static int
@@ -236,13 +247,11 @@ build_paths(const char *runtime_dir, const char *session_id, session_paths *path
 }
 
 static ssize_t
-write_all_fd(int fd, const void *data, size_t size, bool socket_write) {
+write_all_fd(int fd, const void *data, size_t size) {
     const unsigned char *cursor = data;
     size_t written = 0;
     while (written < size) {
-        ssize_t count = socket_write
-            ? send(fd, cursor + written, size - written, MSG_NOSIGNAL)
-            : write(fd, cursor + written, size - written);
+        ssize_t count = write(fd, cursor + written, size - written);
         if (count < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -345,13 +354,45 @@ read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadlin
 static kpb_result
 send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
     kpb_frame_header header;
+    struct iovec vectors[2];
+    struct msghdr message;
+    size_t vector = 0;
+    size_t vector_count = payload_size ? 2U : 1U;
     if (payload_size > KPB_PROTOCOL_MAX_PAYLOAD) return KPB_ERR_INVALID;
     header.magic = htonl(KPB_PROTOCOL_MAGIC);
     header.version = htons(KPB_PROTOCOL_VERSION);
     header.type = htons(type);
     header.payload_size = htonl(payload_size);
-    if (write_all_fd(fd, &header, sizeof header, true) < 0) return KPB_ERR_SYSTEM;
-    if (payload_size && write_all_fd(fd, payload, payload_size, true) < 0) return KPB_ERR_SYSTEM;
+    vectors[0].iov_base = &header;
+    vectors[0].iov_len = sizeof header;
+    vectors[1].iov_base = (void *)payload;
+    vectors[1].iov_len = payload_size;
+    while (vector < vector_count) {
+        ssize_t count;
+        size_t consumed;
+        memset(&message, 0, sizeof message);
+        message.msg_iov = vectors + vector;
+        message.msg_iovlen = vector_count - vector;
+        count = sendmsg(fd, &message, MSG_NOSIGNAL);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return KPB_ERR_SYSTEM;
+        }
+        if (count == 0) {
+            errno = EPIPE;
+            return KPB_ERR_SYSTEM;
+        }
+        consumed = (size_t)count;
+        while (vector < vector_count && consumed >= vectors[vector].iov_len) {
+            consumed -= vectors[vector].iov_len;
+            vector++;
+        }
+        if (consumed && vector < vector_count) {
+            vectors[vector].iov_base =
+                (unsigned char *)vectors[vector].iov_base + consumed;
+            vectors[vector].iov_len -= consumed;
+        }
+    }
     return KPB_OK;
 }
 
@@ -408,6 +449,8 @@ receive_frame(
     return receive_frame_bounded(fd, type, payload, capacity, payload_size, NULL);
 }
 
+static bool peer_is_owner(int fd);
+
 static kpb_result
 connect_session(const char *runtime_dir, const char *session_id, int *fd_out) {
     session_paths paths;
@@ -425,6 +468,13 @@ connect_session(const char *runtime_dir, const char *session_id, int *fd_out) {
         close(fd);
         errno = saved;
         return saved == ENOENT || saved == ECONNREFUSED ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM;
+    }
+    /* The server validates clients; the client must validate the server too.
+     * Otherwise an explicitly supplied public runtime path could feed terminal
+     * controls or forged status data from another uid. */
+    if (!peer_is_owner(fd)) {
+        close(fd);
+        return KPB_ERR_SECURITY;
     }
     *fd_out = fd;
     return KPB_OK;
@@ -617,7 +667,7 @@ write_metadata(server_state *server) {
     }
     fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
-    if (write_all_fd(fd, data, (size_t)count, false) < 0 || fsync(fd) != 0) {
+    if (write_all_fd(fd, data, (size_t)count) < 0 || fsync(fd) != 0) {
         int saved = errno;
         close(fd);
         unlink(temporary);
@@ -806,7 +856,7 @@ append_journal(server_state *server, const unsigned char *data, size_t size) {
         size_t keep = size;
         if (ftruncate(server->journal_fd, 0) != 0 ||
             lseek(server->journal_fd, 0, SEEK_SET) < 0 ||
-            write_all_fd(server->journal_fd, reset_sequence, sizeof reset_sequence - 1, false) < 0) {
+            write_all_fd(server->journal_fd, reset_sequence, sizeof reset_sequence - 1) < 0) {
             return -1;
         }
         server->journal_bytes = sizeof reset_sequence - 1;
@@ -825,7 +875,7 @@ append_journal(server_state *server, const unsigned char *data, size_t size) {
             size = keep;
         }
     }
-    if (write_all_fd(server->journal_fd, data, size, false) < 0) return -1;
+    if (write_all_fd(server->journal_fd, data, size) < 0) return -1;
     server->journal_bytes += size;
     return 0;
 }
@@ -908,7 +958,7 @@ write_transcript(server_state *server, const unsigned char *data, size_t size) {
             return -1;
         }
     }
-    if (write_all_fd(server->transcript_fd, data, size, false) < 0) return -1;
+    if (write_all_fd(server->transcript_fd, data, size) < 0) return -1;
     server->transcript_bytes += size;
     return 0;
 }
@@ -927,6 +977,25 @@ format_elided_graphics(server_state *server, unsigned char *out) {
     return (size_t)length;
 }
 
+static int
+reserve_transcript_output(
+    server_state *server,
+    unsigned char *out,
+    size_t capacity,
+    size_t *used,
+    size_t needed
+) {
+    if (needed > capacity) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (*used > capacity - needed) {
+        if (write_transcript(server, out, *used) != 0) return -1;
+        *used = 0;
+    }
+    return 0;
+}
+
 /* Copy PTY output into the transcript, dropping kitty graphics payloads.
  *
  * The scanner must survive buffer boundaries, because one APC sequence
@@ -938,38 +1007,60 @@ static int
 append_transcript(server_state *server, const unsigned char *data, size_t size) {
     unsigned char out[KPB_IO_CHUNK + TRANSCRIPT_MARKER_MAX * 2];
     size_t out_length = 0;
-    size_t index;
+    size_t index = 0;
     if (server->transcript_fd < 0 || !size) return 0;
     if (server->transcript_graphics == KPB_TRANSCRIPT_GRAPHICS_KEEP) {
         return write_transcript(server, data, size);
     }
-    for (index = 0; index < size; index++) {
-        unsigned char byte = data[index];
-        /* Guarantee room for the widest single-step emission: a marker, or a
-         * held ESC _ prefix plus the byte that disproved it. */
-        if (out_length + TRANSCRIPT_MARKER_MAX > sizeof out) {
-            if (write_transcript(server, out, out_length) != 0) return -1;
-            out_length = 0;
-        }
+    while (index < size) {
+        unsigned char byte;
         switch (server->transcript_scan) {
+            case TRANSCRIPT_TEXT: {
+                const unsigned char *escape = memchr(
+                    data + index, 0x1b, size - index);
+                size_t run = escape
+                    ? (size_t)(escape - (data + index)) : size - index;
+                if (reserve_transcript_output(
+                        server, out, sizeof out, &out_length, run) != 0) {
+                    return -1;
+                }
+                memcpy(out + out_length, data + index, run);
+                out_length += run;
+                index += run;
+                if (index < size) {
+                    server->transcript_scan = TRANSCRIPT_ESCAPE;
+                    index++;
+                }
+                break;
+            }
             case TRANSCRIPT_ESCAPE:
+                byte = data[index++];
                 if (byte == '_') {
                     server->transcript_scan = TRANSCRIPT_APC;
                     break;
                 }
+                if (reserve_transcript_output(
+                        server, out, sizeof out, &out_length, 2) != 0) {
+                    return -1;
+                }
                 out[out_length++] = 0x1b;
-                server->transcript_scan = TRANSCRIPT_TEXT;
-                /* fall through: reconsider this byte as ordinary text */
-                __attribute__((fallthrough));
-            case TRANSCRIPT_TEXT:
-                if (byte == 0x1b) server->transcript_scan = TRANSCRIPT_ESCAPE;
-                else out[out_length++] = byte;
+                if (byte == 0x1b) {
+                    server->transcript_scan = TRANSCRIPT_ESCAPE;
+                } else {
+                    out[out_length++] = byte;
+                    server->transcript_scan = TRANSCRIPT_TEXT;
+                }
                 break;
             case TRANSCRIPT_APC:
+                byte = data[index++];
                 if (byte == 'G') {
                     server->transcript_scan = TRANSCRIPT_GRAPHICS;
                     server->transcript_elided = 3;
                     break;
+                }
+                if (reserve_transcript_output(
+                        server, out, sizeof out, &out_length, 3) != 0) {
+                    return -1;
                 }
                 out[out_length++] = 0x1b;
                 out[out_length++] = '_';
@@ -980,19 +1071,43 @@ append_transcript(server_state *server, const unsigned char *data, size_t size) 
                     server->transcript_scan = TRANSCRIPT_TEXT;
                 }
                 break;
-            case TRANSCRIPT_GRAPHICS:
+            case TRANSCRIPT_GRAPHICS: {
+                const unsigned char *escape = memchr(
+                    data + index, 0x1b, size - index);
+                const unsigned char *bell = memchr(
+                    data + index, 0x07, size - index);
+                const unsigned char *special = !escape ? bell :
+                    (!bell || escape < bell ? escape : bell);
+                size_t run = special
+                    ? (size_t)(special - (data + index)) : size - index;
+                server->transcript_elided += (uint64_t)run;
+                index += run;
+                if (index == size) break;
+                byte = data[index++];
                 server->transcript_elided++;
                 if (byte == 0x1b) {
                     server->transcript_scan = TRANSCRIPT_GRAPHICS_ESCAPE;
                 } else if (byte == 0x07) {
                     server->transcript_scan = TRANSCRIPT_TEXT;
+                    if (reserve_transcript_output(
+                            server, out, sizeof out, &out_length,
+                            TRANSCRIPT_MARKER_MAX) != 0) {
+                        return -1;
+                    }
                     out_length += format_elided_graphics(server, out + out_length);
                 }
                 break;
+            }
             case TRANSCRIPT_GRAPHICS_ESCAPE:
+                byte = data[index++];
                 server->transcript_elided++;
                 if (byte == '\\') {
                     server->transcript_scan = TRANSCRIPT_TEXT;
+                    if (reserve_transcript_output(
+                            server, out, sizeof out, &out_length,
+                            TRANSCRIPT_MARKER_MAX) != 0) {
+                        return -1;
+                    }
                     out_length += format_elided_graphics(server, out + out_length);
                 } else if (byte != 0x1b) {
                     server->transcript_scan = TRANSCRIPT_GRAPHICS;
@@ -1000,6 +1115,11 @@ append_transcript(server_state *server, const unsigned char *data, size_t size) 
                 break;
             default:
                 server->transcript_scan = TRANSCRIPT_TEXT;
+                byte = data[index++];
+                if (reserve_transcript_output(
+                        server, out, sizeof out, &out_length, 1) != 0) {
+                    return -1;
+                }
                 out[out_length++] = byte;
                 break;
         }
@@ -1139,7 +1259,7 @@ static void
 request_termination(server_state *server) {
     if (server->terminate_requested) return;
     server->terminate_requested = true;
-    server->terminate_deadline = now_millis() + 1500;
+    server->terminate_deadline = monotonic_millis() + 1500;
     signal_child_session(server->child_pid, SIGTERM);
 }
 
@@ -1250,6 +1370,7 @@ handle_v2_handshake(
     replay_plan plan;
     uint16_t selected = ntohs(request->version);
     uint16_t mode = ntohs(request->mode);
+    uint32_t request_flags = ntohl(request->flags);
     bool observing = type == KPB_FRAME_OBSERVE;
 
     if (selected > KPB_PROTOCOL_VERSION_MAX) {
@@ -1263,6 +1384,10 @@ handle_v2_handshake(
         return;
     }
     if (mode != (observing ? KPB_WIRE_MODE_OBSERVE : KPB_WIRE_MODE_CONTROL)) {
+        refuse_v2(fd, KPB_ERR_PROTOCOL);
+        return;
+    }
+    if (request_flags & ~KPB_ATTACH_FLAG_RESUME) {
         refuse_v2(fd, KPB_ERR_PROTOCOL);
         return;
     }
@@ -1352,12 +1477,7 @@ handle_new_connection(server_state *server) {
      * the broker, which is what the old unbounded read allowed; it can still
      * slow it, which a non-blocking handshake driven from the loop would fix
      * and this does not. */
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_nsec += 500L * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_nsec -= 1000000000L;
-        deadline.tv_sec += 1;
-    }
+    deadline_in(&deadline, 500);
     if (receive_frame_bounded(
             fd, &type, payload, sizeof payload, &payload_size, &deadline) != KPB_OK) {
         close(fd);
@@ -1415,8 +1535,8 @@ handle_client_frame(server_state *server) {
      * indefinitely, and `kill` could not recover it.
      *
      * Two seconds rather than the accept path's half, because this peer is
-     * legitimate and send_frame writes the header and the payload separately:
-     * a client descheduled between those two writes is normal, not hostile. */
+     * legitimate and may be briefly descheduled or backpressured while
+     * transmitting a maximum-sized frame. */
     deadline_in(&deadline, 2000);
     result = receive_frame_bounded(
         server->client_fd, &type, payload, sizeof payload, &payload_size,
@@ -1435,7 +1555,11 @@ handle_client_frame(server_state *server) {
             break;
         case KPB_FRAME_RESIZE:
             if (payload_size == sizeof(kpb_wire_winsize)) {
-                apply_size(server, (const kpb_wire_winsize *)payload);
+                /* The receive buffer is an unsigned-char array and therefore
+                 * promises no alignment suitable for kpb_wire_winsize. */
+                kpb_wire_winsize size;
+                memcpy(&size, payload, sizeof size);
+                apply_size(server, &size);
             } else {
                 close_client(server);
             }
@@ -1500,6 +1624,25 @@ wait_status_to_exit_code(int status) {
     return 255;
 }
 
+static int
+forward_pty_output(server_state *server, const unsigned char *data, size_t size) {
+    if (append_journal(server, data, size) != 0) return -1;
+    /* A transcript is best-effort: a full disk or a revoked directory must
+     * not take down a live shell. */
+    if (append_transcript(server, data, size) != 0) {
+        close(server->transcript_fd);
+        server->transcript_fd = -1;
+    }
+    if (server->client_fd >= 0 &&
+        send_frame(
+            server->client_fd, KPB_FRAME_OUTPUT, data, (uint32_t)size
+        ) != KPB_OK) {
+        close_client(server);
+    }
+    observers_send(server, KPB_FRAME_OUTPUT, data, (uint32_t)size);
+    return 0;
+}
+
 /* Consume output the child wrote just before exiting.
  *
  * Reaping the child does not empty the PTY: bytes written immediately before
@@ -1511,31 +1654,26 @@ wait_status_to_exit_code(int status) {
 static void
 drain_pty(server_state *server) {
     unsigned char buffer[KPB_IO_CHUNK];
-    const uint64_t deadline = now_millis() + 200;
-    while (now_millis() < deadline) {
+    const uint64_t deadline = monotonic_millis() + 200;
+    while (monotonic_millis() < deadline) {
         struct pollfd descriptor = {.fd = server->pty_fd, .events = POLLIN, .revents = 0};
-        ssize_t count;
+        size_t used = 0;
         int ready = poll(&descriptor, 1, 20);
         if (ready < 0) {
             if (errno == EINTR) continue;
             return;
         }
         if (ready == 0) return;
-        count = read(server->pty_fd, buffer, sizeof buffer);
-        if (count <= 0) {
+        while (used < sizeof buffer) {
+            ssize_t count = read(server->pty_fd, buffer + used, sizeof buffer - used);
+            if (count > 0) {
+                used += (size_t)count;
+                continue;
+            }
             if (count < 0 && errno == EINTR) continue;
-            return;
+            break;
         }
-        if (append_journal(server, buffer, (size_t)count) != 0) return;
-        if (append_transcript(server, buffer, (size_t)count) != 0) {
-            close(server->transcript_fd);
-            server->transcript_fd = -1;
-        }
-        if (server->client_fd >= 0 &&
-            send_frame(server->client_fd, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != KPB_OK) {
-            close_client(server);
-        }
-        observers_send(server, KPB_FRAME_OUTPUT, buffer, (uint32_t)count);
+        if (!used || forward_pty_output(server, buffer, used) != 0) return;
     }
 }
 
@@ -1544,8 +1682,8 @@ drain_pty(server_state *server) {
  * rather than allowed to delay teardown. */
 static void
 observers_drain(server_state *server) {
-    const uint64_t deadline = now_millis() + 200;
-    while (now_millis() < deadline) {
+    const uint64_t deadline = monotonic_millis() + 200;
+    while (monotonic_millis() < deadline) {
         struct pollfd descriptors[KPB_OBSERVER_MAX];
         size_t slots[KPB_OBSERVER_MAX];
         nfds_t pending = 0;
@@ -1583,12 +1721,19 @@ server_loop(server_state *server) {
     bool child_exited = false;
     while (!child_exited) {
         struct pollfd descriptors[3 + KPB_OBSERVER_MAX];
+        struct timespec timeout;
+        struct timespec *timeout_pointer = NULL;
+        sigset_t wait_mask;
         uint32_t generations[KPB_OBSERVER_MAX];
         size_t slot;
         int result;
         pid_t waited = waitpid(server->child_pid, &child_status, WNOHANG);
         if (waited == server->child_pid) child_exited = true;
-        if (server->terminate_requested && now_millis() >= server->terminate_deadline) {
+        else if (waited < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (server->terminate_requested && monotonic_millis() >= server->terminate_deadline) {
             signal_child_session(server->child_pid, SIGKILL);
             server->terminate_deadline = UINT64_MAX;
         }
@@ -1611,7 +1756,22 @@ server_loop(server_state *server) {
             descriptors[3 + slot].revents = 0;
             generations[slot] = observer->generation;
         }
-        result = poll(descriptors, 3 + KPB_OBSERVER_MAX, child_exited ? 0 : 100);
+        if (child_exited) {
+            timeout.tv_sec = 0;
+            timeout.tv_nsec = 0;
+            timeout_pointer = &timeout;
+        } else if (server->terminate_requested &&
+                   server->terminate_deadline != UINT64_MAX) {
+            uint64_t now = monotonic_millis();
+            uint64_t remaining = server->terminate_deadline > now
+                ? server->terminate_deadline - now : 0;
+            timeout.tv_sec = (time_t)(remaining / 1000U);
+            timeout.tv_nsec = (long)(remaining % 1000U) * 1000000L;
+            timeout_pointer = &timeout;
+        }
+        sigemptyset(&wait_mask);
+        result = ppoll(
+            descriptors, 3 + KPB_OBSERVER_MAX, timeout_pointer, &wait_mask);
         if (result < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -1640,29 +1800,19 @@ server_loop(server_state *server) {
             if (revents & POLLIN) handle_observer_frame(server, slot);
             else if (revents & (POLLHUP | POLLERR)) observer_close(server, slot);
         }
-        if (descriptors[1].revents & (POLLIN | POLLHUP)) {
-            while (true) {
-                ssize_t count = read(server->pty_fd, buffer, sizeof buffer);
+        if (descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) {
+            size_t used = 0;
+            while (used < sizeof buffer) {
+                ssize_t count = read(
+                    server->pty_fd, buffer + used, sizeof buffer - used);
                 if (count > 0) {
-                    if (append_journal(server, buffer, (size_t)count) != 0) return -1;
-                    /* A transcript is best-effort: a full disk or a revoked
-                     * directory must not take down a live shell. */
-                    if (append_transcript(server, buffer, (size_t)count) != 0) {
-                        close(server->transcript_fd);
-                        server->transcript_fd = -1;
-                    }
-                    if (server->client_fd >= 0 &&
-                        send_frame(server->client_fd, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != KPB_OK) {
-                        close_client(server);
-                    }
-                    observers_send(server, KPB_FRAME_OUTPUT, buffer, (uint32_t)count);
-                    if ((size_t)count < sizeof buffer) break;
+                    used += (size_t)count;
                     continue;
                 }
-                if (count < 0 && (errno == EINTR)) continue;
-                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EIO)) break;
+                if (count < 0 && errno == EINTR) continue;
                 break;
             }
+            if (used && forward_pty_output(server, buffer, used) != 0) return -1;
         }
         if (descriptors[1].revents & POLLOUT) {
             if (flush_input(server) != 0) return -1;
@@ -1679,7 +1829,7 @@ server_loop(server_state *server) {
     drain_pty(server);
     {
         kpb_wire_exit wire;
-        wire.wait_status = htonl(child_status);
+        wire.wait_status = htonl((uint32_t)child_status);
         if (server->client_fd >= 0) {
             (void)send_frame(server->client_fd, KPB_FRAME_EXIT, &wire, sizeof wire);
         }
@@ -1706,28 +1856,96 @@ cleanup_server(server_state *server) {
     rmdir(server->paths.session_dir);
 }
 
-static void
+static int
 reset_child_signals(void) {
     struct sigaction action;
+    sigset_t mask;
     int signals[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGCHLD, SIGPIPE};
     size_t index;
     memset(&action, 0, sizeof action);
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
     for (index = 0; index < sizeof signals / sizeof signals[0]; index++) {
-        sigaction(signals[index], &action, NULL);
+        if (sigaction(signals[index], &action, NULL) != 0) return -1;
     }
+    sigemptyset(&mask);
+    return sigprocmask(SIG_SETMASK, &mask, NULL);
 }
 
 static void
-ignore_server_signals(void) {
+handle_server_child(int signal_number) {
+    (void)signal_number;
+}
+
+static int
+configure_server_signals(void) {
     struct sigaction action;
+    sigset_t mask;
+    int ignored[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE};
+    size_t index;
     memset(&action, 0, sizeof action);
-    action.sa_handler = SIG_IGN;
     sigemptyset(&action.sa_mask);
-    sigaction(SIGHUP, &action, NULL);
-    sigaction(SIGTERM, &action, NULL);
-    sigaction(SIGPIPE, &action, NULL);
+    /* SIGCHLD == SIG_IGN auto-reaps children on Linux.  Inheriting that from a
+     * library caller would make waitpid report ECHILD forever.  Block it
+     * outside ppoll, then atomically unblock it while waiting: that removes the
+     * check-then-sleep race without waking every idle broker ten times a
+     * second just to call waitpid. */
+    action.sa_handler = handle_server_child;
+    action.sa_flags = SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &action, NULL) != 0) return -1;
+    action.sa_handler = SIG_IGN;
+    action.sa_flags = 0;
+    for (index = 0; index < sizeof ignored / sizeof ignored[0]; index++) {
+        if (sigaction(ignored[index], &action, NULL) != 0) return -1;
+    }
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    return sigprocmask(SIG_SETMASK, &mask, NULL);
+}
+
+static bool
+server_owns_fd(const server_state *server, int ready_fd, int fd) {
+    return fd <= STDERR_FILENO || fd == ready_fd || fd == server->listener_fd ||
+        fd == server->pty_fd || fd == server->journal_fd ||
+        fd == server->transcript_fd;
+}
+
+/* kpb_spawn() is a library boundary, so its caller may have arbitrary open
+ * pipes, files, and sockets.  The command must inherit those descriptors just
+ * as it would without the broker wrapper, but the persistent broker must not:
+ * retaining one can postpone EOF or keep an unrelated resource alive for the
+ * whole terminal session.  Run this in the forkpty parent, after the command
+ * child has inherited its launch environment. */
+static void
+close_inherited_fds(server_state *server, int ready_fd) {
+    DIR *directory = opendir("/proc/self/fd");
+    if (directory) {
+        struct dirent *entry;
+        int directory_fd = dirfd(directory);
+        while ((entry = readdir(directory))) {
+            char *end = NULL;
+            long value;
+            errno = 0;
+            value = strtol(entry->d_name, &end, 10);
+            if (errno || !end || *end || value < 0 || value > INT_MAX) continue;
+            if ((int)value == directory_fd ||
+                server_owns_fd(server, ready_fd, (int)value)) {
+                continue;
+            }
+            (void)close((int)value);
+        }
+        closedir(directory);
+        return;
+    }
+    {
+        long maximum = sysconf(_SC_OPEN_MAX);
+        int fd;
+        if (maximum < 0) maximum = 1024;
+        if (maximum > INT_MAX) maximum = INT_MAX;
+        for (fd = STDERR_FILENO + 1; fd < (int)maximum; fd++) {
+            if (!server_owns_fd(server, ready_fd, fd)) (void)close(fd);
+        }
+    }
 }
 
 static int
@@ -1748,7 +1966,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         }
     }
     server.child_pid = -1;
-    server.started_millis = now_millis();
+    server.started_millis = realtime_millis();
     server.journal_limit = options->journal_limit;
     server.transcript_limit = options->transcript_limit;
     server.transcript_graphics = options->transcript_graphics;
@@ -1763,7 +1981,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     build_command(server.command, options->argv);
     if (build_paths(options->runtime_dir, session_id, &server.paths) != KPB_OK) goto fail;
     if (setsid() < 0) goto fail;
-    ignore_server_signals();
+    if (configure_server_signals() != 0) goto fail;
     null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (null_fd >= 0) {
         (void)dup2(null_fd, STDIN_FILENO);
@@ -1797,8 +2015,18 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
             if (fstat(server.transcript_fd, &transcript_status) == 0 &&
                 S_ISREG(transcript_status.st_mode) &&
                 transcript_status.st_uid == geteuid() &&
+                fchmod(server.transcript_fd, 0600) == 0 &&
                 lseek(server.transcript_fd, 0, SEEK_END) >= 0) {
                 server.transcript_bytes = (uint64_t)transcript_status.st_size;
+                if (server.transcript_limit &&
+                    server.transcript_bytes > server.transcript_limit) {
+                    uint64_t keep = server.transcript_limit -
+                        server.transcript_limit / 4U;
+                    if (rotate_transcript(&server, keep) != 0) {
+                        close(server.transcript_fd);
+                        server.transcript_fd = -1;
+                    }
+                }
             } else {
                 close(server.transcript_fd);
                 server.transcript_fd = -1;
@@ -1808,7 +2036,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     server.child_pid = forkpty(&server.pty_fd, NULL, NULL, &server.size);
     if (server.child_pid < 0) goto fail;
     if (server.child_pid == 0) {
-        reset_child_signals();
+        if (reset_child_signals() != 0) _exit(126);
         close(ready_fd);
         close(server.listener_fd);
         close(server.journal_fd);
@@ -1819,24 +2047,33 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         execvp(options->argv[0], options->argv);
         _exit(errno == ENOENT ? 127 : 126);
     }
+    close_inherited_fds(&server, ready_fd);
     {
         int flags = fcntl(server.pty_fd, F_GETFL);
-        if (flags >= 0) (void)fcntl(server.pty_fd, F_SETFL, flags | O_NONBLOCK);
+        if (flags < 0 || fcntl(server.pty_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            goto fail;
+        }
     }
     if (write_metadata(&server) != 0) goto fail;
     memset(&ready, 0, sizeof ready);
     ready.broker_pid = getpid();
     ready.child_pid = server.child_pid;
-    if (write_all_fd(ready_fd, &ready, sizeof ready, false) < 0) goto fail_after_ready;
+    if (write_all_fd(ready_fd, &ready, sizeof ready) < 0) goto fail_after_ready;
     close(ready_fd);
     exit_code = server_loop(&server);
+    if (exit_code < 0 && server.child_pid > 0) {
+        signal_child_session(server.child_pid, SIGKILL);
+        while (waitpid(server.child_pid, NULL, 0) < 0 && errno == EINTR) {
+            /* retry */
+        }
+    }
     cleanup_server(&server);
     return exit_code < 0 ? 255 : exit_code;
 
 fail:
     memset(&ready, 0, sizeof ready);
     ready.error_number = errno ? errno : EIO;
-    (void)write_all_fd(ready_fd, &ready, sizeof ready, false);
+    (void)write_all_fd(ready_fd, &ready, sizeof ready);
 fail_after_ready:
     if (ready_fd >= 0) close(ready_fd);
     if (server.child_pid > 0) {
@@ -1860,6 +2097,14 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
     struct stat existing;
     if (!options || !options->runtime_dir || !options->cwd ||
         !options->argv || !options->argv[0]) {
+        return KPB_ERR_INVALID;
+    }
+    if (strlen(options->cwd) >= KPB_PATH_MAX ||
+        options->journal_limit > INT64_MAX ||
+        options->transcript_limit > INT64_MAX ||
+        (options->transcript_path &&
+         options->transcript_graphics != KPB_TRANSCRIPT_GRAPHICS_ELIDE &&
+         options->transcript_graphics != KPB_TRANSCRIPT_GRAPHICS_KEEP)) {
         return KPB_ERR_INVALID;
     }
     session_id = options->session_id;
@@ -1985,16 +2230,21 @@ kpb_attach_with_options(
     uint32_t payload_size = 0;
     uint32_t flags;
     bool observing;
+    uint16_t requested_version;
+    uint16_t selected_version;
     int fd = -1;
     kpb_result outcome;
 
-    if (!options || !connection) return KPB_ERR_INVALID;
+    if (!connection) return KPB_ERR_INVALID;
+    memset(connection, 0, sizeof *connection);
+    connection->fd = -1;
+    if (result) memset(result, 0, sizeof *result);
+    if (!options || options->max_version < 1) return KPB_ERR_INVALID;
     observing = options->mode == KPB_ATTACH_OBSERVE;
     if (options->mode != KPB_ATTACH_CONTROL && !observing) return KPB_ERR_INVALID;
     if ((observing || options->resume) && options->max_version < 2) {
         return KPB_ERR_INVALID;
     }
-    if (result) memset(result, 0, sizeof *result);
     if (options->max_version < 2) {
         outcome = kpb_attach(
             runtime_dir, session_id,
@@ -2004,8 +2254,6 @@ kpb_attach_with_options(
         return outcome;
     }
 
-    memset(connection, 0, sizeof *connection);
-    connection->fd = -1;
     outcome = connect_session(runtime_dir, session_id, &fd);
     if (outcome != KPB_OK) return outcome;
 
@@ -2016,7 +2264,9 @@ kpb_attach_with_options(
     request.columns = htons(observing ? 0 : options->columns);
     request.xpixel = htons(observing ? 0 : options->xpixel);
     request.ypixel = htons(observing ? 0 : options->ypixel);
-    request.version = htons((uint16_t)options->max_version);
+    requested_version = options->max_version > KPB_PROTOCOL_VERSION_MAX
+        ? (uint16_t)KPB_PROTOCOL_VERSION_MAX : (uint16_t)options->max_version;
+    request.version = htons(requested_version);
     request.mode = htons(
         observing ? (uint16_t)KPB_WIRE_MODE_OBSERVE : (uint16_t)KPB_WIRE_MODE_CONTROL);
     request.flags = htonl(options->resume ? KPB_ATTACH_FLAG_RESUME : 0U);
@@ -2049,8 +2299,16 @@ kpb_attach_with_options(
         return code <= KPB_ERR_CHILD ? (kpb_result)code : KPB_ERR_PROTOCOL;
     }
     flags = ntohl(reply.flags);
+    selected_version = ntohs(reply.version);
+    if (selected_version < 2 || selected_version > KPB_PROTOCOL_VERSION_MAX ||
+        selected_version > requested_version ||
+        (flags & ~(KPB_REPLY_FLAG_RESUMED | KPB_REPLY_FLAG_COMPLETE |
+                   KPB_REPLY_FLAG_TRUNCATED))) {
+        close(fd);
+        return KPB_ERR_PROTOCOL;
+    }
     if (result) {
-        result->version = ntohs(reply.version);
+        result->version = selected_version;
         result->resumed = (flags & KPB_REPLY_FLAG_RESUMED) != 0;
         result->truncated = (flags & KPB_REPLY_FLAG_TRUNCATED) != 0;
         result->replay_complete = (flags & KPB_REPLY_FLAG_COMPLETE) != 0;
@@ -2138,7 +2396,11 @@ kpb_receive(
             if (payload_size != sizeof wire) return KPB_ERR_PROTOCOL;
             memcpy(&wire, buffer, sizeof wire);
             event->type = KPB_EVENT_EXIT;
-            event->exit_status = ntohl(wire.wait_status);
+            {
+                uint32_t wait_status = ntohl(wire.wait_status);
+                if (wait_status > INT_MAX) return KPB_ERR_PROTOCOL;
+                event->exit_status = (int)wait_status;
+            }
             return KPB_OK;
         }
         case KPB_FRAME_ERROR:

@@ -21,7 +21,15 @@ another terminal parser and requires graphics passthrough.
 make
 make test
 make sanitize
+make compatibility
+make FUZZ_SECONDS=15 fuzz
+make benchmark
 ```
+
+`compatibility` exercises new-client/old-broker and old-client/new-broker
+attachments. The fuzzer drives the framed receive path under ASan and UBSan.
+The benchmark reports median live, transcript, graphics-elision, and replay
+throughput; run `build/benchmark-broker BYTES SAMPLES` to choose its workload.
 
 The build produces:
 
@@ -142,14 +150,22 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
   `kpb_attach_with_options`; the original `kpb_attach` is unchanged and remains
   the version 1 entry point;
 - bounded input queuing so large pastes respect PTY backpressure without loss;
+- batched PTY output and vectored frame writes, bounded by `KPB_IO_CHUNK`;
 - versioned framed communication over owner-only Unix sockets;
 - a bounded replay journal for reconstructing a newly attached terminal;
 - an optional durable transcript of session output.
 
+`kpb_spawn` preserves caller descriptors for the command subject to normal
+`FD_CLOEXEC` handling, as a direct spawn would, but the persistent broker
+closes its own copies after the PTY child is created. The command starts with
+an empty signal mask, and dispositions the broker changes for its own lifecycle
+are restored to their conventional defaults.
+
 Runtime and session directories must be absolute, real directories owned by
 the current user. They are forced to mode `0700`; sockets and metadata are
-private. Session IDs are conservative single path components, and connecting
-peers are checked with `SO_PEERCRED` on Linux.
+private. Session IDs are conservative single path components. On Linux the
+broker validates each connecting peer and the client validates the broker with
+`SO_PEERCRED`, so neither side accepts a socket owned by another user.
 
 ## Replay and graphics
 
@@ -180,8 +196,10 @@ bytes and never emits a terminal reset.
   solely through terminal echo, so a password prompt that suppresses echo is
   not captured.
 - The file is created `0600` and opened `O_NOFOLLOW`. An existing transcript is
-  continued, not truncated, so a recovered pane keeps its history. Transcript
-  failures are non-fatal: the broker closes the log and the pane keeps running.
+  forced back to `0600`, brought within the configured limit immediately, and
+  then continued rather than replaced, so a recovered pane keeps its bounded
+  history. Transcript failures are non-fatal: the broker closes the log and
+  the pane keeps running.
 
 Elision makes a default transcript a faithful record of *text*, not a byte-exact
 capture of the stream. Use `keep` when the graphics bytes themselves are the

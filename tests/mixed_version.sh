@@ -30,12 +30,16 @@ KPB_PRE_V2=12ac22a3c95b34c70d4c05b650411b44b738e066
 base=${1:-$KPB_PRE_V2}
 work=$(mktemp -d /tmp/kpbmv.XXXXXX)
 old_tree="$work/old"
+new_build="$work/new-build"
+old_build="$work/old-build"
 failures=0
 
+# Called indirectly by the EXIT trap; ShellCheck 0.9 does not follow that edge.
+# shellcheck disable=SC2317
 cleanup() {
     for runtime in "$work"/rt-*; do
         [ -d "$runtime" ] || continue
-        for binary in "$root/build/kitty-pty-broker" "$old_tree/build/kitty-pty-broker"; do
+        for binary in "$new_build/kitty-pty-broker" "$old_build/kitty-pty-broker"; do
             [ -x "$binary" ] || continue
             "$binary" --runtime-dir "$runtime" list 2>/dev/null \
                 | awk '{print $1}' \
@@ -64,11 +68,15 @@ git -C "$root" worktree add --detach "$old_tree" "$base" >/dev/null 2>&1 || {
     echo "could not create a worktree at $base" >&2
     exit 2
 }
-make -C "$root" --silent >/dev/null || { echo "current build failed" >&2; exit 2; }
-make -C "$old_tree" --silent >/dev/null || { echo "base build failed" >&2; exit 2; }
+make -C "$root" BUILD_DIR="$new_build" --silent >/dev/null || {
+    echo "current build failed" >&2; exit 2;
+}
+make -C "$old_tree" BUILD_DIR="$old_build" --silent >/dev/null || {
+    echo "base build failed" >&2; exit 2;
+}
 
-new_cli="$root/build/kitty-pty-broker"
-old_cli="$old_tree/build/kitty-pty-broker"
+new_cli="$new_build/kitty-pty-broker"
+old_cli="$old_build/kitty-pty-broker"
 echo "new: $("$new_cli" version)"
 echo "old: $("$old_cli" version)"
 
@@ -82,8 +90,9 @@ start_session() {
     setsid "$binary" --runtime-dir "$runtime" run --id "$id" \
         -- /bin/sh -c 'stty -echo; printf "MIXED_OK:"; sleep 20' \
         </dev/null >/dev/null 2>&1 &
-    local attempt
-    for attempt in $(seq 1 40); do
+    local attempt=0
+    while [ "$attempt" -lt 40 ]; do
+        attempt=$((attempt + 1))
         if "$binary" --runtime-dir "$runtime" status "$id" 2>/dev/null | grep -q detached; then
             return 0
         fi

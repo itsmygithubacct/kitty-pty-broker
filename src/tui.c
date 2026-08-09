@@ -525,14 +525,18 @@ read_input(unsigned char *input, size_t capacity) {
             .events = POLLIN,
             .revents = 0
         };
-        int polled = poll(&descriptor, 1, 30);
+        int polled;
         ssize_t extra;
+        do {
+            polled = poll(&descriptor, 1, 30);
+        } while (polled < 0 && errno == EINTR);
         if (polled <= 0 || !(descriptor.revents & POLLIN)) break;
         extra = read(
             STDIN_FILENO,
             input + count,
             (size_t)(3 - count)
         );
+        if (extra < 0 && errno == EINTR) continue;
         if (extra <= 0) break;
         count += extra;
     }

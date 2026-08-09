@@ -77,6 +77,26 @@ exit_code_from_wait_status(int status) {
     return 255;
 }
 
+static int
+parse_u64_prefix(const char *text, uint64_t *value, const char **end_out) {
+    char *end = NULL;
+    unsigned long long parsed;
+    if (!text || text[0] < '0' || text[0] > '9') return -1;
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno || !end || end == text || parsed > UINT64_MAX) return -1;
+    *value = (uint64_t)parsed;
+    *end_out = end;
+    return 0;
+}
+
+static int
+parse_storage_limit(const char *text, uint64_t *value) {
+    const char *end;
+    return parse_u64_prefix(text, value, &end) == 0 && *end == '\0' &&
+        *value <= INT64_MAX ? 0 : -1;
+}
+
 /* `options` NULL keeps the plain version-1 attach that every existing caller
  * uses, which is also what makes this safe against a broker left running by a
  * previous build. */
@@ -249,20 +269,13 @@ bridge(
 /* EPOCH:OFFSET, fully consumed, exactly one separator. */
 static int
 parse_cursor(const char *text, uint64_t *epoch, uint64_t *offset) {
-    char *end = NULL;
-    unsigned long long value;
-    if (!text || !*text) return -1;
-    errno = 0;
-    value = strtoull(text, &end, 10);
-    if (errno || !end || *end != ':' || end == text) return -1;
-    *epoch = (uint64_t)value;
+    const char *end;
+    if (!epoch || !offset || parse_u64_prefix(text, epoch, &end) != 0 ||
+        *end != ':') {
+        return -1;
+    }
     text = end + 1;
-    if (!*text) return -1;
-    errno = 0;
-    value = strtoull(text, &end, 10);
-    if (errno || !end || *end != '\0') return -1;
-    *offset = (uint64_t)value;
-    return 0;
+    return parse_u64_prefix(text, offset, &end) == 0 && *end == '\0' ? 0 : -1;
 }
 
 static void
@@ -407,9 +420,8 @@ main(int argc, char **argv) {
                 id = argv[index + 1];
                 index += 2;
             } else if (strcmp(argv[index], "--journal-limit") == 0 && index + 1 < argc) {
-                char *end = NULL;
-                unsigned long long value = strtoull(argv[index + 1], &end, 10);
-                if (!end || *end) {
+                uint64_t value;
+                if (parse_storage_limit(argv[index + 1], &value) != 0) {
                     fprintf(stderr, "kitty-pty-broker: invalid journal limit\n");
                     return 2;
                 }
@@ -423,9 +435,8 @@ main(int argc, char **argv) {
                 options.transcript_path = argv[index + 1];
                 index += 2;
             } else if (strcmp(argv[index], "--transcript-limit") == 0 && index + 1 < argc) {
-                char *end = NULL;
-                unsigned long long value = strtoull(argv[index + 1], &end, 10);
-                if (!end || *end) {
+                uint64_t value;
+                if (parse_storage_limit(argv[index + 1], &value) != 0) {
                     fprintf(stderr, "kitty-pty-broker: invalid transcript limit\n");
                     return 2;
                 }

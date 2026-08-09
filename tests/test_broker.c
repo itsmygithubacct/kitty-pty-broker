@@ -32,12 +32,22 @@ static const char *current_test = "(startup)";
     } \
 } while (0)
 
+#define FAIL(message) do { \
+    fprintf(stderr, "%s:%d: [%s] %s (errno=%d %s)\n", \
+            __FILE__, __LINE__, current_test, message, \
+            errno, strerror(errno)); \
+    exit(1); \
+} while (0)
+
 /* Name the running test so a timeout inside a shared helper is attributable. */
 #define RUN(test) do { current_test = #test; test(); } while (0)
 
 static char runtime_dir[] = "/tmp/kitty-pty-broker-test.XXXXXX";
 static char test_program_path[KPB_PATH_MAX];
 static const char *test_program;
+
+static void wait_for_session_end(const char *session_id);
+static void raw_write(int fd, const void *data, size_t size);
 
 static void
 wait_readable(int fd) {
@@ -180,7 +190,7 @@ test_terminate(void) {
         if (kpb_query_status(runtime_dir, "terminate", &status) == KPB_ERR_NOT_FOUND) return;
         usleep(100000);
     }
-    CHECK(!"terminated session disappeared");
+    FAIL("terminated session did not disappear");
 }
 
 static size_t
@@ -275,7 +285,7 @@ test_tui(void) {
         master, output, used, sizeof output, "Terminate tui-session"
     );
     CHECK(write(master, "n", 1) == 1);
-    used = read_pty_until(
+    (void)read_pty_until(
         master, output, used, sizeof output, "Termination cancelled."
     );
     CHECK(kpb_query_status(runtime_dir, "tui-session", &status) == KPB_OK);
@@ -294,7 +304,7 @@ test_tui(void) {
         }
         usleep(100000);
     }
-    CHECK(!"TUI test session disappeared");
+    FAIL("TUI test session did not disappear");
 }
 
 static int
@@ -322,6 +332,106 @@ reader_child(void) {
     }
     dprintf(STDOUT_FILENO, "READER_COUNT=%zu\n", received);
     return received == target ? 0 : 2;
+}
+
+static int
+descriptor_child(const char *text) {
+    char *end = NULL;
+    long value;
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno || !end || *end || value < 0 || value > INT32_MAX) return 2;
+    if (write((int)value, "D", 1) != 1) return 2;
+    if (close((int)value) != 0) return 2;
+    sleep(30);
+    return 0;
+}
+
+static void
+test_inherited_descriptors_are_command_only(void) {
+    int descriptors[2];
+    char descriptor_text[32];
+    char *command[] = {
+        (char *)test_program, "--descriptor-child", descriptor_text, NULL
+    };
+    kpb_spawn_options options;
+    unsigned char marker = 0;
+    bool saw_eof = false;
+    int flags;
+    int attempt;
+
+    CHECK(pipe(descriptors) == 0);
+    CHECK(snprintf(
+        descriptor_text, sizeof descriptor_text, "%d", descriptors[1]) > 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "descriptor-scope";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+    CHECK(close(descriptors[1]) == 0);
+    wait_readable(descriptors[0]);
+    CHECK(read(descriptors[0], &marker, 1) == 1);
+    CHECK(marker == 'D');
+
+    flags = fcntl(descriptors[0], F_GETFL, 0);
+    CHECK(flags >= 0);
+    CHECK(fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    for (attempt = 0; attempt < 100; attempt++) {
+        ssize_t count = read(descriptors[0], &marker, 1);
+        if (count == 0) {
+            saw_eof = true;
+            break;
+        }
+        CHECK(count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        usleep(10000);
+    }
+    CHECK(kpb_terminate(runtime_dir, "descriptor-scope") == KPB_OK);
+    wait_for_session_end("descriptor-scope");
+    close(descriptors[0]);
+    CHECK(saw_eof);
+}
+
+static void
+test_child_signal_mask_and_wait_status(void) {
+    char *command[] = {
+        "/bin/sh", "-c", "stty -echo; IFS= read -r _; kill -TERM $$; exit 99", NULL
+    };
+    kpb_spawn_options options;
+    kpb_connection connection;
+    unsigned char output[256];
+    sigset_t blocked;
+    sigset_t previous;
+    struct sigaction ignored;
+    struct sigaction previous_child;
+    size_t used = 0;
+    int wait_status;
+
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGTERM);
+    CHECK(sigprocmask(SIG_BLOCK, &blocked, &previous) == 0);
+    memset(&ignored, 0, sizeof ignored);
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&ignored.sa_mask);
+    CHECK(sigaction(SIGCHLD, &ignored, &previous_child) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "signal-mask";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+    CHECK(sigaction(SIGCHLD, &previous_child, NULL) == 0);
+    CHECK(sigprocmask(SIG_SETMASK, &previous, NULL) == 0);
+    CHECK(kpb_attach(
+        runtime_dir, "signal-mask", 24, 80, 0, 0, &connection) == KPB_OK);
+    used = read_until_replay_done(&connection, output, sizeof output);
+    CHECK(kpb_send_input(&connection, "go\n", 3) == KPB_OK);
+    wait_status = read_until_exit(
+        &connection, output, &used, sizeof output);
+    CHECK(WIFSIGNALED(wait_status));
+    CHECK(WTERMSIG(wait_status) == SIGTERM);
+    kpb_detach(&connection);
+    wait_for_session_end("signal-mask");
 }
 
 static void
@@ -388,7 +498,7 @@ wait_for_session_end(const char *session_id) {
         if (kpb_query_status(runtime_dir, session_id, &status) == KPB_ERR_NOT_FOUND) return;
         usleep(20000);
     }
-    CHECK(!"session did not finish");
+    FAIL("session did not finish");
 }
 
 static size_t
@@ -474,6 +584,104 @@ test_transcript_keeps_graphics_when_asked(void) {
 
     CHECK(memmem(buffer, used, "\033_Ga=q;PAYLOAD_KEPT\033\\", 21) != NULL);
     CHECK(memmem(buffer, used, "done", 4) != NULL);
+    CHECK(unlink(transcript) == 0);
+}
+
+static size_t
+count_occurrences(
+    const unsigned char *data,
+    size_t size,
+    const char *needle
+) {
+    size_t count = 0;
+    size_t needle_size = strlen(needle);
+    while (size >= needle_size) {
+        const unsigned char *found = memmem(data, size, needle, needle_size);
+        size_t consumed;
+        if (!found) break;
+        count++;
+        consumed = (size_t)(found - data) + needle_size;
+        data += consumed;
+        size -= consumed;
+    }
+    return count;
+}
+
+static void
+test_transcript_scanner_boundaries_and_dense_markers(void) {
+    char *command[] = {
+        "/bin/sh", "-c",
+        "printf 'plain:\\033X:'; "
+        "printf '\\033_Qnongraphics\\033\\\\:'; "
+        "printf '\\033_Gabc\\033Xdef\\033\\\\after-st:'; "
+        "printf '\\033_Gbell\\007after-bel:'; "
+        "i=0; while [ $i -lt 1000 ]; do printf '\\033_G\\007'; i=$((i+1)); done; "
+        "printf 'tail'",
+        NULL
+    };
+    char transcript[KPB_PATH_MAX];
+    static unsigned char buffer[262144];
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/scanner.log", runtime_dir);
+    used = run_with_transcript(
+        "scanner", command, transcript, KPB_DEFAULT_TRANSCRIPT_LIMIT,
+        KPB_TRANSCRIPT_GRAPHICS_ELIDE, buffer, sizeof buffer
+    );
+    CHECK(memmem(buffer, used, "plain:\033X:", sizeof "plain:\033X:" - 1) != NULL);
+    CHECK(memmem(
+        buffer, used,
+        "\033_Qnongraphics\033\\:", sizeof "\033_Qnongraphics\033\\:" - 1) != NULL);
+    CHECK(memmem(buffer, used, "after-st:", 9) != NULL);
+    CHECK(memmem(buffer, used, "after-bel:", 10) != NULL);
+    CHECK(memmem(buffer, used, "tail", 4) != NULL);
+    CHECK(memmem(buffer, used, "abc", 3) == NULL);
+    CHECK(memmem(buffer, used, "def", 3) == NULL);
+    CHECK(memmem(buffer, used, "bell", 4) == NULL);
+    CHECK(count_occurrences(
+        buffer, used, "bytes of graphics elided") == 1002);
+    CHECK(unlink(transcript) == 0);
+}
+
+static void
+test_existing_transcript_is_private_and_bounded_immediately(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 1", NULL};
+    char transcript[KPB_PATH_MAX];
+    unsigned char block[16384];
+    kpb_spawn_options options;
+    kpb_status status;
+    struct stat file_status;
+    int fd;
+    int attempt;
+
+    memset(block, 'x', sizeof block);
+    snprintf(transcript, sizeof transcript, "%s/existing.log", runtime_dir);
+    fd = open(transcript, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    CHECK(fd >= 0);
+    raw_write(fd, block, sizeof block);
+    CHECK(close(fd) == 0);
+    CHECK(chmod(transcript, 0644) == 0);
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "existing-transcript";
+    options.cwd = "/tmp";
+    options.argv = command;
+    options.transcript_path = transcript;
+    options.transcript_limit = 4096;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(stat(transcript, &file_status) == 0);
+    CHECK((file_status.st_mode & 0777) == 0600);
+    CHECK(file_status.st_size <= 4096);
+    for (attempt = 0; attempt < 40; attempt++) {
+        if (kpb_query_status(
+                runtime_dir, "existing-transcript", &status
+            ) == KPB_ERR_NOT_FOUND) {
+            break;
+        }
+        usleep(50000);
+    }
+    CHECK(attempt < 40);
     CHECK(unlink(transcript) == 0);
 }
 
@@ -842,7 +1050,7 @@ wait_until_detached(const char *session_id) {
         if (!status.attached) return;
         usleep(10000);
     }
-    CHECK(!"read-write slot never became free");
+    FAIL("read-write slot never became free");
 }
 
 /* Journal position while the pane is known to be quiescent. */
@@ -1102,7 +1310,7 @@ test_observers_receive_identical_bytes(void) {
     spawn_echo_session("samebytes", 0);
     CHECK(kpb_attach(runtime_dir, "samebytes", 30, 100, 0, 0, &client) == KPB_OK);
     client_used = read_until_replay_done(&client, client_bytes, sizeof client_bytes);
-    client_used = read_until(
+    (void)read_until(
         &client, client_bytes, client_used, sizeof client_bytes, "READY:");
     /* Everything before this point is prologue; the comparison window starts
      * once every observer is attached and drained. */
@@ -1149,7 +1357,7 @@ test_observer_input_refused(void) {
     spawn_echo_session("readonly", 0);
     CHECK(kpb_attach(runtime_dir, "readonly", 30, 100, 0, 0, &client) == KPB_OK);
     used = read_until_replay_done(&client, output, sizeof output);
-    used = read_until(&client, output, used, sizeof output, "READY:");
+    (void)read_until(&client, output, used, sizeof output, "READY:");
     CHECK(kpb_observe(runtime_dir, "readonly", &watcher, NULL) == KPB_OK);
     (void)read_until_replay_done(&watcher, refusal, sizeof refusal);
 
@@ -1191,7 +1399,7 @@ test_observer_resize_refused(void) {
     spawn_echo_session("noresize", 0);
     CHECK(kpb_attach(runtime_dir, "noresize", 30, 100, 0, 0, &client) == KPB_OK);
     used = read_until_replay_done(&client, output, sizeof output);
-    used = read_until(&client, output, used, sizeof output, "READY:");
+    (void)read_until(&client, output, used, sizeof output, "READY:");
     CHECK(kpb_query_status(runtime_dir, "noresize", &status) == KPB_OK);
     CHECK(status.rows == 30 && status.columns == 100);
 
@@ -1257,21 +1465,23 @@ test_stalled_observer_does_not_wedge_pane(void) {
     bool closed = false;
 
     spawn_session("stalled", command, KPB_DEFAULT_JOURNAL_LIMIT);
-    CHECK(kpb_attach(runtime_dir, "stalled", 30, 100, 0, 0, &client) == KPB_OK);
     /* A full complement, every one of them attached and then never read
-     * again.  If any of them could apply back-pressure, the pane stops. */
+     * again.  Admit them before the intentionally blocking read-write client:
+     * once that client is attached, its own backpressure is allowed to stop
+     * the broker and would confound the property this test isolates. */
     for (index = 0; index < KPB_OBSERVER_MAX; index++) {
         CHECK(kpb_observe(runtime_dir, "stalled", &watchers[index], NULL) == KPB_OK);
     }
+    CHECK(kpb_attach(runtime_dir, "stalled", 30, 100, 0, 0, &client) == KPB_OK);
 
     while (true) {
         kpb_event event;
-        size_t index;
+        size_t byte_index;
         wait_readable(client.fd);
         CHECK(kpb_receive(&client, buffer, sizeof buffer, &event) == KPB_OK);
         if (event.type == KPB_EVENT_OUTPUT) {
-            for (index = 0; index < event.size; index++) {
-                if (buffer[index] == 'x') x_count++;
+            for (byte_index = 0; byte_index < event.size; byte_index++) {
+                if (buffer[byte_index] == 'x') x_count++;
             }
             if (x_count == WRITER_CHILD_BYTES && !closed) {
                 /* End the pane: EOT closes the child's stdin. */
@@ -1346,7 +1556,7 @@ test_observer_capacity(void) {
 
     /* Neither the accepted set nor the pane was disturbed. */
     CHECK(kpb_send_input(&client, "after\n", 6) == KPB_OK);
-    used = read_until(&client, output, used, sizeof output, "GOT=after:");
+    (void)read_until(&client, output, used, sizeof output, "GOT=after:");
     for (index = 0; index < KPB_OBSERVER_MAX; index++) {
         size_t seen = read_until(
             &watchers[index], scratch, 0, sizeof scratch, "GOT=after:");
@@ -1559,6 +1769,29 @@ test_version_negotiation(void) {
     kpb_detach(&connection);
     wait_until_detached("negotiate");
 
+    /* Values beyond the library's own ceiling still mean "at least the
+     * current version" rather than wrapping or advertising a future protocol
+     * this client does not actually implement. */
+    kpb_attach_options_init(&options);
+    options.rows = 30;
+    options.columns = 100;
+    options.max_version = 65536;
+    CHECK(kpb_attach_with_options(
+        runtime_dir, "negotiate", &options, &connection, &result) == KPB_OK);
+    CHECK(result.version == 2);
+    (void)read_until_replay_done(&connection, scratch, sizeof scratch);
+    kpb_detach(&connection);
+    wait_until_detached("negotiate");
+
+    connection.fd = 123;
+    memset(&result, 0xff, sizeof result);
+    kpb_attach_options_init(&options);
+    options.max_version = 0;
+    CHECK(kpb_attach_with_options(
+        runtime_dir, "negotiate", &options, &connection, &result) == KPB_ERR_INVALID);
+    CHECK(connection.fd == -1);
+    CHECK(result.version == 0);
+
     /* A client that offers more than the server has is clamped, not refused. */
     kpb_attach_options_init(&options);
     options.rows = 30;
@@ -1607,6 +1840,18 @@ test_version_negotiation(void) {
     raw_read_attach_reply(fd, &reply);
     CHECK(ntohs(reply.result) == KPB_ERR_PROTOCOL);
     CHECK(ntohs(reply.version) == 2);
+    close(fd);
+
+    /* Unknown request flags are rejected rather than silently changing the
+     * meaning of a future client request. */
+    fd = raw_connect("negotiate");
+    memset(&request, 0, sizeof request);
+    request.version = htons(2);
+    request.mode = htons(KPB_WIRE_MODE_CONTROL);
+    request.flags = htonl(0x80000000U);
+    raw_send_frame(fd, KPB_FRAME_ATTACH, &request, sizeof request);
+    raw_read_attach_reply(fd, &reply);
+    CHECK(ntohs(reply.result) == KPB_ERR_PROTOCOL);
     close(fd);
 
     /* Mode must agree with the frame type. */
@@ -1666,7 +1911,7 @@ test_resume_streams_forward(void) {
     used = read_until_replay_done(&first, output, sizeof output);
     used = read_until(&first, output, used, sizeof output, "READY:");
     CHECK(kpb_send_input(&first, "AAA\n", 4) == KPB_OK);
-    used = read_until(&first, output, used, sizeof output, "GOT=AAA:");
+    (void)read_until(&first, output, used, sizeof output, "GOT=AAA:");
     /* The child is now blocked on read, so the journal is quiescent. */
     journal_position("resume", &epoch0, &offset0);
     kpb_detach(&first);
@@ -1677,7 +1922,7 @@ test_resume_streams_forward(void) {
     used = read_until_replay_done(&second, output, sizeof output);
     CHECK(memmem(output, used, "GOT=AAA:", 8) != NULL);
     CHECK(kpb_send_input(&second, "BBB\n", 4) == KPB_OK);
-    used = read_until(&second, output, used, sizeof output, "GOT=BBB:");
+    (void)read_until(&second, output, used, sizeof output, "GOT=BBB:");
     journal_position("resume", &epoch1, &offset1);
     kpb_detach(&second);
     wait_until_detached("resume");
@@ -1694,7 +1939,7 @@ test_resume_streams_forward(void) {
     CHECK(memmem(output, used, "GOT=AAA:", 8) == NULL);
     /* Live output still follows the resumed history. */
     CHECK(kpb_send_input(&third, "CCC\n", 4) == KPB_OK);
-    used = read_until(&third, output, used, sizeof output, "GOT=CCC:");
+    (void)read_until(&third, output, used, sizeof output, "GOT=CCC:");
     kpb_detach(&third);
     wait_until_detached("resume");
 
@@ -1742,7 +1987,7 @@ test_resume_stale_epoch_falls_back(void) {
     journal_position("staleepoch", &epoch0, &offset0);
 
     CHECK(kpb_send_input(&connection, "flood\n", 6) == KPB_OK);
-    used = read_until(&connection, output, used, sizeof output, "GOT=flood:");
+    (void)read_until(&connection, output, used, sizeof output, "GOT=flood:");
     CHECK(kpb_query_status(runtime_dir, "staleepoch", &status) == KPB_OK);
     CHECK(status.journal_epoch > epoch0);
     CHECK(status.replay_complete == 0);
@@ -1775,7 +2020,7 @@ test_resume_offset_past_end_falls_back(void) {
     spawn_echo_session("pastend", 0);
     CHECK(attach_v2("pastend", &connection, &result, 0, 0, 0) == KPB_OK);
     used = read_until_replay_done(&connection, output, sizeof output);
-    used = read_until(&connection, output, used, sizeof output, "READY:");
+    (void)read_until(&connection, output, used, sizeof output, "READY:");
     journal_position("pastend", &epoch, &offset);
     kpb_detach(&connection);
     wait_until_detached("pastend");
@@ -1787,7 +2032,7 @@ test_resume_offset_past_end_falls_back(void) {
     CHECK(used == (size_t)offset);
     CHECK(memmem(output, used, "READY:", 6) != NULL);
     CHECK(kpb_send_input(&connection, "live\n", 5) == KPB_OK);
-    used = read_until(&connection, output, used, sizeof output, "GOT=live:");
+    (void)read_until(&connection, output, used, sizeof output, "GOT=live:");
 
     CHECK(observe_v2("pastend", &watcher, &result, 1, epoch, offset + 4096) == KPB_OK);
     CHECK(result.resumed == 0);
@@ -1898,6 +2143,9 @@ main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--writer-child") == 0) {
         return writer_child();
     }
+    if (argc == 3 && strcmp(argv[1], "--descriptor-child") == 0) {
+        return descriptor_child(argv[2]);
+    }
     CHECK(realpath(argv[0], test_program_path) != NULL);
     test_program = test_program_path;
     CHECK(mkdtemp(runtime_dir) != NULL);
@@ -1907,10 +2155,14 @@ main(int argc, char **argv) {
     RUN(test_spawn_detach_replay_and_exit);
     RUN(test_transcript_elides_graphics);
     RUN(test_transcript_keeps_graphics_when_asked);
+    RUN(test_transcript_scanner_boundaries_and_dense_markers);
+    RUN(test_existing_transcript_is_private_and_bounded_immediately);
     RUN(test_transcript_rotates_and_keeps_newest);
     RUN(test_transcript_captures_output_written_just_before_exit);
     RUN(test_transcript_absent_by_default);
     RUN(test_large_input_backpressure);
+    RUN(test_inherited_descriptors_are_command_only);
+    RUN(test_child_signal_mask_and_wait_status);
     RUN(test_busy_refusal_v1);
     RUN(test_v1_stream_byte_identical);
     RUN(test_v1_peer_sees_only_version_1_headers);

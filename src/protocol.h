@@ -121,7 +121,7 @@ _Static_assert(
     sizeof(kpb_wire_attach_reply) == 24, "attach reply must be 24 bytes");
 
 typedef struct {
-    int32_t wait_status;
+    uint32_t wait_status;
 } kpb_wire_exit;
 
 typedef struct {
