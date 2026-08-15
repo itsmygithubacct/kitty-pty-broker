@@ -973,6 +973,26 @@ writer_child(void) {
     }
 }
 
+/* writer_child, gated on one byte of input first.  A test that needs the
+ * flood to start only after its client is attached cannot use the plain
+ * writer: the journal would otherwise absorb the whole flood before any
+ * client-facing backpressure could engage. */
+static int
+gated_writer_child(void) {
+    struct termios attributes;
+    unsigned char trigger;
+    if (tcgetattr(STDIN_FILENO, &attributes) != 0) return 2;
+    cfmakeraw(&attributes);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &attributes) != 0) return 2;
+    for (;;) {
+        ssize_t count = read(STDIN_FILENO, &trigger, 1);
+        if (count == 1) break;
+        if (count < 0 && errno == EINTR) continue;
+        return 2;
+    }
+    return writer_child();
+}
+
 static void
 spawn_session(
     const char *session_id,
@@ -1197,6 +1217,60 @@ test_a_stalled_client_does_not_stop_the_broker(void) {
 
     close(fd);
     terminate_and_reap("clientstall");
+}
+
+/* A client that attaches and then never READS must not stop the broker
+ * either.  This was the write-side half of the same hole: sends to the
+ * read-write client were blocking, so a frontend that stopped reading -
+ * Ctrl-S flow control, SIGSTOP, or simply hung - wedged the loop inside
+ * sendmsg once the socket filled.  No status, no accept, and `kill` hung
+ * forever, even though kill is the documented deliberate termination path.
+ *
+ * The backpressure itself is deliberate and must survive the fix: what stops
+ * is the shell, held by the kernel PTY buffer once the broker stops reading
+ * it, never the broker.  So this asserts both halves - the pane's output
+ * genuinely freezes short of everything the child wants to write, and the
+ * control plane keeps answering.
+ *
+ * The alarm mirrors the read-side test above: if this regresses, the symptom
+ * is a hang, and a suite that hangs says far less than one that dies. */
+static void
+test_a_write_stalled_client_does_not_stop_the_broker(void) {
+    char *command[] = {(char *)test_program, "--gated-writer-child", NULL};
+    kpb_connection connection;
+    kpb_status status;
+    uint64_t stalled_bytes = 0;
+    int attempt;
+
+    alarm(60);
+    spawn_session("writestall", command, KPB_DEFAULT_JOURNAL_LIMIT);
+    CHECK(kpb_attach(runtime_dir, "writestall", 30, 100, 0, 0, &connection) == KPB_OK);
+    /* Release the flood, then never read a single byte of it. */
+    CHECK(kpb_send_input(&connection, "x", 1) == KPB_OK);
+
+    /* The journal must freeze: once the client's backlog passes the broker's
+     * high-water mark the PTY stops being read and the writer blocks.  Two
+     * equal non-zero readings half a second apart call it frozen. */
+    for (attempt = 0; attempt < 120; attempt++) {
+        CHECK(kpb_query_status(runtime_dir, "writestall", &status) == KPB_OK);
+        if (status.journal_bytes && status.journal_bytes == stalled_bytes) break;
+        stalled_bytes = status.journal_bytes;
+        usleep(500000);
+    }
+    CHECK(attempt < 120);
+    /* Frozen strictly short of the flood: the writer was stopped by
+     * backpressure, not drained to completion and not dropped. */
+    CHECK(stalled_bytes > 0);
+    CHECK(stalled_bytes < WRITER_CHILD_BYTES);
+    CHECK(status.attached == 1);
+
+    /* And the deliberate termination path still works. */
+    CHECK(kpb_terminate(runtime_dir, "writestall") == KPB_OK);
+    wait_for_session_end("writestall");
+    alarm(0);
+
+    close(connection.fd);
+    connection.fd = -1;
 }
 
 /* Every frame a v1 peer receives must carry version 1 and a type it already
@@ -1466,9 +1540,9 @@ test_stalled_observer_does_not_wedge_pane(void) {
 
     spawn_session("stalled", command, KPB_DEFAULT_JOURNAL_LIMIT);
     /* A full complement, every one of them attached and then never read
-     * again.  Admit them before the intentionally blocking read-write client:
-     * once that client is attached, its own backpressure is allowed to stop
-     * the broker and would confound the property this test isolates. */
+     * again.  Admit them before the read-write client: that client's
+     * backpressure is allowed to stop the pane itself, and a pane stalled on
+     * its account would confound the property this test isolates. */
     for (index = 0; index < KPB_OBSERVER_MAX; index++) {
         CHECK(kpb_observe(runtime_dir, "stalled", &watchers[index], NULL) == KPB_OK);
     }
@@ -2143,6 +2217,9 @@ main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--writer-child") == 0) {
         return writer_child();
     }
+    if (argc == 2 && strcmp(argv[1], "--gated-writer-child") == 0) {
+        return gated_writer_child();
+    }
     if (argc == 3 && strcmp(argv[1], "--descriptor-child") == 0) {
         return descriptor_child(argv[2]);
     }
@@ -2182,6 +2259,7 @@ main(int argc, char **argv) {
     RUN(test_observer_replay_truncation_is_flagged);
     RUN(test_tui);
     RUN(test_a_stalled_client_does_not_stop_the_broker);
+    RUN(test_a_write_stalled_client_does_not_stop_the_broker);
     RUN(test_terminate);
     {
         char sessions[4096];

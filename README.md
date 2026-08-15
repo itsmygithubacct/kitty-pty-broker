@@ -124,11 +124,14 @@ for less than a full replay.
   payload size.
 - Capped at `KPB_OBSERVER_MAX` (8). The next request is refused with
   `KPB_ERR_BUSY` and disturbs neither the accepted set nor the pane.
-- **Non-blocking, with a bounded queue.** The read-write client keeps its
-  blocking write, which is correct for it: a frontend that stops reading should
-  stop the shell. An observer must not have that power, so one that falls
-  behind is disconnected rather than buffered. Resume is what makes that cheap —
-  a dropped observer reattaches and asks for the bytes it missed.
+- **Non-blocking, with a bounded queue.** The read-write client is written
+  through a bounded queue too: past a high-water mark the broker stops reading
+  the PTY, the kernel's buffer fills, and the shell blocks in `write()` — so a
+  frontend that stops reading still stops the shell, but can no longer stop
+  the broker, and `status` and `kill` keep working throughout. An observer
+  must not have even that much power over the pane, so one that falls behind
+  is disconnected rather than buffered. Resume is what makes that cheap — a
+  dropped observer reattaches and asks for the bytes it missed.
 - Replay on attach is bounded to the newest `KPB_OBSERVER_REPLAY_MAX` (1 MiB),
   prefixed with a terminal reset and flagged as truncated. That bound is kept
   strictly below the queue limit so a fresh replay can never by itself trip the

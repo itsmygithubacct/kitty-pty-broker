@@ -57,23 +57,32 @@ typedef struct {
     char metadata_path[KPB_PATH_MAX];
 } session_paths;
 
+/* A bounded queue of encoded frames awaiting a non-blocking socket.
+ *
+ * Every attached peer is written through one of these, because a peer that
+ * stops reading must never hold the event loop: the loop is also the control
+ * plane, and `kill` has to keep working precisely when a frontend has stopped
+ * behaving.  What differs per peer is only the overflow policy - an observer
+ * that falls behind is disconnected, while the read-write client's backlog
+ * stops the PTY from being read, so the kernel's own buffer stops the shell. */
+typedef struct {
+    unsigned char *data;
+    size_t offset;
+    size_t size;
+    size_t capacity;
+} frame_queue;
+
 /* An attached read-only observer.
  *
- * The read-write client is written with a blocking send, which is correct for
- * it: a frontend that stops reading should stop the shell.  An observer must
- * never have that power, so it gets a non-blocking socket and a bounded queue,
- * and is disconnected rather than buffered when it falls behind.  That is
- * cheap because a dropped observer can reattach and resume from the offset it
- * had reached.
+ * An observer must never be able to stall the pane, so one that falls behind
+ * is disconnected rather than buffered without bound.  That is cheap because
+ * a dropped observer can reattach and resume from the offset it had reached.
  *
  * `generation` is bumped whenever a slot is released, so a poll result
  * captured before the slot was recycled can be recognised as stale. */
 typedef struct {
     int fd;
-    unsigned char *out;
-    size_t out_offset;
-    size_t out_size;
-    size_t out_capacity;
+    frame_queue out;
     unsigned char in[sizeof(kpb_frame_header)];
     size_t in_size;
     uint32_t generation;
@@ -86,6 +95,18 @@ typedef struct {
 _Static_assert(
     KPB_OBSERVER_REPLAY_MAX < KPB_OBSERVER_QUEUE_LIMIT,
     "a fresh observer replay must fit in the queue with headroom to spare");
+
+/* The read-write client's queue.  Past the high-water mark the loop stops
+ * polling the PTY for output, so the kernel PTY buffer fills and the shell
+ * blocks in write() - the same backpressure the old blocking send provided,
+ * without handing the client the power to stop the broker's control plane.
+ * The headroom above the mark absorbs the chunks already in flight. */
+#define KPB_CLIENT_QUEUE_LIMIT (4U * 1024U * 1024U)
+#define KPB_CLIENT_QUEUE_HIGH_WATER (2U * 1024U * 1024U)
+_Static_assert(
+    KPB_CLIENT_QUEUE_HIGH_WATER + KPB_IO_CHUNK + sizeof(kpb_frame_header) <
+        KPB_CLIENT_QUEUE_LIMIT,
+    "the client queue must absorb a full PTY chunk beyond the high-water mark");
 
 typedef struct {
     session_paths paths;
@@ -110,6 +131,10 @@ typedef struct {
     uint64_t transcript_elided;
     bool terminate_requested;
     uint64_t terminate_deadline;
+    frame_queue client_out;
+    bool client_replay_active;
+    uint64_t client_replay_at;
+    uint64_t client_replay_epoch;
     struct winsize size;
     unsigned char *input_buffer;
     size_t input_offset;
@@ -339,7 +364,10 @@ read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadlin
         }
         count = read(fd, cursor + received, size - received);
         if (count < 0) {
-            if (errno == EINTR) continue;
+            /* EAGAIN is possible here despite the poll above: the attached
+             * client's socket is non-blocking, and a wakeup can be spurious.
+             * Re-poll under the same deadline rather than dropping the peer. */
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             return -1;
         }
         if (count == 0) {
@@ -719,10 +747,109 @@ peer_is_owner(int fd) {
 #endif
 }
 
+static size_t
+frame_queue_pending(const frame_queue *queue) {
+    return queue->size - queue->offset;
+}
+
+/* Queue one whole frame, or none of it.
+ *
+ * The capacity check precedes every append: a half-queued frame would
+ * permanently desynchronise that peer's framing, which presents as garbled
+ * output rather than as an error. */
+static int
+frame_queue_push(
+    frame_queue *queue,
+    size_t limit,
+    uint16_t type,
+    const void *payload,
+    uint32_t size
+) {
+    kpb_frame_header header;
+    size_t need = sizeof header + size;
+    if (queue->offset && queue->offset == queue->size) {
+        queue->offset = queue->size = 0;
+    }
+    if (queue->size - queue->offset + need > limit) {
+        return -1;
+    }
+    if (queue->offset && queue->size + need > queue->capacity) {
+        memmove(
+            queue->data,
+            queue->data + queue->offset,
+            queue->size - queue->offset);
+        queue->size -= queue->offset;
+        queue->offset = 0;
+    }
+    if (queue->size + need > queue->capacity) {
+        size_t capacity = queue->capacity ? queue->capacity : 65536;
+        unsigned char *replacement;
+        while (capacity < queue->size + need) capacity *= 2;
+        if (capacity > limit) capacity = limit;
+        if (queue->size + need > capacity) return -1;
+        replacement = realloc(queue->data, capacity);
+        if (!replacement) return -1;
+        queue->data = replacement;
+        queue->capacity = capacity;
+    }
+    header.magic = htonl(KPB_PROTOCOL_MAGIC);
+    header.version = htons(KPB_PROTOCOL_VERSION);
+    header.type = htons(type);
+    header.payload_size = htonl(size);
+    memcpy(queue->data + queue->size, &header, sizeof header);
+    if (size) memcpy(queue->data + queue->size + sizeof header, payload, size);
+    queue->size += need;
+    return 0;
+}
+
+static int
+frame_queue_flush(int fd, frame_queue *queue) {
+    while (queue->offset < queue->size) {
+        ssize_t count = send(
+            fd,
+            queue->data + queue->offset,
+            queue->size - queue->offset,
+            MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            return -1;
+        }
+        if (count == 0) return -1;
+        queue->offset += (size_t)count;
+    }
+    queue->offset = queue->size = 0;
+    return 0;
+}
+
+static void
+frame_queue_release(frame_queue *queue) {
+    free(queue->data);
+    memset(queue, 0, sizeof *queue);
+}
+
+static int
+client_enqueue(
+    server_state *server,
+    uint16_t type,
+    const void *payload,
+    uint32_t size
+) {
+    return frame_queue_push(
+        &server->client_out, KPB_CLIENT_QUEUE_LIMIT, type, payload, size);
+}
+
+static int
+client_flush(server_state *server) {
+    return frame_queue_flush(server->client_fd, &server->client_out);
+}
+
 static void
 close_client(server_state *server) {
     if (server->client_fd >= 0) close(server->client_fd);
     server->client_fd = -1;
+    frame_queue_release(&server->client_out);
+    server->client_replay_active = false;
 }
 
 static void
@@ -732,7 +859,7 @@ observer_close(server_state *server, size_t slot) {
         close(observer->fd);
         if (server->observer_count) server->observer_count--;
     }
-    free(observer->out);
+    frame_queue_release(&observer->out);
     memset(observer, 0, sizeof *observer);
     observer->fd = -1;
     observer->generation = ++server->observer_generation;
@@ -742,17 +869,12 @@ static void
 observers_close_all(server_state *server) {
     size_t slot;
     for (slot = 0; slot < KPB_OBSERVER_MAX; slot++) {
-        if (server->observers[slot].fd >= 0 || server->observers[slot].out) {
+        if (server->observers[slot].fd >= 0 || server->observers[slot].out.data) {
             observer_close(server, slot);
         }
     }
 }
 
-/* Queue one whole frame, or none of it.
- *
- * The capacity check precedes every append: a half-queued frame would
- * permanently desynchronise that observer's framing, which presents as garbled
- * output rather than as an error. */
 static int
 observer_enqueue(
     observer_slot *observer,
@@ -760,61 +882,13 @@ observer_enqueue(
     const void *payload,
     uint32_t size
 ) {
-    kpb_frame_header header;
-    size_t need = sizeof header + size;
-    if (observer->out_offset && observer->out_offset == observer->out_size) {
-        observer->out_offset = observer->out_size = 0;
-    }
-    if (observer->out_size - observer->out_offset + need > KPB_OBSERVER_QUEUE_LIMIT) {
-        return -1;
-    }
-    if (observer->out_offset && observer->out_size + need > observer->out_capacity) {
-        memmove(
-            observer->out,
-            observer->out + observer->out_offset,
-            observer->out_size - observer->out_offset);
-        observer->out_size -= observer->out_offset;
-        observer->out_offset = 0;
-    }
-    if (observer->out_size + need > observer->out_capacity) {
-        size_t capacity = observer->out_capacity ? observer->out_capacity : 65536;
-        unsigned char *replacement;
-        while (capacity < observer->out_size + need) capacity *= 2;
-        if (capacity > KPB_OBSERVER_QUEUE_LIMIT) capacity = KPB_OBSERVER_QUEUE_LIMIT;
-        if (observer->out_size + need > capacity) return -1;
-        replacement = realloc(observer->out, capacity);
-        if (!replacement) return -1;
-        observer->out = replacement;
-        observer->out_capacity = capacity;
-    }
-    header.magic = htonl(KPB_PROTOCOL_MAGIC);
-    header.version = htons(KPB_PROTOCOL_VERSION);
-    header.type = htons(type);
-    header.payload_size = htonl(size);
-    memcpy(observer->out + observer->out_size, &header, sizeof header);
-    if (size) memcpy(observer->out + observer->out_size + sizeof header, payload, size);
-    observer->out_size += need;
-    return 0;
+    return frame_queue_push(
+        &observer->out, KPB_OBSERVER_QUEUE_LIMIT, type, payload, size);
 }
 
 static int
 observer_flush(observer_slot *observer) {
-    while (observer->out_offset < observer->out_size) {
-        ssize_t count = send(
-            observer->fd,
-            observer->out + observer->out_offset,
-            observer->out_size - observer->out_offset,
-            MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            return -1;
-        }
-        if (count == 0) return -1;
-        observer->out_offset += (size_t)count;
-    }
-    observer->out_offset = observer->out_size = 0;
-    return 0;
+    return frame_queue_flush(observer->fd, &observer->out);
 }
 
 /* Refuse an observer with a reason it can read.  The pending queue is dropped
@@ -823,7 +897,7 @@ observer_flush(observer_slot *observer) {
 static void
 observer_refuse(server_state *server, size_t slot, const char *message) {
     observer_slot *observer = &server->observers[slot];
-    observer->out_offset = observer->out_size = 0;
+    observer->out.offset = observer->out.size = 0;
     if (observer_enqueue(
             observer, KPB_FRAME_ERROR, message, (uint32_t)strlen(message)) == 0) {
         (void)observer_flush(observer);
@@ -1138,31 +1212,17 @@ typedef struct {
     bool truncated;
 } replay_plan;
 
-/* Send to whichever kind of peer this is: the read-write client writes
- * synchronously, an observer goes through its bounded queue. */
-static kpb_result
-peer_send(
-    observer_slot *observer,
-    int fd,
-    uint16_t type,
-    const void *payload,
-    uint32_t size
-) {
-    if (observer) {
-        return observer_enqueue(observer, type, payload, size) == 0
-            ? KPB_OK : KPB_ERR_SYSTEM;
-    }
-    return send_frame(fd, type, payload, size);
-}
-
-/* Reads use pread so the journal's own append offset is never disturbed, and
- * clamp to plan->end rather than the file size: when journal_limit is smaller
- * than the reset sequence, journal_bytes deliberately exceeds the file. */
+/* Replay history to a freshly admitted observer.  Reads use pread so the
+ * journal's own append offset is never disturbed, and clamp to plan->end
+ * rather than the file size: when journal_limit is smaller than the reset
+ * sequence, journal_bytes deliberately exceeds the file.  Observer-only,
+ * because an observer's replay is capped and therefore always fits its queue;
+ * the read-write client's replay has no such cap and is fed incrementally
+ * from the event loop instead. */
 static int
 replay_journal(
     server_state *server,
     observer_slot *observer,
-    int client_fd,
     const replay_plan *plan
 ) {
     unsigned char buffer[KPB_IO_CHUNK];
@@ -1171,7 +1231,7 @@ replay_journal(
      * the journal, and a peer that counted them as journal content would carry
      * a two-byte error in its resume offset for the life of the session. */
     if (plan->truncated &&
-        peer_send(observer, client_fd, KPB_FRAME_RESET, "\033c", 2) != KPB_OK) {
+        observer_enqueue(observer, KPB_FRAME_RESET, "\033c", 2) != 0) {
         return -1;
     }
     while (at < plan->end) {
@@ -1183,15 +1243,80 @@ replay_journal(
             return -1;
         }
         if (count == 0) break;
-        if (peer_send(
-                observer, client_fd,
-                KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != KPB_OK) {
+        if (observer_enqueue(
+                observer, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != 0) {
             return -1;
         }
         at += (uint64_t)count;
     }
-    return peer_send(
-        observer, client_fd, KPB_FRAME_REPLAY_DONE, NULL, 0) == KPB_OK ? 0 : -1;
+    return observer_enqueue(observer, KPB_FRAME_REPLAY_DONE, NULL, 0);
+}
+
+/* Begin owing the read-write client a replay.  The frames are fed to its
+ * queue from the event loop rather than streamed here: the journal can hold
+ * tens of megabytes, and sending it synchronously was the write-side hole in
+ * the loop's responsiveness guarantee - a client that attached and never read
+ * held the broker, and therefore `kill`, hostage inside sendmsg.  Feeding
+ * from the loop keeps memory bounded by the queue limit and the control
+ * plane live throughout. */
+static void
+client_replay_begin(server_state *server, uint64_t start) {
+    server->client_replay_active = true;
+    server->client_replay_at = start;
+    server->client_replay_epoch = server->journal_epoch;
+}
+
+/* Feed the pending replay up to the queue's high-water mark.  The end is
+ * journal_bytes rather than a snapshot: within an epoch the journal is
+ * append-only, so output arriving while the replay drains is simply covered
+ * by the replay itself, and REPLAY_DONE is sent exactly when the client is
+ * current.  If the epoch rolls over mid-replay the journal now begins with a
+ * terminal reset, so restarting from zero repaints the client correctly -
+ * the same contract every full replay after eviction has. */
+static void
+feed_client_replay(server_state *server) {
+    unsigned char buffer[KPB_IO_CHUNK];
+    while (server->client_fd >= 0 && server->client_replay_active &&
+           frame_queue_pending(&server->client_out) < KPB_CLIENT_QUEUE_HIGH_WATER) {
+        uint64_t end = server->journal_bytes;
+        size_t wanted;
+        ssize_t count;
+        if (server->client_replay_epoch != server->journal_epoch) {
+            server->client_replay_epoch = server->journal_epoch;
+            server->client_replay_at = 0;
+            continue;
+        }
+        if (server->client_replay_at >= end) {
+            if (client_enqueue(server, KPB_FRAME_REPLAY_DONE, NULL, 0) != 0) {
+                close_client(server);
+                return;
+            }
+            server->client_replay_active = false;
+            return;
+        }
+        wanted = end - server->client_replay_at < sizeof buffer
+            ? (size_t)(end - server->client_replay_at) : sizeof buffer;
+        count = pread(
+            server->journal_fd, buffer, wanted, (off_t)server->client_replay_at);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            close_client(server);
+            return;
+        }
+        if (count == 0) {
+            /* journal_bytes deliberately exceeds the file when the limit is
+             * smaller than the reset sequence; end-of-file means caught up,
+             * exactly as it did for the streaming replay. */
+            server->client_replay_at = end;
+            continue;
+        }
+        if (client_enqueue(
+                server, KPB_FRAME_OUTPUT, buffer, (uint32_t)count) != 0) {
+            close_client(server);
+            return;
+        }
+        server->client_replay_at += (uint64_t)count;
+    }
 }
 
 /* Decide what a peer is owed.  Within one epoch the journal is strictly
@@ -1316,6 +1441,13 @@ flush_input(server_state *server) {
     return 0;
 }
 
+static int
+set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 static void
 handle_v1_attach(server_state *server, int fd, const unsigned char *payload) {
     if (server->client_fd >= 0) {
@@ -1323,14 +1455,12 @@ handle_v1_attach(server_state *server, int fd, const unsigned char *payload) {
         close(fd);
         return;
     }
-    server->client_fd = fd;
-    {
-        replay_plan plan = {0, server->journal_bytes, false, false};
-        if (replay_journal(server, NULL, fd, &plan) != 0) {
-            close_client(server);
-            return;
-        }
+    if (set_nonblocking(fd) != 0) {
+        close(fd);
+        return;
     }
+    server->client_fd = fd;
+    client_replay_begin(server, 0);
     {
         /* memcpy rather than a cast: the receive buffer is an unsigned char
          * array with alignment 1. */
@@ -1348,13 +1478,6 @@ refuse_v2(int fd, kpb_result code) {
     reply.version = htons((uint16_t)KPB_PROTOCOL_VERSION_MAX);
     (void)send_frame(fd, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply);
     close(fd);
-}
-
-static int
-set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 /* Admit a session-protocol-2 peer.  Reached only for a 32-byte payload, which
@@ -1408,12 +1531,17 @@ handle_v2_handshake(
             refuse_v2(fd, KPB_ERR_BUSY);
             return;
         }
+        if (set_nonblocking(fd) != 0) {
+            refuse_v2(fd, KPB_ERR_SYSTEM);
+            return;
+        }
         server->client_fd = fd;
-        if (send_frame(fd, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply) != KPB_OK ||
-            replay_journal(server, NULL, fd, &plan) != 0) {
+        if (client_enqueue(
+                server, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply) != 0) {
             close_client(server);
             return;
         }
+        client_replay_begin(server, plan.start);
         {
             kpb_wire_winsize size;
             size.rows = request->rows;
@@ -1440,7 +1568,7 @@ handle_v2_handshake(
             return;
         }
         observer = &server->observers[slot];
-        free(observer->out);
+        frame_queue_release(&observer->out);
         memset(observer, 0, sizeof *observer);
         observer->fd = fd;
         observer->generation = ++server->observer_generation;
@@ -1449,7 +1577,7 @@ handle_v2_handshake(
          * pane, and the v1 path above calls apply_size unconditionally. */
         if (observer_enqueue(
                 observer, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply) != 0 ||
-            replay_journal(server, observer, -1, &plan) != 0 ||
+            replay_journal(server, observer, &plan) != 0 ||
             observer_flush(observer) != 0) {
             observer_close(server, slot);
         }
@@ -1549,7 +1677,15 @@ handle_client_frame(server_state *server) {
     switch (type) {
         case KPB_FRAME_INPUT:
             if (queue_input(server, payload, payload_size) != 0) {
-                (void)send_error(server->client_fd, KPB_ERROR_INPUT_LIMIT);
+                /* Refuse with a reason it can read, the way observer_refuse
+                 * does: drop the pending queue so the short error always
+                 * fits, flush once, and close. */
+                server->client_out.offset = server->client_out.size = 0;
+                if (client_enqueue(
+                        server, KPB_FRAME_ERROR, KPB_ERROR_INPUT_LIMIT,
+                        (uint32_t)strlen(KPB_ERROR_INPUT_LIMIT)) == 0) {
+                    (void)client_flush(server);
+                }
                 close_client(server);
             }
             break;
@@ -1633,10 +1769,12 @@ forward_pty_output(server_state *server, const unsigned char *data, size_t size)
         close(server->transcript_fd);
         server->transcript_fd = -1;
     }
-    if (server->client_fd >= 0 &&
-        send_frame(
-            server->client_fd, KPB_FRAME_OUTPUT, data, (uint32_t)size
-        ) != KPB_OK) {
+    /* During a replay these bytes are already covered by the replay itself,
+     * which reads them back out of the journal; queueing them here too would
+     * deliver them twice. */
+    if (server->client_fd >= 0 && !server->client_replay_active &&
+        (client_enqueue(server, KPB_FRAME_OUTPUT, data, (uint32_t)size) != 0 ||
+         client_flush(server) != 0)) {
         close_client(server);
     }
     observers_send(server, KPB_FRAME_OUTPUT, data, (uint32_t)size);
@@ -1691,7 +1829,7 @@ observers_drain(server_state *server) {
         int ready;
         for (slot = 0; slot < KPB_OBSERVER_MAX; slot++) {
             observer_slot *observer = &server->observers[slot];
-            if (observer->fd < 0 || observer->out_size <= observer->out_offset) continue;
+            if (observer->fd < 0 || !frame_queue_pending(&observer->out)) continue;
             descriptors[pending].fd = observer->fd;
             descriptors[pending].events = POLLOUT;
             descriptors[pending].revents = 0;
@@ -1711,6 +1849,39 @@ observers_drain(server_state *server) {
                 observer_close(server, slots[slot]);
             }
         }
+    }
+}
+
+/* Give the read-write client a bounded chance to take what it is owed - the
+ * tail of its replay, any queued output, and the EXIT frame - on the same
+ * budget drain_pty uses.  A client that will not read within it has stopped
+ * behaving and is closed rather than allowed to hold teardown open, which is
+ * what an unbounded send here once permitted: a stalled frontend made `kill`
+ * hang forever on a session whose child was already gone. */
+static void
+client_finish(server_state *server, const kpb_wire_exit *wire) {
+    const uint64_t deadline = monotonic_millis() + 200;
+    bool exit_queued = false;
+    while (server->client_fd >= 0 && monotonic_millis() < deadline) {
+        struct pollfd descriptor;
+        feed_client_replay(server);
+        if (server->client_fd < 0) return;
+        if (!server->client_replay_active && !exit_queued) {
+            if (client_enqueue(server, KPB_FRAME_EXIT, wire, sizeof *wire) != 0) {
+                close_client(server);
+                return;
+            }
+            exit_queued = true;
+        }
+        if (client_flush(server) != 0) {
+            close_client(server);
+            return;
+        }
+        if (exit_queued && !frame_queue_pending(&server->client_out)) return;
+        descriptor.fd = server->client_fd;
+        descriptor.events = POLLOUT;
+        descriptor.revents = 0;
+        if (poll(&descriptor, 1, 20) < 0 && errno != EINTR) return;
     }
 }
 
@@ -1737,21 +1908,35 @@ server_loop(server_state *server) {
             signal_child_session(server->child_pid, SIGKILL);
             server->terminate_deadline = UINT64_MAX;
         }
+        feed_client_replay(server);
         descriptors[0].fd = server->listener_fd;
         descriptors[0].events = POLLIN;
         descriptors[0].revents = 0;
         descriptors[1].fd = server->pty_fd;
-        descriptors[1].events = POLLIN | (server->input_size ? POLLOUT : 0);
+        /* Reading the PTY is gated on the client's backlog: past the
+         * high-water mark the kernel PTY buffer is left to fill, which is
+         * what stops the shell when a frontend stops reading.  Everything
+         * else - the listener, observers, the client's own frames - stays
+         * serviced, so `status` and `kill` keep working regardless. */
+        descriptors[1].events = (short)(
+            (server->client_fd >= 0 &&
+             frame_queue_pending(&server->client_out) >=
+                 KPB_CLIENT_QUEUE_HIGH_WATER
+                 ? 0 : POLLIN) |
+            (server->input_size ? POLLOUT : 0));
         descriptors[1].revents = 0;
         descriptors[2].fd = server->client_fd;
-        descriptors[2].events = server->client_fd >= 0 ? POLLIN : 0;
+        descriptors[2].events = server->client_fd >= 0
+            ? (short)(POLLIN |
+                (frame_queue_pending(&server->client_out) ? POLLOUT : 0))
+            : 0;
         descriptors[2].revents = 0;
         for (slot = 0; slot < KPB_OBSERVER_MAX; slot++) {
             observer_slot *observer = &server->observers[slot];
             descriptors[3 + slot].fd = observer->fd;
             descriptors[3 + slot].events = observer->fd >= 0
                 ? (short)(POLLIN |
-                    (observer->out_size > observer->out_offset ? POLLOUT : 0))
+                    (frame_queue_pending(&observer->out) ? POLLOUT : 0))
                 : 0;
             descriptors[3 + slot].revents = 0;
             generations[slot] = observer->generation;
@@ -1777,7 +1962,11 @@ server_loop(server_state *server) {
             return -1;
         }
         if (descriptors[0].revents & POLLIN) handle_new_connection(server);
-        if (descriptors[2].revents & (POLLIN | POLLHUP | POLLERR)) {
+        if (server->client_fd >= 0 && (descriptors[2].revents & POLLOUT)) {
+            if (client_flush(server) != 0) close_client(server);
+        }
+        if (server->client_fd >= 0 &&
+            (descriptors[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (descriptors[2].revents & POLLIN) handle_client_frame(server);
             else close_client(server);
         }
@@ -1820,9 +2009,12 @@ server_loop(server_state *server) {
         /* Bound backlog latency to one tick.  This cannot spin: a queue that
          * survives the flush means the socket is full, and POLLOUT then simply
          * does not fire until it drains. */
+        if (server->client_fd >= 0 && frame_queue_pending(&server->client_out)) {
+            if (client_flush(server) != 0) close_client(server);
+        }
         for (slot = 0; slot < KPB_OBSERVER_MAX; slot++) {
             observer_slot *observer = &server->observers[slot];
-            if (observer->fd < 0 || observer->out_size <= observer->out_offset) continue;
+            if (observer->fd < 0 || !frame_queue_pending(&observer->out)) continue;
             if (observer_flush(observer) != 0) observer_close(server, slot);
         }
     }
@@ -1830,9 +2022,7 @@ server_loop(server_state *server) {
     {
         kpb_wire_exit wire;
         wire.wait_status = htonl((uint32_t)child_status);
-        if (server->client_fd >= 0) {
-            (void)send_frame(server->client_fd, KPB_FRAME_EXIT, &wire, sizeof wire);
-        }
+        client_finish(server, &wire);
         observers_send(server, KPB_FRAME_EXIT, &wire, sizeof wire);
         observers_drain(server);
     }
@@ -1845,6 +2035,7 @@ static void
 cleanup_server(server_state *server) {
     observers_close_all(server);
     if (server->client_fd >= 0) close(server->client_fd);
+    frame_queue_release(&server->client_out);
     if (server->pty_fd >= 0) close(server->pty_fd);
     if (server->listener_fd >= 0) close(server->listener_fd);
     if (server->journal_fd >= 0) close(server->journal_fd);
