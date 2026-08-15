@@ -111,6 +111,8 @@ bridge(
     struct termios raw;
     struct sigaction action;
     struct winsize size;
+    sigset_t blocked;
+    sigset_t original;
     kpb_connection connection;
     kpb_attach_result attached;
     bool observing = options && options->mode == KPB_ATTACH_OBSERVE;
@@ -169,6 +171,20 @@ bridge(
     sigaction(SIGINT, &action, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    /* The pending flags are checked at the top of the loop, and the wait
+     * below has to wake when one is set.  Handlers alone are not enough: a
+     * signal landing between the check and the wait would be absorbed with
+     * the wait still ahead, so the signals are blocked here and atomically
+     * unblocked only inside ppoll - the same construction the broker uses
+     * for SIGCHLD, rather than a fallback timeout that would wake every
+     * attached client ten times a second for the life of the pane. */
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGWINCH);
+    sigaddset(&blocked, SIGHUP);
+    sigaddset(&blocked, SIGTERM);
+    sigaddset(&blocked, SIGINT);
+    sigprocmask(SIG_BLOCK, &blocked, &original);
+
     while (!stop_pending) {
         struct pollfd descriptors[2];
         int count;
@@ -188,7 +204,7 @@ bridge(
         descriptors[1].fd = STDIN_FILENO;
         descriptors[1].events = replay_done ? POLLIN : 0;
         descriptors[1].revents = 0;
-        count = poll(descriptors, 2, 100);
+        count = ppoll(descriptors, 2, NULL, &original);
         if (count < 0) {
             if (errno == EINTR) continue;
             exit_code = 1;
@@ -253,6 +269,7 @@ bridge(
         }
     }
 
+    sigprocmask(SIG_SETMASK, &original, NULL);
     kpb_detach(&connection);
     if (have_termios) (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved);
     if (track_cursor) {
