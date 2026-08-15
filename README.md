@@ -226,7 +226,9 @@ A session lost that way does not leave permanent garbage, though: the session
 directory's metadata records the broker's pid, and a later `list` or a respawn
 under the same ID removes the directory once that process is provably gone.
 Anything short of proof — metadata missing or a pid that still exists — leaves
-the directory untouched, so a live session is never reaped.
+the directory untouched, so a live session is never reaped. Proof, removal, and
+recreation are serialised through a lock on the sessions directory, so two
+concurrent respawns of the same ID cannot reap each other's fresh session.
 
 ## License
 

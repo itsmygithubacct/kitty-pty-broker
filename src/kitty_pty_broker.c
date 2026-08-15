@@ -21,6 +21,7 @@
 #ifdef __linux__
 #include <sys/random.h>
 #endif
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -2275,13 +2276,33 @@ session_is_stale(const session_paths *paths) {
 
 /* Remove a directory session_is_stale() has vouched for.  Best-effort, and
  * rmdir is the commit point: it fails if anything unexpected is still
- * inside, which is the safe direction. */
+ * inside, which is the safe direction.  Callers hold the sessions-directory
+ * lock across both the proof and this removal. */
 static void
 reap_stale_session(const session_paths *paths) {
     (void)unlink(paths->socket_path);
     (void)unlink(paths->journal_path);
     (void)unlink(paths->metadata_path);
     (void)rmdir(paths->session_dir);
+}
+
+/* Serialise reaping against session creation.  The staleness proof and the
+ * unlinks are two separate steps, and two same-uid callers respawning one ID
+ * could otherwise interleave them: the first reaps the corpse and recreates
+ * the directory, and the second - still holding its ESRCH proof from the old
+ * metadata - unlinks the fresh socket and journal by path.  An exclusive
+ * lock on the sessions directory makes proof, removal, and recreation one
+ * step; every holder releases it within microseconds. */
+static int
+lock_sessions_dir(const session_paths *paths) {
+    int fd = open(paths->sessions_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) continue;
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 kpb_result
@@ -2317,18 +2338,40 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
     if (result != KPB_OK) return result;
     result = build_paths(options->runtime_dir, session_id, &paths);
     if (result != KPB_OK) return result;
-    if (lstat(paths.session_dir, &existing) == 0) {
-        /* A leftover directory whose broker is provably gone must not block
-         * this ID forever: a stable `run --id` pane could otherwise never be
-         * respawned after the machine OOM-killed its broker. */
-        if (!session_is_stale(&paths)) return KPB_ERR_EXISTS;
-        reap_stale_session(&paths);
-        if (lstat(paths.session_dir, &existing) == 0) return KPB_ERR_EXISTS;
-        if (errno != ENOENT) return KPB_ERR_SYSTEM;
-    } else if (errno != ENOENT) {
-        return KPB_ERR_SYSTEM;
+    {
+        /* Everything from the staleness proof to mkdir happens under the
+         * sessions-directory lock: a concurrent respawn or list walk could
+         * otherwise reap the directory this call has just recreated. */
+        int lock_fd = lock_sessions_dir(&paths);
+        if (lock_fd < 0) return KPB_ERR_SYSTEM;
+        if (lstat(paths.session_dir, &existing) == 0) {
+            /* A leftover directory whose broker is provably gone must not
+             * block this ID forever: a stable `run --id` pane could otherwise
+             * never be respawned after the machine OOM-killed its broker. */
+            if (!session_is_stale(&paths)) {
+                close(lock_fd);
+                return KPB_ERR_EXISTS;
+            }
+            reap_stale_session(&paths);
+            if (lstat(paths.session_dir, &existing) == 0) {
+                close(lock_fd);
+                return KPB_ERR_EXISTS;
+            }
+            if (errno != ENOENT) {
+                close(lock_fd);
+                return KPB_ERR_SYSTEM;
+            }
+        } else if (errno != ENOENT) {
+            close(lock_fd);
+            return KPB_ERR_SYSTEM;
+        }
+        if (mkdir(paths.session_dir, 0700) != 0) {
+            bool taken = errno == EEXIST;
+            close(lock_fd);
+            return taken ? KPB_ERR_EXISTS : KPB_ERR_SYSTEM;
+        }
+        close(lock_fd);
     }
-    if (mkdir(paths.session_dir, 0700) != 0) return errno == EEXIST ? KPB_ERR_EXISTS : KPB_ERR_SYSTEM;
     if (pipe2(ready_pipe, O_CLOEXEC) != 0) {
         rmdir(paths.session_dir);
         return KPB_ERR_SYSTEM;
@@ -2712,11 +2755,17 @@ kpb_list(const char *runtime_dir, kpb_list_callback callback, void *data) {
              * the recorded broker is gone this is a corpse from an uncleanly
              * killed session, and this walk is the natural place to reap it -
              * otherwise it stays invisible forever while still blocking its
-             * ID and costing every listing a connect() to a dead socket. */
+             * ID and costing every listing a connect() to a dead socket.
+             * Proof and removal happen under the sessions-directory lock, so
+             * a respawn that has just recreated this directory can never
+             * lose its fresh files to the walk. */
             session_paths stale;
-            if (build_paths(runtime_dir, entry->d_name, &stale) == KPB_OK &&
-                session_is_stale(&stale)) {
-                reap_stale_session(&stale);
+            if (build_paths(runtime_dir, entry->d_name, &stale) == KPB_OK) {
+                int lock_fd = lock_sessions_dir(&stale);
+                if (lock_fd >= 0) {
+                    if (session_is_stale(&stale)) reap_stale_session(&stale);
+                    close(lock_fd);
+                }
             }
             continue;
         }
