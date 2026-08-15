@@ -1792,17 +1792,31 @@ observers_drain(server_state *server) {
 }
 
 /* Give the read-write client a bounded chance to take what it is owed - the
- * tail of its replay, any queued output, and the EXIT frame - on the same
- * budget drain_pty uses.  A client that will not read within it has stopped
- * behaving and is closed rather than allowed to hold teardown open, which is
- * what an unbounded send here once permitted: a stalled frontend made `kill`
- * hang forever on a session whose child was already gone. */
+ * tail of its replay, any queued output, and the EXIT frame.
+ *
+ * The bound is idle time, not total time: a client that attached just before
+ * the child exited can still be owed most of a large journal, and delivering
+ * that takes however long the client takes to read it, so a single fixed
+ * budget would cut a well-behaved slow reader off mid-replay and cost it the
+ * EXIT frame - and with it the child's real exit status.  Every delivery
+ * therefore resets the deadline, and only a client that takes nothing for a
+ * whole budget has stopped behaving and is closed rather than allowed to
+ * hold teardown open, which is what an unbounded send here once permitted: a
+ * stalled frontend made `kill` hang forever on a session whose child was
+ * already gone.  The overall cap keeps teardown finite even against a client
+ * that trickles one byte per budget. */
+#define KPB_FINISH_IDLE_MILLIS 200
+#define KPB_FINISH_TOTAL_MILLIS 30000
+
 static void
 client_finish(server_state *server, const kpb_wire_exit *wire) {
-    const uint64_t deadline = monotonic_millis() + 200;
+    const uint64_t abandon = monotonic_millis() + KPB_FINISH_TOTAL_MILLIS;
+    uint64_t stalled = monotonic_millis() + KPB_FINISH_IDLE_MILLIS;
     bool exit_queued = false;
-    while (server->client_fd >= 0 && monotonic_millis() < deadline) {
+    while (server->client_fd >= 0 && monotonic_millis() < stalled &&
+           monotonic_millis() < abandon) {
         struct pollfd descriptor;
+        size_t pending_before;
         feed_client_replay(server);
         if (server->client_fd < 0) return;
         if (!server->client_replay_active && !exit_queued) {
@@ -1812,9 +1826,13 @@ client_finish(server_state *server, const kpb_wire_exit *wire) {
             }
             exit_queued = true;
         }
+        pending_before = frame_queue_pending(&server->client_out);
         if (client_flush(server) != 0) {
             close_client(server);
             return;
+        }
+        if (frame_queue_pending(&server->client_out) < pending_before) {
+            stalled = monotonic_millis() + KPB_FINISH_IDLE_MILLIS;
         }
         if (exit_queued && !frame_queue_pending(&server->client_out)) return;
         descriptor.fd = server->client_fd;

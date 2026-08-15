@@ -993,6 +993,41 @@ gated_writer_child(void) {
     return writer_child();
 }
 
+#define FINISHING_WRITER_BYTES (8U * 1024U * 1024U)
+
+/* Fill the journal, then hold the pane open until one byte of input arrives,
+ * then exit with a status the test can recognise.  Raw mode, so neither the
+ * trigger byte's echo nor output post-processing can change the byte count
+ * the journal ends up holding. */
+static int
+finishing_writer_child(void) {
+    static unsigned char buffer[8192];
+    struct termios attributes;
+    unsigned char trigger;
+    size_t written = 0;
+    if (tcgetattr(STDIN_FILENO, &attributes) != 0) return 2;
+    cfmakeraw(&attributes);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &attributes) != 0) return 2;
+    memset(buffer, 'x', sizeof buffer);
+    while (written < FINISHING_WRITER_BYTES) {
+        size_t wanted = FINISHING_WRITER_BYTES - written;
+        ssize_t count;
+        if (wanted > sizeof buffer) wanted = sizeof buffer;
+        count = write(STDOUT_FILENO, buffer, wanted);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return 2;
+        }
+        written += (size_t)count;
+    }
+    for (;;) {
+        ssize_t count = read(STDIN_FILENO, &trigger, 1);
+        if (count == 1) return 42;
+        if (count < 0 && errno == EINTR) continue;
+        return 2;
+    }
+}
+
 static void
 spawn_session(
     const char *session_id,
@@ -1271,6 +1306,66 @@ test_a_write_stalled_client_does_not_stop_the_broker(void) {
 
     close(connection.fd);
     connection.fd = -1;
+}
+
+/* The exit drain must not cost a live reader its replay tail or the EXIT
+ * frame.  A client that attaches just before the child exits can still be
+ * owed most of a large journal, and delivering that takes however long the
+ * client takes to read it - the drain budget exists to cut off a client that
+ * has stopped reading, not one that reads slowly.  So: attach against a full
+ * journal, trigger the exit immediately, and read the whole replay at a pace
+ * chosen to overrun any fixed drain budget many times over while never
+ * pausing long enough to look stalled.  Every byte, REPLAY_DONE, and the
+ * child's real exit status must still arrive. */
+static void
+test_slow_reader_keeps_replay_tail_and_exit(void) {
+    char *command[] = {(char *)test_program, "--finishing-writer-child", NULL};
+    kpb_connection connection;
+    kpb_attach_result result;
+    kpb_status status;
+    unsigned char buffer[KPB_IO_CHUNK];
+    uint64_t received = 0;
+    bool replay_done = false;
+    int attempt;
+
+    alarm(120);
+    spawn_session("slowfinish", command, KPB_DEFAULT_JOURNAL_LIMIT);
+    for (attempt = 0; attempt < 600; attempt++) {
+        CHECK(kpb_query_status(runtime_dir, "slowfinish", &status) == KPB_OK);
+        if (status.journal_bytes >= FINISHING_WRITER_BYTES) break;
+        usleep(50000);
+    }
+    CHECK(attempt < 600);
+    CHECK(status.journal_bytes == FINISHING_WRITER_BYTES);
+
+    CHECK(attach_v2("slowfinish", &connection, &result, 0, 0, 0) == KPB_OK);
+    CHECK(result.journal_offset == 0);
+    CHECK(kpb_send_input(&connection, "x", 1) == KPB_OK);
+
+    while (true) {
+        kpb_event event;
+        wait_readable(connection.fd);
+        CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_OK);
+        if (event.type == KPB_EVENT_EXIT) {
+            CHECK(replay_done);
+            CHECK(WIFEXITED(event.exit_status));
+            CHECK(WEXITSTATUS(event.exit_status) == 42);
+            break;
+        }
+        if (event.type == KPB_EVENT_REPLAY_DONE) {
+            replay_done = true;
+            continue;
+        }
+        CHECK(event.type == KPB_EVENT_OUTPUT);
+        received += event.size;
+        /* Slow, never stalled: each pause is far inside the broker's idle
+         * allowance, while the drain as a whole takes whole seconds. */
+        usleep(5000);
+    }
+    CHECK(received == FINISHING_WRITER_BYTES);
+    kpb_detach(&connection);
+    wait_for_session_end("slowfinish");
+    alarm(0);
 }
 
 /* Every frame a v1 peer receives must carry version 1 and a type it already
@@ -2443,6 +2538,9 @@ main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--gated-writer-child") == 0) {
         return gated_writer_child();
     }
+    if (argc == 2 && strcmp(argv[1], "--finishing-writer-child") == 0) {
+        return finishing_writer_child();
+    }
     if (argc == 3 && strcmp(argv[1], "--descriptor-child") == 0) {
         return descriptor_child(argv[2]);
     }
@@ -2485,6 +2583,7 @@ main(int argc, char **argv) {
     RUN(test_tui);
     RUN(test_a_stalled_client_does_not_stop_the_broker);
     RUN(test_a_write_stalled_client_does_not_stop_the_broker);
+    RUN(test_slow_reader_keeps_replay_tail_and_exit);
     RUN(test_terminate);
     RUN(test_dead_session_directory_is_reaped);
     RUN(test_reaping_never_removes_a_live_session);
