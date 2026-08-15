@@ -31,19 +31,19 @@ all: $(STATIC_LIB) $(SHARED_LIB) $(CLI)
 $(BUILD_DIR):
 	mkdir -p "$@"
 
-$(LIB_OBJECT): src/kitty_pty_broker.c src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(LIB_OBJECT): src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
-$(CLI_OBJECT): src/main.c include/kitty_pty_broker.h | $(BUILD_DIR)
+$(CLI_OBJECT): src/main.c src/internal.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
-$(TUI_OBJECT): src/tui.c src/tui.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(TUI_OBJECT): src/tui.c src/tui.h src/internal.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(TEST_OBJECT): tests/test_broker.c src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
-$(BENCHMARK_OBJECT): tests/benchmark_broker.c include/kitty_pty_broker.h | $(BUILD_DIR)
+$(BENCHMARK_OBJECT): tests/benchmark_broker.c src/internal.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(STATIC_LIB): $(LIB_OBJECT)
@@ -73,7 +73,7 @@ benchmark: $(BENCHMARK)
 compatibility:
 	./tests/mixed_version.sh
 
-$(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 		-fsanitize=fuzzer,address,undefined \
 		tests/fuzz_protocol.c src/kitty_pty_broker.c -o "$@" $(LDLIBS)

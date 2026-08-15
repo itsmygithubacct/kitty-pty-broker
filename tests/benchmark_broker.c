@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kitty_pty_broker.h"
+#include "internal.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -51,25 +52,6 @@ monotonic_nanos(void) {
 }
 
 static int
-write_all(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t done = 0;
-    while (done < size) {
-        ssize_t count = write(fd, cursor + done, size - done);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (count == 0) {
-            errno = EIO;
-            return -1;
-        }
-        done += (size_t)count;
-    }
-    return 0;
-}
-
-static int
 wait_for_trigger(void) {
     unsigned char trigger;
     while (true) {
@@ -90,21 +72,21 @@ producer(size_t bytes, bool graphics, bool replay) {
     cfmakeraw(&attributes);
     if (tcsetattr(STDIN_FILENO, TCSANOW, &attributes) != 0) return 2;
     if (!replay) {
-        if (write_all(
+        if (write_all_fd(
                 STDOUT_FILENO, BENCHMARK_READY,
-                sizeof BENCHMARK_READY - 1U) != 0) {
+                sizeof BENCHMARK_READY - 1U) < 0) {
             return 2;
         }
         if (wait_for_trigger() != 0) return 2;
     }
-    if (graphics && write_all(STDOUT_FILENO, "\033_G", 3) != 0) return 2;
+    if (graphics && write_all_fd(STDOUT_FILENO, "\033_G", 3) < 0) return 2;
     while (produced < bytes) {
         size_t wanted = bytes - produced;
         if (wanted > sizeof block) wanted = sizeof block;
-        if (write_all(STDOUT_FILENO, block, wanted) != 0) return 2;
+        if (write_all_fd(STDOUT_FILENO, block, wanted) < 0) return 2;
         produced += wanted;
     }
-    if (graphics && write_all(STDOUT_FILENO, "\033\\", 2) != 0) return 2;
+    if (graphics && write_all_fd(STDOUT_FILENO, "\033\\", 2) < 0) return 2;
     if (replay && wait_for_trigger() != 0) return 2;
     return 0;
 }

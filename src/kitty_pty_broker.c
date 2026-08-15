@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kitty_pty_broker.h"
+#include "internal.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -161,23 +162,6 @@ be64_to_host(uint64_t value) {
     return host_to_be64(value);
 }
 
-static uint64_t
-clock_millis(clockid_t clock) {
-    struct timespec ts;
-    if (clock_gettime(clock, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000U + (uint64_t)ts.tv_nsec / 1000000U;
-}
-
-static uint64_t
-realtime_millis(void) {
-    return clock_millis(CLOCK_REALTIME);
-}
-
-static uint64_t
-monotonic_millis(void) {
-    return clock_millis(CLOCK_MONOTONIC);
-}
-
 static int
 copy_string(char *destination, size_t capacity, const char *source) {
     size_t size;
@@ -269,44 +253,6 @@ build_paths(const char *runtime_dir, const char *session_id, session_paths *path
     }
     if (strlen(paths->socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return KPB_ERR_INVALID;
     return KPB_OK;
-}
-
-static ssize_t
-write_all_fd(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t written = 0;
-    while (written < size) {
-        ssize_t count = write(fd, cursor + written, size - written);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (count == 0) {
-            errno = EPIPE;
-            return -1;
-        }
-        written += (size_t)count;
-    }
-    return (ssize_t)written;
-}
-
-static ssize_t
-read_all_fd(int fd, void *data, size_t size) {
-    unsigned char *cursor = data;
-    size_t received = 0;
-    while (received < size) {
-        ssize_t count = read(fd, cursor + received, size - received);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (count == 0) {
-            errno = ECONNRESET;
-            return -1;
-        }
-        received += (size_t)count;
-    }
-    return (ssize_t)received;
 }
 
 /* A deadline `millis` from now, normalised.  One place, because open-coding
@@ -1751,13 +1697,6 @@ handle_observer_frame(server_state *server, size_t slot) {
             observer_refuse(server, slot, KPB_ERROR_INVALID);
             break;
     }
-}
-
-static int
-wait_status_to_exit_code(int status) {
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-    return 255;
 }
 
 static int

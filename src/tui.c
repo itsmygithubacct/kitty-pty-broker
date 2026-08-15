@@ -2,6 +2,8 @@
 
 #include "tui.h"
 
+#include "internal.h"
+
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -61,13 +63,6 @@ static void
 handle_tui_stop(int signal_number) {
     (void)signal_number;
     tui_stop_pending = 1;
-}
-
-static uint64_t
-realtime_millis(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
-    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 static int

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kitty_pty_broker.h"
+#include "internal.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -10,22 +11,6 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-static int
-write_all(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t done = 0;
-    while (done < size) {
-        ssize_t count = write(fd, cursor + done, size - done);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (count == 0) return -1;
-        done += (size_t)count;
-    }
-    return 0;
-}
 
 static void
 check_event(kpb_result result, const kpb_event *event, size_t capacity) {
@@ -86,12 +71,13 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         header.version = htons(KPB_PROTOCOL_VERSION);
         header.type = htons(type);
         header.payload_size = htonl(payload_size);
-        if (write_all(sockets[0], &header, sizeof header) == 0 &&
-            (!payload_size || write_all(sockets[0], payload, payload_size) == 0)) {
+        if (write_all_fd(sockets[0], &header, sizeof header) >= 0 &&
+            (!payload_size ||
+             write_all_fd(sockets[0], payload, payload_size) >= 0)) {
             (void)shutdown(sockets[0], SHUT_WR);
         }
     } else {
-        if (!size || write_all(sockets[0], data, size) == 0) {
+        if (!size || write_all_fd(sockets[0], data, size) >= 0) {
             (void)shutdown(sockets[0], SHUT_WR);
         }
     }

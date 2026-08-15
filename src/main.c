@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "kitty_pty_broker.h"
+#include "internal.h"
 #include "tui.h"
 
 #include <errno.h>
@@ -31,22 +32,6 @@ handle_stop(int signal_number) {
     stop_pending = 1;
 }
 
-static int
-write_all(int fd, const void *data, size_t size) {
-    const unsigned char *cursor = data;
-    size_t done = 0;
-    while (done < size) {
-        ssize_t count = write(fd, cursor + done, size - done);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (count == 0) return -1;
-        done += (size_t)count;
-    }
-    return 0;
-}
-
 static const char *
 default_runtime(char output[KPB_PATH_MAX]) {
     const char *configured = getenv("KITTY_PTY_BROKER_RUNTIME");
@@ -68,13 +53,6 @@ get_size(struct winsize *size) {
         size->ws_row = 24;
         size->ws_col = 80;
     }
-}
-
-static int
-exit_code_from_wait_status(int status) {
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
-    return 255;
 }
 
 static int
@@ -219,7 +197,7 @@ bridge(
             }
             if (event.type == KPB_EVENT_OUTPUT) {
                 cursor_offset += event.size;
-                if (write_all(STDOUT_FILENO, buffer, event.size) != 0) {
+                if (write_all_fd(STDOUT_FILENO, buffer, event.size) < 0) {
                     exit_code = 1;
                     break;
                 }
@@ -227,19 +205,19 @@ bridge(
                 /* Written but deliberately not counted: it holds no journal
                  * position, and adding it would push cursor_offset past the
                  * end of what has actually been received. */
-                if (write_all(STDOUT_FILENO, buffer, event.size) != 0) {
+                if (write_all_fd(STDOUT_FILENO, buffer, event.size) < 0) {
                     exit_code = 1;
                     break;
                 }
             } else if (event.type == KPB_EVENT_REPLAY_DONE) {
                 replay_done = true;
             } else if (event.type == KPB_EVENT_EXIT) {
-                exit_code = exit_code_from_wait_status(event.exit_status);
+                exit_code = wait_status_to_exit_code(event.exit_status);
                 break;
             } else if (event.type == KPB_EVENT_ERROR) {
                 if (event.size) {
-                    (void)write_all(STDERR_FILENO, buffer, event.size);
-                    (void)write_all(STDERR_FILENO, "\n", 1);
+                    (void)write_all_fd(STDERR_FILENO, buffer, event.size);
+                    (void)write_all_fd(STDERR_FILENO, "\n", 1);
                 }
                 exit_code = 1;
                 break;
