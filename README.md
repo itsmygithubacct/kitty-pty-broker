@@ -30,6 +30,10 @@ make benchmark
 attachments. The fuzzer drives the framed receive path under ASan and UBSan.
 The benchmark reports median live, transcript, graphics-elision, and replay
 throughput; run `build/benchmark-broker BYTES SAMPLES` to choose its workload.
+Replay throughput deliberately trades a fraction of its ceiling for liveness:
+the replay is paced through the client's bounded queue rather than streamed in
+one blocking burst, which is what keeps `status` and `kill` answering while a
+reattach drains tens of megabytes of history.
 
 The build produces:
 
