@@ -222,6 +222,12 @@ itself being sent `SIGKILL`, the OOM killer, a reboot, or loss of the user
 session. Threads are deliberately not used as a lifetime boundary because all
 threads die with their process.
 
+A session lost that way does not leave permanent garbage, though: the session
+directory's metadata records the broker's pid, and a later `list` or a respawn
+under the same ID removes the directory once that process is provably gone.
+Anything short of proof — metadata missing or a pid that still exists — leaves
+the directory untouched, so a live session is never reaped.
+
 ## License
 
 MIT

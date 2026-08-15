@@ -2191,6 +2191,126 @@ test_observer_replay_truncation_is_flagged(void) {
     wait_for_session_end("truncate");
 }
 
+static int
+ignore_session(const kpb_status *status, void *data) {
+    (void)status;
+    (void)data;
+    return 0;
+}
+
+/* A broker killed outright - SIGKILL, the OOM killer - cannot run its own
+ * cleanup, so its session directory used to be permanent: invisible to list,
+ * blocking its ID against respawn, and unremovable by anything in the module.
+ * The metadata file names the broker pid precisely so a later walk can prove
+ * the process is gone and reap the corpse. */
+static void
+test_dead_session_directory_is_reaped(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char session_dir[KPB_PATH_MAX];
+    kpb_spawn_options options;
+    kpb_status status;
+    struct stat probe;
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "corpse";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(snprintf(
+        session_dir, sizeof session_dir, "%s/sessions/corpse",
+        runtime_dir) < (int)sizeof session_dir);
+
+    /* Kill the broker the way the OOM killer would: no cleanup runs.  This
+     * process is the broker's parent, so also reap the zombie - a pid that
+     * still exists, even as a zombie, must and does count as alive. */
+    CHECK(kill(status.broker_pid, SIGKILL) == 0);
+    CHECK(waitpid(status.broker_pid, NULL, 0) == status.broker_pid);
+    (void)kill(status.child_pid, SIGKILL);
+    CHECK(lstat(session_dir, &probe) == 0);
+
+    /* Respawning under the same ID reaps the corpse instead of EXISTS. */
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    terminate_and_reap("corpse");
+
+    /* And a corpse a spawn never touches is reaped by the list walk. */
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(kill(status.broker_pid, SIGKILL) == 0);
+    CHECK(waitpid(status.broker_pid, NULL, 0) == status.broker_pid);
+    (void)kill(status.child_pid, SIGKILL);
+    CHECK(lstat(session_dir, &probe) == 0);
+    CHECK(kpb_list(runtime_dir, ignore_session, NULL) == KPB_OK);
+    CHECK(lstat(session_dir, &probe) != 0 && errno == ENOENT);
+}
+
+/* Reaping must never take a live session, so everything short of proof is
+ * left alone: a running session, a directory whose recorded broker pid still
+ * exists even though nothing answers its socket, and a directory with no
+ * metadata at all (a spawn may be mid-flight) all survive a list walk and
+ * all keep blocking their IDs. */
+static void
+test_reaping_never_removes_a_live_session(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char live_dir[KPB_PATH_MAX];
+    char hollow_dir[KPB_PATH_MAX];
+    char hollow_metadata[KPB_PATH_MAX];
+    char bare_dir[KPB_PATH_MAX];
+    kpb_spawn_options options;
+    kpb_status status;
+    struct stat probe;
+    FILE *stream;
+
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "alive";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+    CHECK(snprintf(
+        live_dir, sizeof live_dir, "%s/sessions/alive",
+        runtime_dir) < (int)sizeof live_dir);
+
+    /* Looks dead - no socket answers - but the recorded broker pid is this
+     * very process, which is as provably alive as it gets. */
+    CHECK(snprintf(
+        hollow_dir, sizeof hollow_dir, "%s/sessions/hollow",
+        runtime_dir) < (int)sizeof hollow_dir);
+    CHECK(snprintf(
+        hollow_metadata, sizeof hollow_metadata, "%s/metadata",
+        hollow_dir) < (int)sizeof hollow_metadata);
+    CHECK(mkdir(hollow_dir, 0700) == 0);
+    stream = fopen(hollow_metadata, "w");
+    CHECK(stream != NULL);
+    CHECK(fprintf(
+        stream,
+        "version=1\nid=hollow\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=0\n",
+        (long)getpid()) > 0);
+    CHECK(fclose(stream) == 0);
+
+    CHECK(snprintf(
+        bare_dir, sizeof bare_dir, "%s/sessions/bare",
+        runtime_dir) < (int)sizeof bare_dir);
+    CHECK(mkdir(bare_dir, 0700) == 0);
+
+    CHECK(kpb_list(runtime_dir, ignore_session, NULL) == KPB_OK);
+
+    CHECK(lstat(live_dir, &probe) == 0);
+    CHECK(lstat(hollow_dir, &probe) == 0);
+    CHECK(lstat(bare_dir, &probe) == 0);
+    CHECK(kpb_query_status(runtime_dir, "alive", &status) == KPB_OK);
+
+    /* Neither impostor's ID has become spawnable. */
+    options.session_id = "hollow";
+    CHECK(kpb_spawn(&options, NULL) == KPB_ERR_EXISTS);
+    options.session_id = "bare";
+    CHECK(kpb_spawn(&options, NULL) == KPB_ERR_EXISTS);
+
+    CHECK(unlink(hollow_metadata) == 0);
+    CHECK(rmdir(hollow_dir) == 0);
+    CHECK(rmdir(bare_dir) == 0);
+    terminate_and_reap("alive");
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -2261,6 +2381,8 @@ main(int argc, char **argv) {
     RUN(test_a_stalled_client_does_not_stop_the_broker);
     RUN(test_a_write_stalled_client_does_not_stop_the_broker);
     RUN(test_terminate);
+    RUN(test_dead_session_directory_is_reaped);
+    RUN(test_reaping_never_removes_a_live_session);
     {
         char sessions[4096];
         snprintf(sessions, sizeof sessions, "%s/sessions", runtime_dir);
