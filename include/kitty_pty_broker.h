@@ -189,6 +189,17 @@ kpb_result kpb_resize(
     unsigned short xpixel,
     unsigned short ypixel
 );
+/* Receive one event.  The broker emits OUTPUT payloads of up to KPB_IO_CHUNK
+ * bytes, so a buffer of at least KPB_IO_CHUNK is the capacity that can never
+ * lose data; smaller buffers are accepted (down to the 4 bytes an EXIT frame
+ * needs) for callers that only expect small frames.  A frame larger than
+ * `capacity` is consumed and discarded so the stream's framing survives, and
+ * the call reports the loss rather than hiding it: it returns KPB_ERR_BUFFER
+ * with event->size set to the discarded payload's size and event->type to the
+ * event it would have delivered (0 for types that carry no payload).  Skipped
+ * output is journal content, so a protocol-2 caller that keeps a cursor (see
+ * kpb_attach_result) can recover the bytes by reattaching with resume from
+ * that cursor, which the failed call does not advance. */
 kpb_result kpb_receive(
     kpb_connection *connection,
     void *buffer,

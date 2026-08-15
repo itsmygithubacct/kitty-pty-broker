@@ -2625,7 +2625,24 @@ kpb_receive(
     }
     memset(event, 0, sizeof *event);
     result = receive_frame(connection->fd, &type, buffer, capacity, &payload_size);
-    if (result != KPB_OK) return result;
+    if (result != KPB_OK) {
+        /* A frame that does not fit has already been consumed off the stream
+         * to preserve framing, so its payload is unrecoverable here.  Report
+         * what was lost - the size and the event it would have been - instead
+         * of returning a bare error that hides the loss entirely.  Skipped
+         * OUTPUT is journal content, so a protocol-2 caller that keeps a
+         * cursor can recover the bytes by reattaching with resume from it. */
+        if (result == KPB_ERR_BUFFER) {
+            switch (type) {
+                case KPB_FRAME_OUTPUT: event->type = KPB_EVENT_OUTPUT; break;
+                case KPB_FRAME_RESET: event->type = KPB_EVENT_RESET; break;
+                case KPB_FRAME_ERROR: event->type = KPB_EVENT_ERROR; break;
+                default: break;
+            }
+            event->size = payload_size;
+        }
+        return result;
+    }
     switch (type) {
         case KPB_FRAME_OUTPUT:
             event->type = KPB_EVENT_OUTPUT;

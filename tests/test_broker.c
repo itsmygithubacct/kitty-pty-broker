@@ -2117,6 +2117,109 @@ test_resume_offset_past_end_falls_back(void) {
     terminate_and_reap("pastend");
 }
 
+/* A frame larger than the caller's buffer is skipped to preserve framing, and
+ * the skip is reported rather than silent: KPB_ERR_BUFFER carries the size
+ * and would-be type of what was lost, and the next frame still parses. */
+static void
+test_receive_reports_a_skipped_oversized_frame(void) {
+    kpb_connection connection;
+    kpb_event event;
+    unsigned char big[8192];
+    unsigned char small[512];
+    int sockets[2];
+
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    memset(big, 'y', sizeof big);
+    raw_send_frame(sockets[0], KPB_FRAME_OUTPUT, big, sizeof big);
+    raw_send_frame(sockets[0], KPB_FRAME_OUTPUT, "tail", 4);
+    memset(&connection, 0, sizeof connection);
+    connection.fd = sockets[1];
+
+    memset(&event, 0xa5, sizeof event);
+    CHECK(kpb_receive(&connection, small, sizeof small, &event) == KPB_ERR_BUFFER);
+    CHECK(event.type == KPB_EVENT_OUTPUT);
+    CHECK(event.size == sizeof big);
+    /* Framing survives the skip: the next frame is delivered intact. */
+    CHECK(kpb_receive(&connection, small, sizeof small, &event) == KPB_OK);
+    CHECK(event.type == KPB_EVENT_OUTPUT);
+    CHECK(event.size == 4);
+    CHECK(memcmp(small, "tail", 4) == 0);
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
+/* The reported skip is actionable: skipped output is journal content, so a
+ * caller that kept its cursor can resume from it and get the bytes back. */
+static void
+test_skipped_output_is_recoverable_by_resume(void) {
+    kpb_connection connection;
+    kpb_attach_result result;
+    kpb_event event;
+    unsigned char tiny[600];
+    static unsigned char output[65536];
+    static char line[2048];
+    kpb_status status;
+    uint64_t skipped = 0;
+    uint64_t received = 0;
+    size_t used;
+    bool replay_done = false;
+
+    spawn_echo_session("skiprecover", 0);
+    CHECK(attach_v2("skiprecover", &connection, &result, 0, 0, 0) == KPB_OK);
+    used = read_until_replay_done(&connection, output, sizeof output);
+    used = read_until(&connection, output, used, sizeof output, "READY:");
+    /* One echo far larger than the small buffer below. */
+    memset(line, 'A', 1600);
+    line[1600] = '\n';
+    CHECK(kpb_send_input(&connection, line, 1601) == KPB_OK);
+    /* The echo ends "...AAAA:", and the broker journals bytes before it
+     * forwards them, so once the trailing colon arrives here the journal is
+     * complete and, with the child blocked on read again, quiescent. */
+    (void)read_until(&connection, output, used, sizeof output, "AAAA:");
+    kpb_detach(&connection);
+    wait_until_detached("skiprecover");
+    /* The pane is idle again; the whole journal replays as one frame. */
+    CHECK(kpb_query_status(runtime_dir, "skiprecover", &status) == KPB_OK);
+    CHECK(status.journal_bytes > sizeof tiny);
+    CHECK(status.journal_bytes <= KPB_IO_CHUNK);
+
+    CHECK(attach_v2("skiprecover", &connection, &result, 0, 0, 0) == KPB_OK);
+    CHECK(result.journal_offset == 0);
+    while (!replay_done) {
+        kpb_result received_result;
+        wait_readable(connection.fd);
+        received_result = kpb_receive(&connection, tiny, sizeof tiny, &event);
+        if (received_result == KPB_ERR_BUFFER) {
+            CHECK(event.type == KPB_EVENT_OUTPUT);
+            CHECK(event.size > sizeof tiny);
+            skipped += event.size;
+            continue;
+        }
+        CHECK(received_result == KPB_OK);
+        if (event.type == KPB_EVENT_REPLAY_DONE) replay_done = true;
+        else {
+            CHECK(event.type == KPB_EVENT_OUTPUT);
+            received += event.size;
+        }
+    }
+    CHECK(skipped > 0);
+    CHECK(skipped + received == status.journal_bytes);
+    kpb_detach(&connection);
+    wait_until_detached("skiprecover");
+
+    /* Resume from the pre-skip cursor with an adequate buffer replays every
+     * byte the skip destroyed. */
+    CHECK(attach_v2(
+        "skiprecover", &connection, &result,
+        1, status.journal_epoch, 0) == KPB_OK);
+    CHECK(result.resumed == 1);
+    used = read_until_replay_done(&connection, output, sizeof output);
+    CHECK(used == (size_t)status.journal_bytes);
+    CHECK(memmem(output, used, "AAAAAAAA", 8) != NULL);
+    kpb_detach(&connection);
+    terminate_and_reap("skiprecover");
+}
+
 /* An observer owed more history than the replay bound gets a trimmed,
  * explicitly flagged stream rather than being silently dropped. */
 static void
@@ -2376,6 +2479,8 @@ main(int argc, char **argv) {
     RUN(test_resume_streams_forward);
     RUN(test_resume_stale_epoch_falls_back);
     RUN(test_resume_offset_past_end_falls_back);
+    RUN(test_receive_reports_a_skipped_oversized_frame);
+    RUN(test_skipped_output_is_recoverable_by_resume);
     RUN(test_observer_replay_truncation_is_flagged);
     RUN(test_tui);
     RUN(test_a_stalled_client_does_not_stop_the_broker);
