@@ -709,6 +709,73 @@ test_transcript_rotates_and_keeps_newest(void) {
     CHECK(used <= limit);
     CHECK(memmem(buffer, used, "NEWEST_LINE", 11) != NULL);
     CHECK(memmem(buffer, used, "OLDEST_LINE", 11) == NULL);
+    /* The opening size record was dropped with the oldest output, so the
+     * rotated file starts with a fresh one that also says it was cut. */
+    {
+        static const char rotated[] = "\033_kilix-transcript;rows=24;cols=80;rotated=1\033\\";
+        CHECK(used > sizeof rotated - 1U);
+        CHECK(memcmp(buffer, rotated, sizeof rotated - 1U) == 0);
+        CHECK(count_occurrences(buffer, used, rotated) == 1);
+    }
+    CHECK(unlink(transcript) == 0);
+}
+
+static void
+test_transcript_records_pane_size_and_resizes(void) {
+    char *command[] = {"/bin/sh", "-c", "read line; printf 'after-%s\\n' \"$line\"", NULL};
+    static const char opened[] = "\033_kilix-transcript;rows=30;cols=100\033\\";
+    static const char attached[] = "\033_kilix-transcript;rows=40;cols=120\033\\";
+    static const char resized[] = "\033_kilix-transcript;rows=50;cols=132\033\\";
+    char transcript[KPB_PATH_MAX];
+    unsigned char buffer[65536];
+    kpb_spawn_options options;
+    kpb_connection connection;
+    kpb_status status;
+    unsigned char *first, *second, *third, *output;
+    size_t used;
+
+    snprintf(transcript, sizeof transcript, "%s/size.log", runtime_dir);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "size";
+    options.cwd = "/tmp";
+    options.argv = command;
+    options.rows = 30;
+    options.columns = 100;
+    options.transcript_path = transcript;
+    options.transcript_limit = KPB_DEFAULT_TRANSCRIPT_LIMIT;
+    options.transcript_graphics = KPB_TRANSCRIPT_GRAPHICS_ELIDE;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(kpb_attach(runtime_dir, "size", 40, 120, 0, 0, &connection) == KPB_OK);
+    CHECK(kpb_resize(&connection, 50, 132, 0, 0) == KPB_OK);
+    /* Re-sending the current size is not a change and records nothing. */
+    CHECK(kpb_resize(&connection, 50, 132, 0, 0) == KPB_OK);
+    CHECK(kpb_send_input(&connection, "go\n", 3) == KPB_OK);
+    {
+        unsigned char received[KPB_IO_CHUNK];
+        bool exited = false;
+        while (!exited) {
+            kpb_event event;
+            wait_readable(connection.fd);
+            CHECK(kpb_receive(&connection, received, sizeof received, &event) == KPB_OK);
+            CHECK(event.type != KPB_EVENT_ERROR);
+            exited = event.type == KPB_EVENT_EXIT;
+        }
+    }
+    kpb_detach(&connection);
+    wait_for_session_end("size");
+    used = read_whole_file(transcript, buffer, sizeof buffer);
+
+    first = memmem(buffer, used, opened, sizeof opened - 1U);
+    second = memmem(buffer, used, attached, sizeof attached - 1U);
+    third = memmem(buffer, used, resized, sizeof resized - 1U);
+    output = memmem(buffer, used, "after-go", 8);
+    CHECK(first == buffer);
+    CHECK(second != NULL && second > first);
+    CHECK(third != NULL && third > second);
+    CHECK(output != NULL && output > third);
+    CHECK(count_occurrences(buffer, used, resized) == 1);
+    CHECK(memmem(buffer, used, ";rotated=1", 10) == NULL);
     CHECK(unlink(transcript) == 0);
 }
 
@@ -2556,6 +2623,7 @@ main(int argc, char **argv) {
     RUN(test_transcript_scanner_boundaries_and_dense_markers);
     RUN(test_existing_transcript_is_private_and_bounded_immediately);
     RUN(test_transcript_rotates_and_keeps_newest);
+    RUN(test_transcript_records_pane_size_and_resizes);
     RUN(test_transcript_captures_output_written_just_before_exit);
     RUN(test_transcript_absent_by_default);
     RUN(test_large_input_backpressure);

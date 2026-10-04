@@ -273,9 +273,13 @@ run_sample(
                 transcript.st_size > 0 && (uint64_t)transcript.st_size < expected,
                 "graphics transcript was not elided");
         } else {
+            /* Plus the size record written when the transcript opened: the
+             * pane spawns and is attached at 24x80, so no resize record. */
+            static const char size_record[] =
+                "\033_kilix-transcript;rows=24;cols=80\033\\";
             require(
                 (uint64_t)transcript.st_size ==
-                    expected + sizeof BENCHMARK_READY - 1U,
+                    expected + sizeof BENCHMARK_READY - 1U + sizeof size_record - 1U,
                 "transcript size");
         }
         require(unlink(transcript_path) == 0, "remove transcript");

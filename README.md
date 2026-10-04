@@ -207,6 +207,13 @@ bytes and never emits a terminal reset.
   then continued rather than replaced, so a recovered pane keeps its bounded
   history. Transcript failures are non-fatal: the broker closes the log and
   the pane keeps running.
+- The pane size is recorded alongside the output, because full-screen programs
+  address the cursor by row and column and a replay cannot place their text
+  without it. The record is a private APC that terminals ignore:
+  `ESC _ kilix-transcript;rows=R;cols=C ESC \`. One is written when the
+  transcript opens and another whenever the size changes. After a rotation the
+  file starts with one carrying `;rotated=1`, which also tells a reader that
+  the session's beginning was dropped. Records count against the size limit.
 
 Elision makes a default transcript a faithful record of *text*, not a byte-exact
 capture of the stream. Use `keep` when the graphics bytes themselves are the

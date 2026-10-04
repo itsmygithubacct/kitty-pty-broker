@@ -930,17 +930,53 @@ pwrite_all_fd(int fd, const void *data, size_t size, off_t offset) {
     return (ssize_t)written;
 }
 
+/* The transcript holds raw PTY output, which never says how big the screen
+ * was, and a replay cannot place cursor-addressed text without knowing.  The
+ * broker therefore records the pane size as a private APC that terminals
+ * ignore: when the transcript opens, whenever the size changes, and at the
+ * front of the file after a rotation, where ``rotated=1`` also tells a reader
+ * that the session's beginning was dropped. */
+#define TRANSCRIPT_SIZE_RECORD_MAX 64
+
+static size_t
+format_size_record(const server_state *server, bool rotated, unsigned char *out) {
+    int length = snprintf(
+        (char *)out, TRANSCRIPT_SIZE_RECORD_MAX,
+        "\033_kilix-transcript;rows=%u;cols=%u%s\033\\",
+        (unsigned)server->size.ws_row, (unsigned)server->size.ws_col,
+        rotated ? ";rotated=1" : ""
+    );
+    if (length <= 0 || length >= TRANSCRIPT_SIZE_RECORD_MAX) return 0;
+    return (size_t)length;
+}
+
 /* Slide the newest ``keep`` bytes to the front of the transcript and drop the
  * rest.  Rewriting in place (rather than renaming to a .1 file) keeps the
  * single long-lived writer attached to the same inode, matching how the rest
- * of the stack bounds its session logs. */
+ * of the stack bounds its session logs.  A size record goes first, inside the
+ * same budget, because the record that opened the file has just been dropped. */
 static int
 rotate_transcript(server_state *server, uint64_t keep) {
     unsigned char buffer[KPB_IO_CHUNK];
+    unsigned char record[TRANSCRIPT_SIZE_RECORD_MAX];
+    size_t record_length = format_size_record(server, true, record);
     off_t read_offset;
     off_t write_offset = 0;
     if (keep > server->transcript_bytes) keep = server->transcript_bytes;
+    if (keep >= record_length) keep -= record_length;
+    else record_length = 0;
     read_offset = (off_t)(server->transcript_bytes - keep);
+    /* The record overwrites only bytes being dropped; with nothing dropped
+     * there is no room for it, and nothing was lost to announce. */
+    if (read_offset < (off_t)record_length) {
+        keep += record_length;
+        read_offset -= (off_t)record_length;
+        record_length = 0;
+    }
+    if (record_length) {
+        if (pwrite_all_fd(server->transcript_fd, record, record_length, 0) < 0) return -1;
+        write_offset = (off_t)record_length;
+    }
     while (keep) {
         size_t wanted = keep < sizeof buffer ? (size_t)keep : sizeof buffer;
         ssize_t count = pread(server->transcript_fd, buffer, wanted, read_offset);
@@ -968,13 +1004,19 @@ write_transcript(server_state *server, const unsigned char *data, size_t size) {
          * instead of once per write. */
         uint64_t keep = server->transcript_limit - server->transcript_limit / 4;
         if (size >= keep) {
+            unsigned char record[TRANSCRIPT_SIZE_RECORD_MAX];
+            size_t record_length = format_size_record(server, true, record);
+            if (record_length >= keep) record_length = 0;
             if (ftruncate(server->transcript_fd, 0) != 0 ||
                 lseek(server->transcript_fd, 0, SEEK_SET) < 0) {
                 return -1;
             }
-            server->transcript_bytes = 0;
-            data += size - (size_t)keep;
-            size = (size_t)keep;
+            if (record_length && write_all_fd(server->transcript_fd, record, record_length) < 0) {
+                return -1;
+            }
+            server->transcript_bytes = record_length;
+            data += size - (size_t)(keep - record_length);
+            size = (size_t)(keep - record_length);
         } else if (rotate_transcript(server, keep - size) != 0) {
             return -1;
         }
@@ -982,6 +1024,20 @@ write_transcript(server_state *server, const unsigned char *data, size_t size) {
     if (write_all_fd(server->transcript_fd, data, size) < 0) return -1;
     server->transcript_bytes += size;
     return 0;
+}
+
+/* Append the current size.  A transcript that cannot be written is closed,
+ * as for pane output: the pane keeps running and the log simply ends. */
+static void
+record_transcript_size(server_state *server) {
+    unsigned char record[TRANSCRIPT_SIZE_RECORD_MAX];
+    size_t length;
+    if (server->transcript_fd < 0) return;
+    length = format_size_record(server, false, record);
+    if (length && write_transcript(server, record, length) != 0) {
+        close(server->transcript_fd);
+        server->transcript_fd = -1;
+    }
 }
 
 #define TRANSCRIPT_MARKER_MAX 96
@@ -1296,6 +1352,8 @@ plan_replay(
 
 static void
 apply_size(server_state *server, const kpb_wire_winsize *wire) {
+    unsigned short rows = server->size.ws_row;
+    unsigned short columns = server->size.ws_col;
     server->size.ws_row = ntohs(wire->rows);
     server->size.ws_col = ntohs(wire->columns);
     server->size.ws_xpixel = ntohs(wire->xpixel);
@@ -1303,6 +1361,9 @@ apply_size(server_state *server, const kpb_wire_winsize *wire) {
     if (!server->size.ws_row) server->size.ws_row = 24;
     if (!server->size.ws_col) server->size.ws_col = 80;
     if (server->pty_fd >= 0) (void)ioctl(server->pty_fd, TIOCSWINSZ, &server->size);
+    if (rows != server->size.ws_row || columns != server->size.ws_col) {
+        record_transcript_size(server);
+    }
 }
 
 static void
@@ -2181,6 +2242,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
                 server.transcript_fd = -1;
             }
         }
+        record_transcript_size(&server);
     }
     server.child_pid = forkpty(&server.pty_fd, NULL, NULL, &server.size);
     if (server.child_pid < 0) goto fail;
