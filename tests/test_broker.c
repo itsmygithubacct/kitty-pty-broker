@@ -6114,8 +6114,9 @@ test_a_fifo_carrying_a_complete_record_is_still_no_proof(void) {
     {
         /* A FIFO is consumed by reading, and a decision reads the file twice (the
          * proof, then the removal), so the writer leaves the same 89-byte record
-         * forty times: each 2047-byte read then ends on a record boundary and is a
-         * complete, valid, stale record of its own. */
+         * 46 times: the two 2047-byte reads (23 records each) both fill their buffer
+         * and end on a record boundary, so each is a complete, valid, stale record of
+         * its own and neither runs into the empty pipe (EAGAIN). */
         char boot[64];
         char record[160];
         size_t length;
@@ -6128,7 +6129,7 @@ test_a_fifo_carrying_a_complete_record_is_still_no_proof(void) {
         while (length < 88) record[length++] = 'a';
         record[length++] = '\n';
         CHECK(length == 89);
-        for (copy = 0; copy < 40; copy++) {
+        for (copy = 0; copy < 46; copy++) {
             CHECK(write(writer, record, length) == (ssize_t)length);
         }
     }
