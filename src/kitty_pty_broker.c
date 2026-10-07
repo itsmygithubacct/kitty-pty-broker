@@ -643,6 +643,7 @@ kpb_result_string(kpb_result result) {
         case KPB_ERR_NAME_TOO_LONG: return "socket path too long";
         case KPB_ERR_MISMATCH: return "session identity does not match";
         case KPB_ERR_UNSUPPORTED: return "broker cannot check identity";
+        case KPB_ERR_NOT_SENT: return "timed out before the request was sent";
     }
     return "unknown error";
 }
@@ -2608,21 +2609,25 @@ reaped_limit_from_environment(const char *name, uint64_t fallback) {
     return (uint64_t)parsed;
 }
 
-/* "ID.STARTED_MILLIS.journal".  Session IDs may contain '.', so the millis are
- * the part after the LAST dot. */
+/* "ID.STARTED_MILLIS" followed by `suffix` (".journal" or ".meta").  Session IDs
+ * may contain '.', so the millis are the part after the LAST dot of the stem. */
 static bool
-parse_archive_name(const char *name, char id[KPB_SESSION_ID_MAX + 1], uint64_t *started) {
-    static const char suffix[] = ".journal";
+parse_archive_stem(
+    const char *name,
+    const char *suffix,
+    char id[KPB_SESSION_ID_MAX + 1],
+    uint64_t *started
+) {
+    size_t suffix_size = strlen(suffix);
     size_t length = strlen(name);
     size_t cut;
     size_t digits;
     uint64_t value = 0;
     size_t index;
-    if (length <= sizeof suffix - 1 ||
-        strcmp(name + length - (sizeof suffix - 1), suffix) != 0) {
+    if (length <= suffix_size || strcmp(name + length - suffix_size, suffix) != 0) {
         return false;
     }
-    length -= sizeof suffix - 1;
+    length -= suffix_size;
     cut = length;
     while (cut > 0 && name[cut - 1] != '.') cut--;
     if (cut <= 1) return false;
@@ -2640,8 +2645,17 @@ parse_archive_name(const char *name, char id[KPB_SESSION_ID_MAX + 1], uint64_t *
     return true;
 }
 
+static bool
+parse_archive_name(const char *name, char id[KPB_SESSION_ID_MAX + 1], uint64_t *started) {
+    return parse_archive_stem(name, ".journal", id, started);
+}
+
 typedef struct {
     char name[KPB_SESSION_ID_MAX + 64];
+    /* A ".meta" whose journal is gone (evicted by an older build, or moved out by
+     * an integrator).  It is counted and evicted like an entry of its own, so
+     * orphans cannot accumulate without bound; `name` is then the .meta. */
+    bool orphan;
     uint64_t started;
     uint64_t journal_bytes;
     uint64_t meta_bytes;
@@ -2680,7 +2694,7 @@ remove_archive_item(const char *reaped_dir, const archive_item *item) {
     char path[KPB_PATH_MAX];
     if (join_path(path, sizeof path, reaped_dir, item->name) != 0) return;
     (void)unlink(path);
-    if (meta_path_for(path, sizeof path) == 0) (void)unlink(path);
+    if (!item->orphan && meta_path_for(path, sizeof path) == 0) (void)unlink(path);
 }
 
 /* Keep RUNTIME/reaped/ inside its bounds, evicting the oldest first.  Age is
@@ -2709,18 +2723,37 @@ evict_reaped(const char *reaped_dir) {
         struct stat journal;
         struct stat meta;
         memset(&item, 0, sizeof item);
-        if (!parse_archive_name(entry->d_name, id, &item.started)) continue;
-        if (join_path(path, sizeof path, reaped_dir, entry->d_name) != 0 ||
-            lstat(path, &journal) != 0 || !S_ISREG(journal.st_mode)) {
-            continue;
-        }
-        copy_string(item.name, sizeof item.name, entry->d_name);
-        item.journal_bytes = (uint64_t)journal.st_size;
-        item.age = journal.st_mtim;
-        if (meta_path_for(path, sizeof path) == 0 &&
-            lstat(path, &meta) == 0 && S_ISREG(meta.st_mode)) {
+        if (parse_archive_stem(entry->d_name, ".meta", id, &item.started)) {
+            /* Only a .meta with no journal beside it is an entry of its own. */
+            if (join_path(path, sizeof path, reaped_dir, entry->d_name) != 0 ||
+                lstat(path, &meta) != 0 || !S_ISREG(meta.st_mode)) {
+                continue;
+            }
+            copy_string(item.name, sizeof item.name, entry->d_name);
+            if (join_path(path, sizeof path, reaped_dir, entry->d_name) != 0) continue;
+            {
+                size_t length = strlen(path) - (sizeof ".meta" - 1);
+                if (length + sizeof ".journal" > sizeof path) continue;
+                memcpy(path + length, ".journal", sizeof ".journal");
+            }
+            if (lstat(path, &journal) == 0) continue;  /* has its journal: not an orphan */
+            item.orphan = true;
             item.meta_bytes = (uint64_t)meta.st_size;
             item.age = meta.st_mtim;
+        } else {
+            if (!parse_archive_name(entry->d_name, id, &item.started)) continue;
+            if (join_path(path, sizeof path, reaped_dir, entry->d_name) != 0 ||
+                lstat(path, &journal) != 0 || !S_ISREG(journal.st_mode)) {
+                continue;
+            }
+            copy_string(item.name, sizeof item.name, entry->d_name);
+            item.journal_bytes = (uint64_t)journal.st_size;
+            item.age = journal.st_mtim;
+            if (meta_path_for(path, sizeof path) == 0 &&
+                lstat(path, &meta) == 0 && S_ISREG(meta.st_mode)) {
+                item.meta_bytes = (uint64_t)meta.st_size;
+                item.age = meta.st_mtim;
+            }
         }
         if (count == capacity) {
             size_t grown = capacity ? capacity * 2U : 32U;
@@ -2859,7 +2892,13 @@ lock_sessions_dir_until(const session_paths *paths, const struct timespec *deadl
 
 kpb_result
 kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
+    return kpb_spawn_timeout(options, status, 0);
+}
+
+kpb_result
+kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int timeout_millis) {
     session_paths paths;
+    struct timespec ready_deadline;
     char generated[KPB_SESSION_ID_MAX + 1];
     const char *session_id;
     int ready_pipe[2];
@@ -2902,7 +2941,7 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
          * otherwise reap the directory this call has just recreated. */
         struct timespec lock_deadline;
         int lock_fd;
-        deadline_in(&lock_deadline, KPB_DEFAULT_TIMEOUT_MILLIS);
+        deadline_from_timeout(&lock_deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
         lock_fd = lock_sessions_dir_until(&paths, &lock_deadline);
         /* Bounded like every other wait: a holder that is stopped is reported,
          * and nothing has been created yet. */
@@ -2955,11 +2994,19 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
         _exit(code);
     }
     close(ready_pipe[1]);
-    if (read_all_fd(ready_pipe[0], &ready, sizeof ready) < 0) {
+    /* Bounded: the new broker is another process, and a start that wedges
+     * (a filesystem that stops answering, a stopped process) must not hang the
+     * caller.  When this gives up the read end closes, the broker's report fails,
+     * and its own failure path kills the command and removes the session - so a
+     * timeout here means no session was left running. */
+    deadline_in(
+        &ready_deadline,
+        timeout_millis > KPB_SPAWN_READY_MILLIS ? (long)timeout_millis : (long)KPB_SPAWN_READY_MILLIS);
+    if (read_all_bounded(ready_pipe[0], &ready, sizeof ready, &ready_deadline) < 0) {
         int saved = errno;
         close(ready_pipe[0]);
         errno = saved;
-        return KPB_ERR_CHILD;
+        return saved == ETIMEDOUT ? KPB_ERR_TIMEOUT : KPB_ERR_CHILD;
     }
     close(ready_pipe[0]);
     if (ready.error_number) {
@@ -3416,6 +3463,9 @@ kpb_terminate_timeout(
     kpb_result result;
     deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
     result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
+    /* Still connecting means nothing was sent: a different statement from a
+     * timeout after sending, which may yet be acted on. */
+    if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
     result = send_frame(fd, KPB_FRAME_TERMINATE, NULL, 0);
     if (result == KPB_OK) {
@@ -3445,6 +3495,7 @@ kpb_terminate_expect(
     kpb_result result;
     deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
     result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
+    if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
     request.expected_started_millis = host_to_be64(expected_started_millis);
     result = send_frame(fd, KPB_FRAME_TERMINATE, &request, sizeof request);
@@ -3535,9 +3586,12 @@ kpb_read_start_ticks(pid_t pid, uint64_t *ticks) {
 }
 
 kpb_result
-kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
+kpb_read_cwd_now_ex(pid_t child_pid, char *output, size_t capacity, int *deleted) {
+    static const char suffix[] = " (deleted)";
     char path[64];
+    struct stat probe;
     ssize_t size;
+    if (deleted) *deleted = 0;
     if (!output || capacity < 2) return KPB_ERR_INVALID;
     output[0] = '\0';
     if (child_pid <= 0 ||
@@ -3552,7 +3606,23 @@ kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
         return KPB_ERR_NOT_FOUND;
     }
     output[size] = '\0';
+    /* The kernel marks a directory that has been removed by appending " (deleted)"
+     * to the link text, which is not a path.  A removed directory can still be
+     * opened through /proc but has no links left; a directory that really is
+     * named "... (deleted)" is live and has links. */
+    if ((size_t)size > sizeof suffix - 1 &&
+        strcmp(output + size - (sizeof suffix - 1), suffix) == 0 &&
+        ((stat(path, &probe) != 0 && errno == ENOENT) || (stat(path, &probe) == 0 && probe.st_nlink == 0))) {
+        output[0] = '\0';
+        if (deleted) *deleted = 1;
+        return KPB_ERR_NOT_FOUND;
+    }
     return KPB_OK;
+}
+
+kpb_result
+kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
+    return kpb_read_cwd_now_ex(child_pid, output, capacity, NULL);
 }
 
 /* At most this many sessions are being queried at once, so a runtime with a

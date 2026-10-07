@@ -12,11 +12,14 @@ enum {
 
 /* Run the session manager.  `timeout_millis` bounds each list, kill and the
  * handshakes it triggers (<= 0: one second).  On KPB_TUI_ATTACH or
- * KPB_TUI_OBSERVE, `session_id` names the chosen session. */
+ * KPB_TUI_OBSERVE, `session_id` names the chosen session.  `initial_message`
+ * (may be NULL or empty) is shown in the status row on the first screen: it is
+ * how an observe that failed outside the alternate screen is still seen. */
 int kpb_tui_run(
     const char *runtime_dir,
     int timeout_millis,
-    char session_id[KPB_SESSION_ID_MAX + 1]
+    char session_id[KPB_SESSION_ID_MAX + 1],
+    const char *initial_message
 );
 
 #endif

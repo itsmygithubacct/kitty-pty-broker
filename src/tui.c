@@ -631,7 +631,8 @@ int
 kpb_tui_run(
     const char *runtime_dir,
     int timeout_millis,
-    char session_id[KPB_SESSION_ID_MAX + 1]
+    char session_id[KPB_SESSION_ID_MAX + 1],
+    const char *initial_message
 ) {
     session_list list = {0};
     terminal_state terminal;
@@ -654,6 +655,9 @@ kpb_tui_run(
         return KPB_TUI_ERROR;
     }
     if (timeout_millis <= 0) timeout_millis = TUI_DEFAULT_TIMEOUT_MILLIS;
+    if (initial_message && initial_message[0]) {
+        snprintf(message, sizeof message, "%s", initial_message);
+    }
     session_id[0] = '\0';
     broker_result = refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
     if (broker_result != KPB_OK) {

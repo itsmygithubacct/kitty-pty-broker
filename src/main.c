@@ -84,14 +84,33 @@ parse_storage_limit(const char *text, uint64_t *value) {
 
 static void report_socket_path_too_long(const char *runtime_dir, const char *session_id);
 
+/* One reason line for every failure.  Printed to stderr, or - when a caller is
+ * about to take over the screen (the TUI) - handed back in `failure` so it can
+ * be shown where it will be seen. */
+static void
+say_failure(char *failure, size_t capacity, const char *verb, const char *session_id, const char *reason) {
+    if (failure) {
+        snprintf(failure, capacity, "%s %.64s: %s", verb, session_id, reason);
+    } else {
+        fprintf(stderr, "kitty-pty-broker: %s %s: %s\n", verb, session_id, reason);
+    }
+}
+
 /* `options` NULL keeps the plain version-1 attach that every existing caller
  * uses, which is also what makes this safe against a broker left running by a
- * previous build. */
+ * previous build.
+ *
+ * Every non-zero exit says why, on one line: a pane's own exit status is not a
+ * failure of this function and is passed through silently, but "the peer closed",
+ * "the broker stopped mid-frame" and the rest used to exit 1 with nothing on
+ * stderr.  `failure`, if given, receives that line instead of stderr. */
 static int
 bridge(
     const char *runtime_dir,
     const char *session_id,
-    const kpb_attach_options *options
+    const kpb_attach_options *options,
+    char *failure,
+    size_t failure_capacity
 ) {
     unsigned char buffer[KPB_IO_CHUNK];
     struct termios saved;
@@ -103,14 +122,18 @@ bridge(
     kpb_connection connection;
     kpb_attach_result attached;
     bool observing = options && options->mode == KPB_ATTACH_OBSERVE;
+    const char *verb = observing ? "observe" : "attach";
+    char reason[200] = "";
     bool have_termios = false;
     bool replay_done = false;
+    bool stdin_hung_up = false;
     bool track_cursor = false;
     uint64_t cursor_epoch = 0;
     uint64_t cursor_offset = 0;
     int exit_code = 0;
     kpb_result result;
 
+    if (failure && failure_capacity) failure[0] = '\0';
     get_size(&size);
     memset(&attached, 0, sizeof attached);
     if (options) {
@@ -140,9 +163,12 @@ bridge(
             report_socket_path_too_long(runtime_dir, session_id);
             return 1;
         }
-        fprintf(stderr, "kitty-pty-broker: attach %s: %s", session_id, kpb_result_string(result));
-        if (result == KPB_ERR_SYSTEM) fprintf(stderr, ": %s", strerror(errno));
-        fputc('\n', stderr);
+        if (result == KPB_ERR_SYSTEM) {
+            snprintf(reason, sizeof reason, "%s: %s", kpb_result_string(result), strerror(errno));
+        } else {
+            snprintf(reason, sizeof reason, "%s", kpb_result_string(result));
+        }
+        say_failure(failure, failure_capacity, verb, session_id, reason);
         return 1;
     }
 
@@ -179,6 +205,15 @@ bridge(
     while (!stop_pending) {
         struct pollfd descriptors[2];
         int count;
+        /* ppoll unblocks the signals only while it waits, and returns without
+         * delivering one that is already pending if a descriptor is ready at
+         * the same moment.  With a descriptor ready every time round - a
+         * stream of output, or a hung-up stdin - a SIGTERM would then sit
+         * pending forever.  Letting pending signals through here, between
+         * waits, closes that. */
+        sigprocmask(SIG_SETMASK, &original, NULL);
+        sigprocmask(SIG_BLOCK, &blocked, NULL);
+        if (stop_pending) break;
         if (resize_pending) {
             resize_pending = 0;
             /* An observer must never resize the pane it is watching. */
@@ -192,26 +227,52 @@ bridge(
         descriptors[0].fd = connection.fd;
         descriptors[0].events = POLLIN;
         descriptors[0].revents = 0;
-        descriptors[1].fd = STDIN_FILENO;
+        /* A hung-up stdin (a pipe whose writer is gone) is reported by poll
+         * whether or not it is being watched, and never clears: left in the set
+         * it makes ppoll return at once, forever. */
+        descriptors[1].fd = stdin_hung_up ? -1 : STDIN_FILENO;
         descriptors[1].events = replay_done ? POLLIN : 0;
         descriptors[1].revents = 0;
         count = ppoll(descriptors, 2, NULL, &original);
         if (count < 0) {
             if (errno == EINTR) continue;
             exit_code = 1;
+            snprintf(reason, sizeof reason, "waiting for the broker failed: %s", strerror(errno));
             break;
         }
         if (descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             kpb_event event;
             result = kpb_receive(&connection, buffer, sizeof buffer, &event);
             if (result != KPB_OK) {
-                if (descriptors[0].revents & POLLIN) exit_code = 1;
+                if (descriptors[0].revents & POLLIN) {
+                    exit_code = 1;
+                    if (result == KPB_ERR_TIMEOUT) {
+                        snprintf(
+                            reason, sizeof reason,
+                            "the broker stopped in the middle of a frame (timed out); "
+                            "reattach with --resume %llu:%llu to continue",
+                            (unsigned long long)cursor_epoch,
+                            (unsigned long long)cursor_offset);
+                        if (!track_cursor) {
+                            snprintf(
+                                reason, sizeof reason,
+                                "the broker stopped in the middle of a frame (timed out)");
+                        }
+                    } else if (result == KPB_ERR_PROTOCOL) {
+                        snprintf(reason, sizeof reason, "protocol error from the broker");
+                    } else if (result == KPB_ERR_BUFFER) {
+                        snprintf(reason, sizeof reason, "a frame from the broker was too large");
+                    } else {
+                        snprintf(reason, sizeof reason, "connection closed by the broker without an exit status");
+                    }
+                }
                 break;
             }
             if (event.type == KPB_EVENT_OUTPUT) {
                 cursor_offset += event.size;
                 if (write_all_fd(STDOUT_FILENO, buffer, event.size) < 0) {
                     exit_code = 1;
+                    snprintf(reason, sizeof reason, "cannot write to the terminal: %s", strerror(errno));
                     break;
                 }
             } else if (event.type == KPB_EVENT_RESET) {
@@ -220,6 +281,7 @@ bridge(
                  * end of what has actually been received. */
                 if (write_all_fd(STDOUT_FILENO, buffer, event.size) < 0) {
                     exit_code = 1;
+                    snprintf(reason, sizeof reason, "cannot write to the terminal: %s", strerror(errno));
                     break;
                 }
             } else if (event.type == KPB_EVENT_REPLAY_DONE) {
@@ -228,14 +290,29 @@ bridge(
                 exit_code = wait_status_to_exit_code(event.exit_status);
                 break;
             } else if (event.type == KPB_EVENT_ERROR) {
-                if (event.size) {
-                    (void)write_all_fd(STDERR_FILENO, buffer, event.size);
-                    (void)write_all_fd(STDERR_FILENO, "\n", 1);
-                }
+                size_t length = event.size < sizeof reason - 1 ? event.size : sizeof reason - 1;
                 exit_code = 1;
+                /* The broker's own words, with control bytes made harmless. */
+                {
+                    size_t index;
+                    for (index = 0; index < length; index++) {
+                        unsigned char c = buffer[index];
+                        reason[index] = c >= 0x20 && c < 0x7f ? (char)c : '?';
+                    }
+                    reason[length] = '\0';
+                }
+                if (!length) snprintf(reason, sizeof reason, "refused by the broker");
                 break;
             }
         }
+        if (descriptors[1].revents & (POLLHUP | POLLERR | POLLNVAL) &&
+            !(descriptors[1].revents & POLLIN)) {
+            /* stdin is gone.  Before the replay is done it cannot be acted on,
+             * so remember it and stop polling it; afterwards it means the same
+             * as end of file below. */
+            stdin_hung_up = true;
+        }
+        if (stdin_hung_up && replay_done) break;
         if (descriptors[1].revents & POLLIN) {
             ssize_t received = read(STDIN_FILENO, buffer, sizeof buffer);
             if (observing) {
@@ -249,12 +326,14 @@ bridge(
                 result = kpb_send_input(&connection, buffer, (size_t)received);
                 if (result != KPB_OK) {
                     exit_code = 1;
+                    snprintf(reason, sizeof reason, "lost the connection to the broker while sending input");
                     break;
                 }
             } else if (received == 0) {
                 break;
             } else if (errno != EINTR && errno != EAGAIN) {
                 exit_code = 1;
+                snprintf(reason, sizeof reason, "cannot read the terminal: %s", strerror(errno));
                 break;
             }
         }
@@ -271,6 +350,7 @@ bridge(
             (unsigned long long)cursor_epoch,
             (unsigned long long)cursor_offset);
     }
+    if (exit_code != 0 && reason[0]) say_failure(failure, failure_capacity, verb, session_id, reason);
     return exit_code;
 }
 
@@ -340,9 +420,16 @@ print_status_json(const kpb_status *status, json_shape shape) {
     json_string(status->cwd);
     {
         char now[KPB_PATH_MAX];
+        int deleted = 0;
         fputs(",\"cwd_now\":", stdout);
-        if (kpb_read_cwd_now(status->child_pid, now, sizeof now) == KPB_OK) json_string(now);
-        else fputs("null", stdout);
+        if (kpb_read_cwd_now_ex(status->child_pid, now, sizeof now, &deleted) == KPB_OK) {
+            json_string(now);
+        } else {
+            fputs("null", stdout);
+        }
+        /* null because the directory was removed, as opposed to null because
+         * it could not be read. */
+        fputs(deleted ? ",\"cwd_now_deleted\":true" : ",\"cwd_now_deleted\":false", stdout);
     }
     fputs(",\"command\":", stdout);
     json_string(status->command);
@@ -576,8 +663,10 @@ usage(FILE *stream) {
         "                      once, so the bound is shared, not per session\n"
         "\n"
         "exit status: 0 success; 1 failure (including a missing or unsafe runtime directory);\n"
-        "2 usage error; 3 and 5 are refusals of kill --expect-started (above). run and attach\n"
-        "exit with the pane command's status once it exits.\n",
+        "2 usage error; 3 and 5 are refusals of kill --expect-started (above); 6 is a kill whose\n"
+        "request was never sent (timed out while connecting: nothing was done). run and attach\n"
+        "exit with the pane command's status once it exits; a failure to attach or stay\n"
+        "attached exits 1 and says why on one line.\n",
         stream
     );
 }
@@ -773,9 +862,16 @@ main(int argc, char **argv) {
         options.columns = size.ws_col;
         options.xpixel = size.ws_xpixel;
         options.ypixel = size.ws_ypixel;
-        result = kpb_spawn(&options, &status);
+        result = kpb_spawn_timeout(&options, &status, timeout_millis);
+        if (result == KPB_ERR_TIMEOUT) {
+            fprintf(
+                stderr,
+                "kitty-pty-broker: start session: timed out waiting for the sessions lock or "
+                "for the new broker; no session was started\n");
+            return 1;
+        }
         if (result != KPB_OK) return report_session_result("start session", runtime_dir, id, result);
-        return bridge(runtime_dir, id, NULL);
+        return bridge(runtime_dir, id, NULL, NULL, 0);
     }
     if (strcmp(command, "observe") == 0) {
         kpb_attach_options options;
@@ -803,7 +899,7 @@ main(int argc, char **argv) {
                 return 2;
             }
             if (require_runtime(runtime_dir) != 0) return 1;
-            return bridge(runtime_dir, session_id, &options);
+            return bridge(runtime_dir, session_id, &options, NULL, 0);
         }
     }
     if (strcmp(command, "attach") == 0) {
@@ -817,7 +913,7 @@ main(int argc, char **argv) {
          * path is unchanged and works against any broker. */
         if (index == argc) {
             if (require_runtime(runtime_dir) != 0) return 1;
-            return bridge(runtime_dir, session_id, NULL);
+            return bridge(runtime_dir, session_id, NULL, NULL, 0);
         }
         {
             kpb_attach_options options;
@@ -832,7 +928,7 @@ main(int argc, char **argv) {
             }
             options.resume = 1;
             if (require_runtime(runtime_dir) != 0) return 1;
-            return bridge(runtime_dir, session_id, &options);
+            return bridge(runtime_dir, session_id, &options, NULL, 0);
         }
     }
     if (strcmp(command, "tui") == 0) {
@@ -843,12 +939,14 @@ main(int argc, char **argv) {
             return 2;
         }
         if (require_runtime(runtime_dir) != 0) return 1;
+        char carried[256] = "";
         for (;;) {
-            tui_result = kpb_tui_run(runtime_dir, timeout_millis, session_id);
+            tui_result = kpb_tui_run(runtime_dir, timeout_millis, session_id, carried);
+            carried[0] = '\0';
             if (tui_result == KPB_TUI_ATTACH) {
                 resize_pending = 0;
                 stop_pending = 0;
-                return bridge(runtime_dir, session_id, NULL);
+                return bridge(runtime_dir, session_id, NULL, NULL, 0);
             }
             if (tui_result == KPB_TUI_OBSERVE) {
                 kpb_attach_options options;
@@ -861,7 +959,10 @@ main(int argc, char **argv) {
                  * pane left in the scrollback. */
                 fputs("\033[?1049h\033[2J\033[H", stdout);
                 fflush(stdout);
-                (void)bridge(runtime_dir, session_id, &options);
+                /* A failure is not printed here: it would be written inside the
+                 * alternate screen and gone the moment it is left.  It is
+                 * carried to the list instead, where it stays on screen. */
+                (void)bridge(runtime_dir, session_id, &options, carried, sizeof carried);
                 fputs("\033[?1049l", stdout);
                 fflush(stdout);
                 continue;
@@ -908,6 +1009,15 @@ main(int argc, char **argv) {
             }
         } else {
             result = kpb_terminate_timeout(runtime_dir, session_id, timeout_millis);
+        }
+        if (result == KPB_ERR_NOT_SENT) {
+            /* Still connecting when the time ran out: nothing was sent, so
+             * nothing was or will be done and it is safe to try again. */
+            fprintf(
+                stderr,
+                "kitty-pty-broker: kill session: timed out before the request was sent "
+                "(the broker is not accepting connections); nothing was done\n");
+            return 6;
         }
         if (result == KPB_ERR_TIMEOUT) {
             fprintf(

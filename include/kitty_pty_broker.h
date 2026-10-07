@@ -19,6 +19,11 @@ extern "C" {
 #define KPB_OBSERVER_MAX 8
 #define KPB_PROTOCOL_VERSION_MAX 2
 
+/* How long a spawn waits for the new broker to report that it is up, at least.
+ * Generous: this wait covers forkpty and fsync on a possibly loaded machine, and
+ * giving up early would turn a slow start into a failed one. */
+#define KPB_SPAWN_READY_MILLIS 10000
+
 /* The most history an observer is given on attach.  Beyond this the replay is
  * trimmed to the newest bytes, prefixed with a terminal reset, and reported as
  * truncated - the same contract the journal's own overflow uses. */
@@ -82,7 +87,12 @@ typedef enum {
      * one the caller meant; nothing was done.  UNSUPPORTED: the broker predates
      * identity-bound terminate and could not check; nothing was done. */
     KPB_ERR_MISMATCH = 12,
-    KPB_ERR_UNSUPPORTED = 13
+    KPB_ERR_UNSUPPORTED = 13,
+    /* kpb_terminate_timeout / kpb_terminate_expect only: the deadline passed
+     * while still CONNECTING, so the request was never sent and nothing was or
+     * will be done.  Contrast KPB_ERR_TIMEOUT, which for those calls means the
+     * request WAS sent and may still be acted on. */
+    KPB_ERR_NOT_SENT = 14
 } kpb_result;
 
 typedef struct {
@@ -227,7 +237,22 @@ kpb_result kpb_prepare_runtime(const char *runtime_dir);
  * to the spawned command, while the persistent broker closes its copies.  The
  * command starts with an empty signal mask; dispositions changed by the broker
  * for its own lifecycle are restored to their conventional defaults. */
+/* May return KPB_ERR_TIMEOUT: the sessions lock could not be had within
+ * KPB_DEFAULT_TIMEOUT_MILLIS, or the new broker did not report ready (see
+ * kpb_spawn_timeout).  Either way no session was started. */
 kpb_result kpb_spawn(const kpb_spawn_options *options, kpb_status *status);
+/* As kpb_spawn, with an explicit bound (<= 0: KPB_DEFAULT_TIMEOUT_MILLIS) on
+ * waiting for the sessions-directory lock.  Both forms can return
+ * KPB_ERR_TIMEOUT: either the lock could not be had in time (nothing was
+ * created), or the new broker did not report ready within the larger of that
+ * bound and KPB_SPAWN_READY_MILLIS.  In the second case nobody is waiting any
+ * more, so the broker tears itself down instead of coming up unobserved - a
+ * timeout means no session was started. */
+kpb_result kpb_spawn_timeout(
+    const kpb_spawn_options *options,
+    kpb_status *status,
+    int timeout_millis
+);
 kpb_result kpb_attach(
     const char *runtime_dir,
     const char *session_id,
@@ -315,7 +340,9 @@ kpb_result kpb_query_status(
 kpb_result kpb_terminate(const char *runtime_dir, const char *session_id);
 /* Bounded forms (KPB_ERR_TIMEOUT on expiry); the plain forms above use
  * KPB_DEFAULT_TIMEOUT_MILLIS.  A terminate that times out after its request
- * was sent may still be acted on by the broker later. */
+ * was sent (KPB_ERR_TIMEOUT) may still be acted on by the broker later; one
+ * that times out while still connecting returns KPB_ERR_NOT_SENT instead, and
+ * nothing was done. */
 kpb_result kpb_query_status_timeout(
     const char *runtime_dir,
     const char *session_id,
@@ -342,6 +369,9 @@ kpb_result kpb_terminate_timeout(
  *                     and the risk, belong to the caller (kpb_terminate).
  *   KPB_ERR_TIMEOUT   as for kpb_terminate_timeout: the request may still be
  *                     acted on, and if it is, it is still identity-checked.
+ *
+ *   KPB_ERR_NOT_SENT  the deadline passed while still connecting: nothing was
+ *                     sent, so nothing was or will be done (safe to retry).
  *
  * `expected_started_millis` is compared as given: 0 is not "no expectation". */
 kpb_result kpb_terminate_expect(
@@ -398,6 +428,13 @@ kpb_result kpb_session_socket_path(
  * or it belongs to another user.  This runs in the caller, not the broker, and
  * adds nothing to the wire. */
 kpb_result kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity);
+/* As kpb_read_cwd_now, and says why there is no answer when the directory the
+ * command is in has been REMOVED: *deleted is set and the result is
+ * KPB_ERR_NOT_FOUND with `output` empty (never the kernel's "/path (deleted)"
+ * link text, which is not a path).  `deleted` may be NULL.  Note that
+ * `child_pid` is whatever the broker reported; it is trusted exactly as far as a
+ * same-user broker is. */
+kpb_result kpb_read_cwd_now_ex(pid_t child_pid, char *output, size_t capacity, int *deleted);
 
 /* The identity of a broker process, read by the caller from /proc, so a later
  * request can be bound to the exact session that was seen (a pid or an ID alone

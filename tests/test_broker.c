@@ -15,7 +15,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 #include <sys/file.h>
+#include <sys/mount.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -3762,6 +3765,10 @@ test_spawn_does_not_wait_forever_for_the_sessions_lock(void) {
  * accepts one connection, reads the client's first frame, then sends `lead`
  * (raw bytes) and holds the connection open, sending `more` after `delay`
  * milliseconds if given.  Returns the server's pid; the caller kills it. */
+/* Set before a call to make the stand-in close the connection right after its
+ * lead bytes instead of holding it open; cleared by the call. */
+static bool fake_broker_closes;
+
 static pid_t
 fake_broker(
     const char *runtime,
@@ -3779,6 +3786,8 @@ fake_broker(
     int ready[2];
     pid_t child;
     char byte;
+    bool closes = fake_broker_closes;
+    fake_broker_closes = false;
     make_fake_session(runtime, session_id, NULL, NULL, directory);
     CHECK(snprintf(socket_path, sizeof socket_path, "%s/control.sock", directory)
           < (int)sizeof socket_path);
@@ -3800,12 +3809,31 @@ fake_broker(
         if (write(ready[1], "x", 1) != 1) _exit(1);
         fd = accept(listener, NULL, NULL);
         if (fd < 0) _exit(1);
-        /* The client's first frame: a 12-byte header and an 8-byte attach. */
-        if (read(fd, request, 20) != 20) _exit(1);
+        /* The client's first frame, whatever it is: a header and its payload. */
+        {
+            kpb_frame_header header;
+            size_t got = 0;
+            size_t payload;
+            while (got < sizeof header) {
+                ssize_t count = read(fd, (unsigned char *)&header + got, sizeof header - got);
+                if (count <= 0) _exit(1);
+                got += (size_t)count;
+            }
+            payload = ntohl(header.payload_size);
+            if (payload > sizeof request) _exit(1);
+            for (got = 0; got < payload;) {
+                ssize_t count = read(fd, request + got, payload - got);
+                if (count <= 0) _exit(1);
+                got += (size_t)count;
+            }
+        }
         if (lead_size && write(fd, lead, lead_size) != (ssize_t)lead_size) _exit(1);
         if (more_size) {
             usleep((useconds_t)delay_millis * 1000U);
             if (write(fd, more, more_size) != (ssize_t)more_size) _exit(1);
+        }
+        if (closes) {
+            close(fd);
         }
         for (;;) pause();
     }
@@ -4149,6 +4177,985 @@ test_tui_kill_is_bound_to_the_session_that_was_shown(void) {
     terminate_and_reap("tui-swap");
 }
 
+
+/* --- fix round 3 ------------------------------------------------------------ */
+
+/* Run the CLI against `runtime` with stdin at /dev/null, stdout and stderr
+ * merged into `output`.  Returns its exit status, 128+signal if it was killed,
+ * or 124 after `limit_seconds` (when it is killed).  `elapsed` is milliseconds. */
+static int
+run_cli(
+    const char *runtime,
+    const char *const *arguments,
+    char *output,
+    size_t capacity,
+    int limit_seconds,
+    long *elapsed
+) {
+    char cli_path[KPB_PATH_MAX];
+    const char *argv[32];
+    int channel[2];
+    pid_t child;
+    size_t used = 0;
+    size_t count = 0;
+    int status = 0;
+    int result;
+    bool timed_out = false;
+    long started = now_millis();
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    argv[count++] = cli_path;
+    argv[count++] = "--runtime-dir";
+    argv[count++] = runtime;
+    while (*arguments) {
+        CHECK(count + 1 < sizeof argv / sizeof argv[0]);
+        argv[count++] = *arguments++;
+    }
+    argv[count] = NULL;
+    CHECK(pipe(channel) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int null = open("/dev/null", O_RDONLY);
+        if (null >= 0) dup2(null, STDIN_FILENO);
+        dup2(channel[1], STDOUT_FILENO);
+        dup2(channel[1], STDERR_FILENO);
+        close(channel[0]);
+        close(channel[1]);
+        execv(cli_path, (char *const *)argv);
+        _exit(127);
+    }
+    close(channel[1]);
+    for (;;) {
+        struct pollfd waiting = {.fd = channel[0], .events = POLLIN, .revents = 0};
+        long remaining = (long)limit_seconds * 1000L - (now_millis() - started);
+        ssize_t got;
+        if (remaining <= 0) {
+            timed_out = true;
+            (void)kill(child, SIGKILL);
+            break;
+        }
+        if (poll(&waiting, 1, (int)remaining) < 0 && errno == EINTR) continue;
+        if (!(waiting.revents & (POLLIN | POLLHUP))) continue;
+        got = read(channel[0], output + used, capacity - 1 - used);
+        if (got <= 0) break;
+        used += (size_t)got;
+        if (used + 1 >= capacity) break;
+    }
+    output[used] = '\0';
+    close(channel[0]);
+    CHECK(waitpid(child, &status, 0) == child);
+    *elapsed = now_millis() - started;
+    if (timed_out) result = 124;
+    else if (WIFEXITED(status)) result = WEXITSTATUS(status);
+    else result = 128 + WTERMSIG(status);
+    return result;
+}
+
+static size_t
+count_lines(const char *text) {
+    size_t lines = 0;
+    for (; *text; text++) if (*text == '\n') lines++;
+    return lines;
+}
+
+/* A listener nobody accepts from, with its backlog filled: what a stopped
+ * broker looks like once enough abandoned connections have piled up. */
+typedef struct {
+    int listener;
+    int clients[64];
+    size_t count;
+} full_backlog;
+
+static void
+make_full_backlog(const char *runtime, const char *session_id, full_backlog *backlog) {
+    char directory[KPB_PATH_MAX];
+    char socket_path[KPB_PATH_MAX];
+    struct sockaddr_un address;
+    make_fake_session(runtime, session_id, NULL, NULL, directory);
+    CHECK(snprintf(socket_path, sizeof socket_path, "%s/control.sock", directory)
+          < (int)sizeof socket_path);
+    backlog->count = 0;
+    backlog->listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(backlog->listener >= 0);
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, socket_path);
+    CHECK(bind(backlog->listener, (struct sockaddr *)&address, sizeof address) == 0);
+    CHECK(listen(backlog->listener, 1) == 0);
+    while (backlog->count < sizeof backlog->clients / sizeof backlog->clients[0]) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        CHECK(fd >= 0);
+        if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+            CHECK(errno == EAGAIN);
+            close(fd);
+            return;
+        }
+        backlog->clients[backlog->count++] = fd;
+    }
+    FAIL("the backlog never filled");
+}
+
+static void
+release_backlog(full_backlog *backlog) {
+    size_t index;
+    for (index = 0; index < backlog->count; index++) close(backlog->clients[index]);
+    close(backlog->listener);
+}
+
+/* Survivor M01: connecting to a listener whose backlog is full used to be
+ * retried with no deadline, and nothing exercised it. */
+static void
+test_a_full_backlog_is_bounded_and_says_whether_the_request_was_sent(void) {
+    char scratch[64];
+    full_backlog backlog;
+    kpb_status status;
+    kpb_connection connection;
+    list_tally tally;
+    kpb_list_options options = {.timeout_millis = 300};
+    char output[1024];
+    const char *kill_arguments[] = {"--timeout", "0.3", "kill", "full", NULL};
+    long started;
+    long elapsed;
+    int code;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    make_full_backlog(scratch, "full", &backlog);
+
+    alarm(30);
+    started = now_millis();
+    CHECK(kpb_query_status_timeout(scratch, "full", &status, 300) == KPB_ERR_TIMEOUT);
+    elapsed = now_millis() - started;
+    CHECK(elapsed >= 250 && elapsed < 1500);
+    started = now_millis();
+    CHECK(kpb_attach_timeout(scratch, "full", 24, 80, 0, 0, &connection, 300) == KPB_ERR_TIMEOUT);
+    CHECK(now_millis() - started < 1500);
+    /* Terminate: the request was never sent, and the result says so. */
+    started = now_millis();
+    CHECK(kpb_terminate_timeout(scratch, "full", 300) == KPB_ERR_NOT_SENT);
+    CHECK(now_millis() - started < 1500);
+    CHECK(kpb_terminate_expect(scratch, "full", 1, 300) == KPB_ERR_NOT_SENT);
+    /* list reports it as unreachable at once. */
+    memset(&tally, 0, sizeof tally);
+    started = now_millis();
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    CHECK(now_millis() - started < 1500);
+    CHECK(tally.unreachable == 1 && tally.timed_out == 1);
+
+    /* The CLI: its own exit code, and "not sent" rather than "may still act". */
+    code = run_cli(scratch, kill_arguments, output, sizeof output, 10, &elapsed);
+    alarm(0);
+    CHECK(code == 6);
+    CHECK(elapsed < 2500);
+    CHECK(strstr(output, "before the request was sent") != NULL);
+    CHECK(strstr(output, "may still act") == NULL);
+    release_backlog(&backlog);
+    remove_tree(scratch);
+}
+
+/* The other half of the distinction: a request that WAS sent and not answered
+ * is still a plain timeout ("may still act"), not "not sent". */
+static void
+test_a_sent_but_unanswered_terminate_is_a_timeout_not_unsent(void) {
+    char scratch[64];
+    unsigned char nothing = 0;
+    pid_t server;
+    char output[1024];
+    const char *kill_arguments[] = {"--timeout", "0.4", "kill", "mute3", NULL};
+    long elapsed;
+    int code;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    server = fake_broker(scratch, "mute", &nothing, 0, NULL, 0, 0);
+    CHECK(kpb_terminate_timeout(scratch, "mute", 400) == KPB_ERR_TIMEOUT);
+    end_child(server);
+    server = fake_broker(scratch, "mute2", &nothing, 0, NULL, 0, 0);
+    CHECK(kpb_terminate_expect(scratch, "mute2", 5, 400) == KPB_ERR_TIMEOUT);
+    end_child(server);
+    server = fake_broker(scratch, "mute3", &nothing, 0, NULL, 0, 0);
+    code = run_cli(scratch, kill_arguments, output, sizeof output, 10, &elapsed);
+    CHECK(code == 1);
+    CHECK(strstr(output, "timed out; the broker may still act on the request") != NULL);
+    end_child(server);
+    remove_tree(scratch);
+}
+
+/* D4 (survivor M37): a first frame whose header is complete but whose payload
+ * is not is not a completed v1 handshake. */
+static void
+test_a_header_without_its_payload_is_not_a_completed_handshake(void) {
+    char scratch[64];
+    unsigned char frame[12 + 5];
+    kpb_connection connection;
+    pid_t server;
+    long started;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    frame_header_bytes(frame, KPB_FRAME_OUTPUT, 5);
+    memcpy(frame + 12, "hello", 5);
+    server = fake_broker(scratch, "cut", frame, 12 + 2, NULL, 0, 0);
+    alarm(20);
+    started = now_millis();
+    CHECK(kpb_attach_timeout(scratch, "cut", 24, 80, 0, 0, &connection, 400) == KPB_ERR_TIMEOUT);
+    alarm(0);
+    CHECK(now_millis() - started >= 350 && now_millis() - started < 1500);
+    CHECK(connection.fd == -1);
+    end_child(server);
+    /* Non-vacuity: the same frame, complete, is accepted. */
+    server = fake_broker(scratch, "whole", frame, sizeof frame, NULL, 0, 0);
+    CHECK(kpb_attach_timeout(scratch, "whole", 24, 80, 0, 0, &connection, 1000) == KPB_OK);
+    kpb_detach(&connection);
+    end_child(server);
+    remove_tree(scratch);
+}
+
+/* F7 / D1: every non-zero exit of attach says why, on one line. */
+static void
+test_every_failed_attach_says_why_on_one_line(void) {
+    char scratch[64];
+    unsigned char first[12];
+    unsigned char lead[12 + 6];
+    unsigned char error_frame[12 + 4];
+    unsigned char next[12];
+    char output[1024];
+    const char *arguments[] = {"--timeout", "1", "attach", "p", NULL};
+    pid_t server;
+    long elapsed;
+    int code;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+
+    /* The peer closes at once. */
+    fake_broker_closes = true;
+    server = fake_broker(scratch, "p", NULL, 0, NULL, 0, 0);
+    code = run_cli(scratch, arguments, output, sizeof output, 10, &elapsed);
+    CHECK(code == 1);
+    CHECK(count_lines(output) == 1);
+    CHECK(strstr(output, "kitty-pty-broker: attach p: connection closed by the broker") != NULL);
+    end_child(server);
+    remove_tree(scratch);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+
+    /* The broker stops in the middle of a frame after a complete first one. */
+    frame_header_bytes(first, KPB_FRAME_REPLAY_DONE, 0);
+    frame_header_bytes(next, KPB_FRAME_OUTPUT, 5);
+    memcpy(lead, first, 12);
+    memcpy(lead + 12, next, 6);
+    server = fake_broker(scratch, "p", lead, sizeof lead, NULL, 0, 0);
+    code = run_cli(scratch, arguments, output, sizeof output, 10, &elapsed);
+    CHECK(code == 1);
+    CHECK(elapsed >= 1500 && elapsed < 6000);
+    CHECK(count_lines(output) == 1);
+    CHECK(strstr(output, "kitty-pty-broker: attach p: the broker stopped in the middle of a frame") != NULL);
+    end_child(server);
+    remove_tree(scratch);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+
+    /* The broker refuses with an error frame: its words, one line, control bytes defanged. */
+    frame_header_bytes(error_frame, KPB_FRAME_ERROR, 4);
+    memcpy(error_frame + 12, "bo\033m", 4);
+    server = fake_broker(scratch, "p", error_frame, sizeof error_frame, NULL, 0, 0);
+    code = run_cli(scratch, arguments, output, sizeof output, 10, &elapsed);
+    CHECK(code == 1);
+    CHECK(count_lines(output) == 1);
+    CHECK(strstr(output, "kitty-pty-broker: attach p: bo?m") != NULL);
+    CHECK(strchr(output, '\033') == NULL);
+    end_child(server);
+    remove_tree(scratch);
+}
+
+/* F6: a removed directory is not a path. */
+static void
+test_cwd_now_of_a_removed_directory_is_null_and_flagged(void) {
+    char *command[] = {
+        "/bin/sh", "-c",
+        "d=$(mktemp -d /tmp/kpbcwd.XXXXXX) && cd \"$d\" && rmdir \"$d\" && sleep 3600", NULL};
+    char scratch[64];
+    kpb_spawn_options options;
+    kpb_status status;
+    char now[KPB_PATH_MAX];
+    char output[4096];
+    const char *arguments[] = {"status", "gone", "--json", NULL};
+    int deleted = 0;
+    int attempt;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "gone";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    for (attempt = 0; attempt < 300; attempt++) {
+        if (kpb_read_cwd_now_ex(status.child_pid, now, sizeof now, &deleted) ==
+                KPB_ERR_NOT_FOUND && deleted) {
+            break;
+        }
+        usleep(10000);
+    }
+    CHECK(deleted == 1);
+    CHECK(now[0] == '\0');
+    CHECK(kpb_read_cwd_now(status.child_pid, now, sizeof now) == KPB_ERR_NOT_FOUND);
+    CHECK(strstr(now, "(deleted)") == NULL);
+    CHECK(run_cli(scratch, arguments, output, sizeof output, 10, &elapsed) == 0);
+    CHECK(strstr(output, "\"cwd_now\":null,\"cwd_now_deleted\":true") != NULL);
+    CHECK(strstr(output, "(deleted)") == NULL);
+    /* Not deleted: the flag is false and the path present. */
+    CHECK(kpb_read_cwd_now_ex(getpid(), now, sizeof now, &deleted) == KPB_OK);
+    CHECK(deleted == 0 && now[0] == '/');
+    CHECK(kpb_terminate(scratch, "gone") == KPB_OK);
+    wait_until_gone(scratch, "gone");
+    remove_tree(scratch);
+}
+
+/* D2: the spawn's lock wait honours --timeout / the timeout argument. */
+static void
+test_the_spawn_lock_wait_honours_the_timeout(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    kpb_spawn_options options;
+    char output[1024];
+    const char *arguments[] = {"--timeout", "0.3", "run", "--id", "locked", "--", "/bin/true", NULL};
+    pid_t holder;
+    long started;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(kpb_prepare_runtime(scratch) == KPB_OK);
+    holder = hold_sessions_lock(scratch);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "locked";
+    options.cwd = "/tmp";
+    options.argv = command;
+    alarm(30);
+    started = now_millis();
+    CHECK(kpb_spawn_timeout(&options, NULL, 300) == KPB_ERR_TIMEOUT);
+    elapsed = now_millis() - started;
+    CHECK(elapsed >= 250 && elapsed < 1500);
+    CHECK(run_cli(scratch, arguments, output, sizeof output, 10, &elapsed) == 1);
+    alarm(0);
+    CHECK(elapsed < 1800);
+    CHECK(strstr(output, "timed out") != NULL && strstr(output, "no session was started") != NULL);
+    end_child(holder);
+    remove_tree(scratch);
+}
+
+/* D3: the wait for a new broker to report ready is bounded, and a timeout means
+ * no session was left running.  The broker is held before it can report: the
+ * caller of kpb_spawn is traced for fork, so the broker it forks is stopped in
+ * its first instruction and stays stopped until the test lets it go. */
+static void
+test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char directory[KPB_PATH_MAX];
+    kpb_spawn_options options;
+    kpb_status status;
+    pid_t caller;
+    pid_t broker = -1;
+    int wait_status;
+    long started;
+    int tries;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/slow", scratch) < (int)sizeof directory);
+    caller = fork();
+    CHECK(caller >= 0);
+    if (caller == 0) {
+        /* Stop until the tracer has attached, so the fork cannot be missed. */
+        raise(SIGSTOP);
+        kpb_spawn_options_init(&options);
+        options.runtime_dir = scratch;
+        options.session_id = "slow";
+        options.cwd = "/tmp";
+        options.argv = command;
+        _exit((int)kpb_spawn_timeout(&options, NULL, 100));
+    }
+    CHECK(waitpid(caller, &wait_status, WUNTRACED) == caller && WIFSTOPPED(wait_status));
+    if (ptrace(PTRACE_SEIZE, caller, 0, PTRACE_O_TRACEFORK) != 0) {
+        /* Tracing is not permitted here: this one test cannot run. */
+        printf("skip  %s (ptrace refused: %s)\n", current_test, strerror(errno));
+        (void)kill(caller, SIGKILL);
+        (void)waitpid(caller, NULL, 0);
+        remove_tree(scratch);
+        return;
+    }
+    (void)kill(caller, SIGCONT);
+    alarm(60);
+    started = now_millis();
+    for (;;) {
+        pid_t got = waitpid(-1, &wait_status, __WALL);
+        CHECK(got > 0);
+        if (got == caller) {
+            if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) break;
+            if (WIFSTOPPED(wait_status)) {
+                int event = wait_status >> 16;
+                if (event == PTRACE_EVENT_FORK) {
+                    unsigned long child_pid = 0;
+                    CHECK(ptrace(PTRACE_GETEVENTMSG, caller, 0, &child_pid) == 0);
+                    broker = (pid_t)child_pid;
+                    /* The broker stays stopped: it is NOT continued here. */
+                    CHECK(ptrace(PTRACE_CONT, caller, 0, 0) == 0);
+                } else {
+                    int signal_number = WSTOPSIG(wait_status);
+                    CHECK(ptrace(
+                        PTRACE_CONT, caller, 0,
+                        (signal_number == SIGSTOP || signal_number == SIGTRAP) ? 0 : signal_number) == 0);
+                }
+            }
+        }
+        /* Anything else (the new broker's initial stop) is left as it is. */
+    }
+    alarm(0);
+    /* kpb_spawn_timeout waits at least KPB_SPAWN_READY_MILLIS for the broker. */
+    CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == (int)KPB_ERR_TIMEOUT);
+    CHECK(now_millis() - started >= KPB_SPAWN_READY_MILLIS - 500);
+    CHECK(now_millis() - started < KPB_SPAWN_READY_MILLIS + 5000);
+    CHECK(broker > 0);
+
+    /* Nobody is waiting any more.  Let the broker go: its report fails and it
+     * tears itself down, taking the command with it. */
+    CHECK(ptrace(PTRACE_DETACH, broker, 0, 0) == 0 || errno == ESRCH);
+    (void)kill(broker, SIGCONT);
+    for (tries = 0; tries < 400 && exists(directory); tries++) usleep(20000);
+    CHECK(!exists(directory));
+    CHECK(kpb_query_status(scratch, "slow", &status) == KPB_ERR_NOT_FOUND);
+    remove_tree(scratch);
+}
+
+
+/* --- identity, races, boundaries, archive edges ------------------------------ */
+
+/* Survivors M10/M11: an identity that cannot be read is not proof of death.  In
+ * a private user and mount namespace the kernel's boot_id (or one process's
+ * /proc/PID/stat) is replaced by an empty file; a live session must be kept.
+ * Returns 0 on success, 77 when namespaces are not available here. */
+static int
+unreadable_identity_child(const char *scratch, bool mask_boot, bool mask_stat) {
+    char path[KPB_PATH_MAX];
+    char empty[KPB_PATH_MAX];
+    char metadata[1024];
+    char directory[KPB_PATH_MAX];
+    char boot[64];
+    char other[64];
+    char map[64];
+    int fd;
+    int seen = 0;
+    long self = (long)getpid();
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 77;
+    fd = open("/proc/self/setgroups", O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, "deny", 4) != 4) { close(fd); return 77; }
+        close(fd);
+    }
+    snprintf(map, sizeof map, "%u %u 1", (unsigned)uid, (unsigned)uid);
+    fd = open("/proc/self/uid_map", O_WRONLY);
+    if (fd < 0 || write(fd, map, strlen(map)) < 0) return 77;
+    close(fd);
+    snprintf(map, sizeof map, "%u %u 1", (unsigned)gid, (unsigned)gid);
+    fd = open("/proc/self/gid_map", O_WRONLY);
+    if (fd < 0 || write(fd, map, strlen(map)) < 0) return 77;
+    close(fd);
+    if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 77;
+
+    read_current_boot_id(boot);
+    memcpy(other, boot, sizeof boot);
+    other[0] = other[0] == '0' ? '1' : '0';
+    snprintf(empty, sizeof empty, "%s/empty", scratch);
+    fd = open(empty, O_WRONLY | O_CREAT, 0600);
+    if (fd < 0) return 77;
+    close(fd);
+
+    /* Control, in the same namespace and before anything is masked: a recorded
+     * boot that is not this boot IS proof, and is reaped. */
+    snprintf(metadata, sizeof metadata,
+        "version=1\nid=control\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\nboot_id=%s\n",
+        self, other);
+    make_fake_session(scratch, "control", metadata, NULL, directory);
+    (void)kpb_list(scratch, count_session, &seen);
+    snprintf(path, sizeof path, "%s/sessions/control", scratch);
+    if (exists(path)) return 1;
+
+    if (mask_boot &&
+        mount(empty, "/proc/sys/kernel/random/boot_id", NULL, MS_BIND, NULL) != 0) return 77;
+    if (mask_stat) {
+        char stat_path[64];
+        snprintf(stat_path, sizeof stat_path, "/proc/%ld/stat", self);
+        if (mount(empty, stat_path, NULL, MS_BIND, NULL) != 0) return 77;
+    }
+    /* Both sessions name a process that exists - this one - with an identity
+     * that WOULD prove otherwise if it could be read. */
+    snprintf(metadata, sizeof metadata,
+        "version=1\nid=boot\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\nboot_id=%s\n",
+        self, mask_boot ? other : boot);
+    make_fake_session(scratch, "boot", metadata, NULL, directory);
+    snprintf(metadata, sizeof metadata,
+        "version=1\nid=ticks\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\nboot_id=%s\nstart_ticks=%llu\n",
+        self, boot, (unsigned long long)(mask_stat ? 1ULL : 1ULL));
+    make_fake_session(scratch, "ticks", metadata, NULL, directory);
+    (void)kpb_list(scratch, count_session, &seen);
+    snprintf(path, sizeof path, "%s/sessions/boot", scratch);
+    if (mask_boot && !exists(path)) return 2;
+    snprintf(path, sizeof path, "%s/sessions/ticks", scratch);
+    if (mask_stat && !exists(path)) return 3;
+    return 0;
+}
+
+static void
+run_unreadable_identity_case(bool mask_boot, bool mask_stat) {
+    char scratch[64];
+    pid_t child;
+    int wait_status;
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) _exit(unreadable_identity_child(scratch, mask_boot, mask_stat));
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status));
+    if (WEXITSTATUS(wait_status) == 77) {
+        printf("skip  %s (no user/mount namespaces here)\n", current_test);
+    } else {
+        CHECK(WEXITSTATUS(wait_status) == 0);
+    }
+    remove_tree(scratch);
+}
+
+static void
+test_an_unreadable_boot_id_is_never_proof_of_death(void) {
+    run_unreadable_identity_case(true, false);
+}
+
+static void
+test_an_unreadable_proc_stat_is_never_proof_of_death(void) {
+    run_unreadable_identity_case(false, true);
+}
+
+/* Survivor M23: concurrent respawns of one corpse ID must have exactly one
+ * winner whose socket survives the concurrent list walks. */
+static void
+test_concurrent_respawn_of_one_corpse_has_exactly_one_winner(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    int round;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (round = 0; round < 60; round++) {
+        char id[32];
+        char metadata[256];
+        char directory[KPB_PATH_MAX];
+        char socket_path[KPB_PATH_MAX];
+        pid_t workers[6];
+        int barrier[2];
+        int winners = 0;
+        int losers = 0;
+        size_t index;
+        kpb_status status;
+
+        CHECK(snprintf(id, sizeof id, "race%d", round) < (int)sizeof id);
+        CHECK(snprintf(
+            metadata, sizeof metadata,
+            "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\n",
+            id, (long)dead_pid()) < (int)sizeof metadata);
+        make_fake_session(scratch, id, metadata, NULL, directory);
+        CHECK(snprintf(socket_path, sizeof socket_path, "%s/control.sock", directory)
+              < (int)sizeof socket_path);
+        CHECK(pipe(barrier) == 0);
+        for (index = 0; index < 6; index++) {
+            workers[index] = fork();
+            CHECK(workers[index] >= 0);
+            if (workers[index] == 0) {
+                char go;
+                kpb_spawn_options options;
+                int seen = 0;
+                int spin;
+                close(barrier[1]);
+                if (read(barrier[0], &go, 1) < 0) _exit(99);
+                if (index < 4) {
+                    kpb_spawn_options_init(&options);
+                    options.runtime_dir = scratch;
+                    options.session_id = id;
+                    options.cwd = "/tmp";
+                    options.argv = command;
+                    _exit((int)kpb_spawn(&options, NULL));
+                }
+                for (spin = 0; spin < 30; spin++) (void)kpb_list(scratch, count_session, &seen);
+                _exit(0);
+            }
+        }
+        close(barrier[0]);
+        close(barrier[1]);  /* every worker is released at once, by EOF */
+        for (index = 0; index < 6; index++) {
+            int wait_status;
+            alarm(60);
+            CHECK(waitpid(workers[index], &wait_status, 0) == workers[index]);
+            alarm(0);
+            CHECK(WIFEXITED(wait_status));
+            if (index < 4) {
+                if (WEXITSTATUS(wait_status) == (int)KPB_OK) winners++;
+                else if (WEXITSTATUS(wait_status) == (int)KPB_ERR_EXISTS) losers++;
+            }
+        }
+        CHECK(winners == 1);
+        CHECK(losers == 3);
+        CHECK(exists(socket_path));
+        CHECK(kpb_query_status_timeout(scratch, id, &status, 2000) == KPB_OK);
+        CHECK(kpb_terminate(scratch, id) == KPB_OK);
+        wait_until_gone(scratch, id);
+    }
+    remove_tree(scratch);
+}
+
+/* Survivor M09: the 107/108-byte boundary, through kpb_spawn itself. */
+static void
+test_the_socket_path_limit_is_exact_through_spawn(void) {
+    char scratch[64];
+    char runtime[KPB_PATH_MAX];
+    char probe[KPB_PATH_MAX];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    kpb_spawn_options options;
+    kpb_status status;
+    size_t length;
+    int which;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    length = strlen(scratch);
+    for (which = 0; which < 2; which++) {
+        size_t fixed = length + 1 + strlen("/sessions/x/control.sock");
+        size_t pad = (which == 0 ? KPB_SOCKET_PATH_LIMIT : KPB_SOCKET_PATH_LIMIT + 1) - fixed;
+        memcpy(runtime, scratch, length);
+        runtime[length] = '/';
+        memset(runtime + length + 1, which == 0 ? 'a' : 'b', pad);
+        runtime[length + 1 + pad] = '\0';
+        kpb_spawn_options_init(&options);
+        options.runtime_dir = runtime;
+        options.session_id = "x";
+        options.cwd = "/tmp";
+        options.argv = command;
+        if (which == 0) {
+            /* 107 bytes: binds and runs. */
+            CHECK(kpb_spawn(&options, &status) == KPB_OK);
+            CHECK(kpb_query_status(runtime, "x", &status) == KPB_OK);
+            CHECK(kpb_terminate(runtime, "x") == KPB_OK);
+            wait_until_gone(runtime, "x");
+        } else {
+            /* 108 bytes: refused, and nothing created. */
+            CHECK(kpb_spawn(&options, &status) == KPB_ERR_NAME_TOO_LONG);
+            CHECK(!exists(runtime));
+            CHECK(snprintf(probe, sizeof probe, "%s/sessions", runtime) < (int)sizeof probe);
+            CHECK(!exists(probe));
+        }
+    }
+    remove_tree(scratch);
+}
+
+/* Archive edges: modes under a permissive umask, an existing name, decoys, the
+ * DEFAULT bounds actually used, orphans, and a journal over the byte bound. */
+static void
+make_reaped_decoys(const char *scratch) {
+    char reaped[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    static const char *const files[] = {
+        "notes.txt", "x.journal", ".journal", "a.b.journal", "weird name.8.journal",
+        "z.12345678901234567890.journal", "keep.nodigits.meta",
+    };
+    size_t index;
+    CHECK(snprintf(reaped, sizeof reaped, "%s/reaped", scratch) < (int)sizeof reaped);
+    if (mkdir(reaped, 0700) != 0) CHECK(errno == EEXIST);
+    for (index = 0; index < sizeof files / sizeof files[0]; index++) {
+        FILE *stream;
+        CHECK(snprintf(path, sizeof path, "%s/%s", reaped, files[index]) < (int)sizeof path);
+        stream = fopen(path, "w");
+        CHECK(stream != NULL);
+        CHECK(fputs("decoy", stream) >= 0);
+        CHECK(fclose(stream) == 0);
+    }
+    CHECK(snprintf(path, sizeof path, "%s/lnk.5.journal", reaped) < (int)sizeof path);
+    CHECK(symlink("/nonexistent", path) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/dir.6.journal", reaped) < (int)sizeof path);
+    CHECK(mkdir(path, 0700) == 0);
+}
+
+static int
+count_archive_entries(const char *scratch, const char *suffix) {
+    char reaped[KPB_PATH_MAX];
+    DIR *directory;
+    struct dirent *entry;
+    int count = 0;
+    size_t suffix_size = strlen(suffix);
+    CHECK(snprintf(reaped, sizeof reaped, "%s/reaped", scratch) < (int)sizeof reaped);
+    directory = opendir(reaped);
+    if (!directory) return 0;
+    while ((entry = readdir(directory))) {
+        size_t length = strlen(entry->d_name);
+        /* Real archive names only: ID.<digits>.suffix, ID simple. */
+        if (length > suffix_size && strcmp(entry->d_name + length - suffix_size, suffix) == 0 &&
+            strncmp(entry->d_name, "n", 1) == 0) {
+            count++;
+        }
+    }
+    closedir(directory);
+    return count;
+}
+
+static void
+test_the_archive_has_private_modes_even_under_umask_zero(void) {
+    char scratch[64];
+    char path[KPB_PATH_MAX];
+    mode_t previous;
+    set_reaped_limits(NULL, NULL);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    previous = umask(0);
+    reap_fake(scratch, "modes", 4242, "journal bytes");
+    (void)umask(previous);
+    CHECK(snprintf(path, sizeof path, "%s/reaped", scratch) < (int)sizeof path);
+    CHECK(mode_of(path) == 0700);
+    CHECK(snprintf(path, sizeof path, "%s/reaped/modes.4242.journal", scratch) < (int)sizeof path);
+    CHECK(mode_of(path) == 0600);
+    CHECK(snprintf(path, sizeof path, "%s/reaped/modes.4242.meta", scratch) < (int)sizeof path);
+    CHECK(mode_of(path) == 0600);
+    remove_tree(scratch);
+}
+
+static void
+test_an_existing_archive_name_is_never_overwritten(void) {
+    char scratch[64];
+    char path[KPB_PATH_MAX];
+    char text[64];
+    FILE *stream;
+    set_reaped_limits(NULL, NULL);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/reaped", scratch) < (int)sizeof path);
+    CHECK(mkdir(path, 0700) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/reaped/dup.77.journal", scratch) < (int)sizeof path);
+    stream = fopen(path, "w");
+    CHECK(stream != NULL);
+    CHECK(fputs("ORIGINAL", stream) >= 0);
+    CHECK(fclose(stream) == 0);
+    /* The same ID and start time dies again: the old archive stands, and the
+     * session directory is still reaped. */
+    reap_fake(scratch, "dup", 77, "REPLACEMENT");
+    CHECK(read_text(path, text, sizeof text) == 8);
+    CHECK(strcmp(text, "ORIGINAL") == 0);
+    remove_tree(scratch);
+}
+
+static void
+test_decoy_files_in_reaped_are_never_touched_by_eviction(void) {
+    char scratch[64];
+    char path[KPB_PATH_MAX];
+    static const char *const names[] = {
+        "notes.txt", "x.journal", ".journal", "a.b.journal", "weird name.8.journal",
+        "z.12345678901234567890.journal", "keep.nodigits.meta", "lnk.5.journal", "dir.6.journal",
+    };
+    size_t index;
+    int serial;
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    make_reaped_decoys(scratch);
+    set_reaped_limits("1", "1");   /* everything that IS an archive entry is evicted */
+    for (serial = 1; serial <= 3; serial++) {
+        char id[16];
+        CHECK(snprintf(id, sizeof id, "n%d", serial) < (int)sizeof id);
+        reap_fake(scratch, id, (unsigned long long)serial * 100ULL, "journal");
+        usleep(20000);
+    }
+    for (index = 0; index < sizeof names / sizeof names[0]; index++) {
+        CHECK(snprintf(path, sizeof path, "%s/reaped/%s", scratch, names[index]) < (int)sizeof path);
+        CHECK(exists(path));
+    }
+    CHECK(count_archive_entries(scratch, ".journal") == 0);
+    set_reaped_limits(NULL, NULL);
+    remove_tree(scratch);
+}
+
+static void
+test_the_default_archive_bounds_are_the_ones_in_force(void) {
+    char scratch[64];
+    char path[KPB_PATH_MAX];
+    reaped_tally tally;
+    int serial;
+    set_reaped_limits(NULL, NULL);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+
+    /* 64 journals by default: the 65th and 66th evict the two oldest. */
+    for (serial = 1; serial <= 66; serial++) {
+        char id[16];
+        CHECK(snprintf(id, sizeof id, "f%d", serial) < (int)sizeof id);
+        reap_fake(scratch, id, (unsigned long long)serial, "j");
+    }
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_reaped(scratch, tally_reaped, &tally) == KPB_OK);
+    CHECK(tally.count == 64);
+    CHECK(snprintf(path, sizeof path, "%s/reaped/f1.1.journal", scratch) < (int)sizeof path);
+    CHECK(!exists(path));
+    CHECK(snprintf(path, sizeof path, "%s/reaped/f66.66.journal", scratch) < (int)sizeof path);
+    CHECK(exists(path));
+    remove_tree(scratch);
+
+    /* 256 MiB by default: three 100 MiB (sparse) journals cannot all stay. */
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (serial = 1; serial <= 3; serial++) {
+        char id[16];
+        char directory[KPB_PATH_MAX];
+        char metadata[256];
+        int seen = 0;
+        CHECK(snprintf(id, sizeof id, "b%d", serial) < (int)sizeof id);
+        CHECK(snprintf(
+            metadata, sizeof metadata,
+            "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=%d\n",
+            id, (long)dead_pid(), serial * 10) < (int)sizeof metadata);
+        make_fake_session(scratch, id, metadata, "x", directory);
+        CHECK(snprintf(path, sizeof path, "%s/journal.bin", directory) < (int)sizeof path);
+        CHECK(truncate(path, 100LL * 1024LL * 1024LL) == 0);
+        CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+        usleep(20000);
+    }
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_reaped(scratch, tally_reaped, &tally) == KPB_OK);
+    CHECK(tally.count == 2);
+    CHECK(strcmp(tally.first.session_id, "b2") == 0 && strcmp(tally.last.session_id, "b3") == 0);
+    remove_tree(scratch);
+}
+
+static void
+test_orphan_meta_files_are_counted_and_evicted(void) {
+    char scratch[64];
+    char path[KPB_PATH_MAX];
+    int serial;
+    int remaining = 0;
+    DIR *directory;
+    struct dirent *entry;
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/reaped", scratch) < (int)sizeof path);
+    CHECK(mkdir(path, 0700) == 0);
+    for (serial = 1; serial <= 5; serial++) {
+        FILE *stream;
+        CHECK(snprintf(path, sizeof path, "%s/reaped/o%d.%d.meta", scratch, serial, serial) < (int)sizeof path);
+        stream = fopen(path, "w");
+        CHECK(stream != NULL);
+        CHECK(fputs("orphan", stream) >= 0);
+        CHECK(fclose(stream) == 0);
+        usleep(20000);
+    }
+    set_reaped_limits(NULL, "2");
+    reap_fake(scratch, "fresh", 99, "journal");
+    CHECK(snprintf(path, sizeof path, "%s/reaped", scratch) < (int)sizeof path);
+    directory = opendir(path);
+    CHECK(directory != NULL);
+    while ((entry = readdir(directory))) {
+        if (entry->d_name[0] != '.') remaining++;
+    }
+    closedir(directory);
+    /* The bound is on entries - journals and orphan .meta files alike - and the
+     * fresh archive (journal + its .meta) is one of them. */
+    CHECK(remaining == 3);   /* fresh.99.journal, fresh.99.meta, one newest orphan */
+    CHECK(snprintf(path, sizeof path, "%s/reaped/fresh.99.journal", scratch) < (int)sizeof path);
+    CHECK(exists(path));
+    CHECK(snprintf(path, sizeof path, "%s/reaped/o5.5.meta", scratch) < (int)sizeof path);
+    CHECK(exists(path));
+    CHECK(snprintf(path, sizeof path, "%s/reaped/o1.1.meta", scratch) < (int)sizeof path);
+    CHECK(!exists(path));
+    set_reaped_limits(NULL, NULL);
+    remove_tree(scratch);
+}
+
+/* Documented limit: a journal larger than the byte bound is not kept (the bound
+ * is a bound), and the session is still reaped. */
+static void
+test_a_journal_larger_than_the_byte_bound_is_not_kept(void) {
+    char scratch[64];
+    reaped_tally tally;
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    set_reaped_limits("100", NULL);
+    reap_fake(scratch, "big", 5, "0123456789012345678901234567890123456789012345678901234567890123456789"
+        "01234567890123456789012345678901234567890123456789");
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_reaped(scratch, tally_reaped, &tally) == KPB_OK);
+    CHECK(tally.count == 0);
+    set_reaped_limits(NULL, NULL);
+    remove_tree(scratch);
+}
+
+
+/* F5: `o` on a session that has just become unreachable.  The failure used to be
+ * printed inside the alternate screen the observe runs on, and the screen was
+ * left a moment later, so the message was never seen.  It must be on the list. */
+static void
+test_a_failed_observe_from_the_tui_stays_visible(void) {
+    char cli_path[KPB_PATH_MAX];
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    size_t used = 0;
+    size_t first_failure = 0;
+    size_t last_leave = 0;
+    size_t index;
+    int master;
+    int wait_status;
+    pid_t child;
+    pid_t broker;
+    int drained;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    broker = spawn_sleeper("tui-obsfail");
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(cli_path, cli_path, "--runtime-dir", runtime_dir, "--timeout", "0.4", "tui", (char *)NULL);
+        _exit(127);
+    }
+    used = read_pty_until(master, output, used, sizeof output, "tui-obsfail");
+    used = read_pty_until(master, output, used, sizeof output, "detached");
+    /* The broker stops after the list was drawn and before it is next refreshed. */
+    CHECK(kill(broker, SIGSTOP) == 0);
+    CHECK(write(master, "o", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "timed out");
+    /* Drain what follows the first sight of the message. */
+    for (drained = 0; drained < 10; drained++) {
+        struct pollfd waiting = {.fd = master, .events = POLLIN, .revents = 0};
+        if (poll(&waiting, 1, 100) > 0) {
+            ssize_t count = read(master, output + used, sizeof output - used - 1);
+            if (count > 0) used += (size_t)count;
+        }
+    }
+    {
+        const unsigned char *found = memmem(output, used, "timed out", 9);
+        CHECK(found != NULL);
+        first_failure = (size_t)(found - output);
+    }
+    for (index = 0; index + 8 <= used; index++) {
+        if (memcmp(output + index, "\033[?1049l", 8) == 0) last_leave = index;
+    }
+    /* The message is drawn AFTER the last time the alternate screen was left. */
+    CHECK(first_failure > last_leave);
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    close(master);
+    resume_and_end(broker, "tui-obsfail");
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -4249,6 +5256,24 @@ main(int argc, char **argv) {
     RUN(test_terminate_payloads_on_the_wire);
     RUN(test_an_old_brokers_refusal_is_unsupported_not_a_fallback);
     RUN(test_tui_kill_is_bound_to_the_session_that_was_shown);
+    RUN(test_a_full_backlog_is_bounded_and_says_whether_the_request_was_sent);
+    RUN(test_a_sent_but_unanswered_terminate_is_a_timeout_not_unsent);
+    RUN(test_a_header_without_its_payload_is_not_a_completed_handshake);
+    RUN(test_every_failed_attach_says_why_on_one_line);
+    RUN(test_cwd_now_of_a_removed_directory_is_null_and_flagged);
+    RUN(test_the_spawn_lock_wait_honours_the_timeout);
+    RUN(test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing);
+    RUN(test_an_unreadable_boot_id_is_never_proof_of_death);
+    RUN(test_an_unreadable_proc_stat_is_never_proof_of_death);
+    RUN(test_concurrent_respawn_of_one_corpse_has_exactly_one_winner);
+    RUN(test_the_socket_path_limit_is_exact_through_spawn);
+    RUN(test_the_archive_has_private_modes_even_under_umask_zero);
+    RUN(test_an_existing_archive_name_is_never_overwritten);
+    RUN(test_decoy_files_in_reaped_are_never_touched_by_eviction);
+    RUN(test_the_default_archive_bounds_are_the_ones_in_force);
+    RUN(test_orphan_meta_files_are_counted_and_evicted);
+    RUN(test_a_journal_larger_than_the_byte_bound_is_not_kept);
+    RUN(test_a_failed_observe_from_the_tui_stays_visible);
     {
         char sessions[4096];
         snprintf(sessions, sizeof sessions, "%s/sessions", runtime_dir);
