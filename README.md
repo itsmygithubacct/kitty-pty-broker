@@ -46,28 +46,142 @@ Linux).
 ## CLI
 
 ```sh
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" run --id work -- bash
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" \
-    run --id work --transcript ~/.local/state/work.log -- bash
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" attach work --resume 0:4096
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" observe work
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" observe work --from 0:4096
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" list --json
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" status work --json
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" kill work
-kitty-pty-broker --runtime-dir "$XDG_RUNTIME_DIR/kpb" tui
+kitty-pty-broker run --id work -- bash
+kitty-pty-broker run --id work --transcript ~/.local/state/work.log -- bash
+kitty-pty-broker attach work
+kitty-pty-broker attach work --resume 0:4096
+kitty-pty-broker observe work
+kitty-pty-broker observe work --from 0:4096
+kitty-pty-broker list --json
+kitty-pty-broker list --all
+kitty-pty-broker status work --json
+kitty-pty-broker kill work
+kitty-pty-broker reaped
+kitty-pty-broker reaped path work
+kitty-pty-broker tui
+kitty-pty-broker --runtime-dir /srv/panes --timeout 0.5 list
 ```
+
+`kitty-pty-broker --help` (also `-h`, `help`, and `COMMAND --help`) prints the
+usage to stdout and exits 0.
+
+### Which runtime
+
+Every command works on one runtime directory, chosen in this order:
+
+1. `--runtime-dir DIR` (an absolute path);
+2. `$KITTY_PTY_BROKER_RUNTIME`, if it is set to an absolute path;
+3. `$XDG_RUNTIME_DIR/kitty-pty-broker`;
+4. `/tmp/kitty-pty-broker-UID`.
+
+A host that embeds the broker usually exports `KITTY_PTY_BROKER_RUNTIME` into the
+panes it starts, which is why the bare CLI sees that host's sessions from inside
+a pane and none from outside it: outside, it falls through to a different
+directory. Say which one you mean with `--runtime-dir`.
+
+`list`, `status`, `kill`, `attach`, `observe`, `reaped` and `tui` fail with exit
+status 1 when the runtime does not exist:
+
+```
+kitty-pty-broker: runtime directory does not exist: PATH (set KITTY_PTY_BROKER_RUNTIME or pass --runtime-dir)
+```
+
+A runtime that exists but has no `sessions/` yet is simply an empty listing. A
+runtime that is a symlink, is not a directory, or is not owned by you is refused
+as unsafe, also with exit status 1. `run` creates the runtime if needed, after
+checking that the socket path will fit (below).
+
+### On disk
+
+```
+RUNTIME/                         0700, owned by you
+    sessions/ID/                 0700, one per live session
+        control.sock             0600, the broker's socket
+        journal.bin              0600, the replay journal
+        metadata                 0600, key=value: pids, started_millis, boot_id, start_ticks
+    reaped/                      0700, journals kept from dead sessions (below)
+        ID.STARTED_MILLIS.journal
+        ID.STARTED_MILLIS.meta
+```
+
+`control.sock`'s full path must fit a Unix socket address, 107 bytes. A longer
+one is refused up front, before anything is created:
+`kitty-pty-broker: socket path too long (N bytes, limit 107): PATH`. Use a short
+runtime such as `/run/user/UID/kpb`.
+
+### Waiting is bounded
+
+Nothing waits on a broker without a deadline. A broker that is stopped, wedged
+or swapped out would otherwise hang every caller that asks about it.
+`--timeout SECONDS` (a decimal number of **seconds**, 0.1 to 60, given with
+`--runtime-dir` before the command, in either order) bounds each wait: the
+default is 2 seconds per operation, and 1 second for `list` and `tui`.
+
+A session that does not answer in time, or that fails for any reason other than
+"nothing is listening", is **unreachable**. `kill` that times out after sending
+its request says `kill session: timed out; the broker may still act on the
+request` and exits 1 - it did not necessarily fail.
+
+### `list`
+
+`list` asks every session **at the same time** under one overall deadline, so a
+runtime with any number of stuck brokers costs one deadline, not one each, and
+a stuck broker never hides a healthy one. For each session that did not answer,
+`list` prints `kitty-pty-broker: list: ID: REASON` on stderr (`timeout`,
+`security`, `protocol`, `system`) and still exits 0 with the sessions that did
+answer on stdout, because callers rely on that. A directory with nothing
+listening is a corpse rather than a session; it is reaped (below) and not
+reported.
+
+`list --all` also puts unreachable sessions in the listing:
+
+```
+ID<TAB>detached<TAB>pid=1234<TAB>COMMAND          reachable (attached or detached)
+ID<TAB>unreachable<TAB>pid=-<TAB>error=timeout    did not answer
+```
+
+and with `--json`, `{"id":"ID","reachable":false,"error":"timeout"}`, while
+reachable items gain `"reachable":true`.
+
+### Status JSON
+
+`status ID --json` and each `list --json` item are one object. The session's own
+record keeps its field names, types and meaning; new fields are appended after
+them:
+
+| field | meaning |
+|---|---|
+| `id`, `broker_pid`, `child_pid`, `foreground_pgrp`, `started_millis` | as reported by the broker |
+| `journal_bytes`, `journal_epoch`, `attached`, `replay_complete`, `rows`, `columns` | as reported by the broker |
+| `cwd` | the directory the session **started** in; fixed for the life of the session |
+| `cwd_now` | the command's directory **now**, read by the caller from `/proc/CHILD/cwd`; `null` when unavailable |
+| `command` | the command line, truncated to 511 bytes |
+| `boot_id` | this machine's boot id, read by the caller; `null` when unavailable |
+| `start_ticks` | the broker process's start time (`/proc/PID/stat`, field 22), read by the caller; `null` when unavailable |
+| `reachable` | only under `list --all`: `true` |
+
+`boot_id` and `start_ticks` identify the broker process exactly; a caller that
+wants a later request to act on this session and no other (a `kill` after a
+`list`) can keep them, or `started_millis`, with the id. `cwd_now`, `boot_id` and
+`start_ticks` describe the machine and `/proc` the *caller* sees.
+
+### `tui`
+
+`tui` opens the interactive session manager. Detached sessions are sorted first
+and unreachable ones last; use the arrow keys or `j`/`k` to select one, Enter to
+attach, `o` to observe (read-only, and allowed for a pane that is already
+attached; `Ctrl-]` returns to the list), `x` to request termination (with
+confirmation), `r` to refresh, and `q` to quit. A session that did not answer is
+shown with state `unreachable` and cannot be attached or observed. The header
+shows the runtime and the timeout in effect. The interface uses only ANSI
+terminal controls and adds no runtime dependency.
+
+### Other commands
 
 `run` starts the broker and attaches the current terminal. Disconnecting that
 client leaves the session alive. `kill` is the deliberate termination path;
 the broker first sends `SIGTERM` to every process group in the pane's terminal
 session, then `SIGKILL` after a bounded grace period.
-
-`tui` opens the interactive session manager. Detached sessions are sorted
-first; use the arrow keys or `j`/`k` to select one, Enter to attach, `x` to
-request termination (with confirmation), `r` to refresh, and `q` to quit. The
-interface uses only ANSI terminal controls and adds no runtime dependency.
 
 `observe` attaches read-only. It renders the pane but forwards nothing: keys
 are consumed locally and `Ctrl-]` leaves. `SIGWINCH` is ignored, so watching a
@@ -77,6 +191,42 @@ attached, or one that is not attached at all.
 Both `attach` and `observe` print `cursor=EPOCH:OFFSET` to stderr on exit. Pass
 that back as `--resume` or `--from` to continue where you stopped instead of
 repainting from the start of the journal.
+
+### Reaped journals
+
+A broker killed outright (`SIGKILL`, the OOM killer) cannot clean up. Its
+session directory is reaped by a later `list` or by a respawn of the same ID -
+but not before its journal, the last thing the pane showed, is kept:
+
+- the journal is **moved** (an atomic, constant-time rename within the runtime)
+  to `RUNTIME/reaped/ID.STARTED_MILLIS.journal`, and `ID.STARTED_MILLIS.meta`
+  beside it holds a copy of the session metadata plus `reaped_millis=`. The
+  directory is `0700`, the files `0600`, and nothing is followed through a
+  symlink;
+- an empty journal is not kept, and if a journal cannot be kept for any reason
+  it is deleted as before, so a failure to archive can never leave a corpse that
+  blocks its own ID;
+- the broker bounds `reaped/` itself, so a standalone install never grows
+  without limit: at most 256 MiB and 64 journals (a `.meta` file counts toward
+  the bytes, not the count), oldest evicted first. The process doing the reaping
+  reads `KITTY_PTY_BROKER_REAPED_MAX_BYTES` and `KITTY_PTY_BROKER_REAPED_MAX_FILES`
+  to override them. A host that wants to keep journals longer should compress
+  and move them out of `reaped/` itself.
+
+`reaped` lists them (`--json` for a JSON array); `reaped path ID` prints the
+path of the newest journal for an ID and exits 1 if there is none. A journal is
+raw terminal output: replay it in a terminal, not on your own.
+
+### Exit status
+
+| status | meaning |
+|---|---|
+| 0 | success (`list` with unreachable sessions is still 0) |
+| 1 | failure: missing or unsafe runtime, session not found, timeout, refused spawn, ... |
+| 2 | usage error |
+
+`run` and `attach` return the pane command's own exit status once it exits
+(`128+N` if it died from signal `N`), and 1 if they could not attach.
 
 ## Protocol version 2
 
@@ -152,7 +302,13 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
 
 - cryptographically random or caller-supplied stable session IDs;
 - spawning a command under an independently owned PTY;
-- attach, input, resize, output, detach, status, list, and terminate operations;
+- attach, input, resize, output, detach, status, list, and terminate operations,
+  each bounded by a deadline (`KPB_DEFAULT_TIMEOUT_MILLIS`, 2 s; `list`
+  1 s overall across all sessions) with `*_timeout` forms taking an explicit
+  bound and `kpb_list_with_options` reporting unreachable sessions;
+- `kpb_check_runtime`, `kpb_session_socket_path`, `kpb_read_cwd_now`,
+  `kpb_read_boot_id`/`kpb_read_start_ticks`, and the reaped archive
+  (`kpb_list_reaped`, `kpb_reaped_path`), all additive;
 - read-only observation and resumable replay through `kpb_observe` and
   `kpb_attach_with_options`; the original `kpb_attach` is unchanged and remains
   the version 1 entry point;
@@ -234,12 +390,18 @@ session. Threads are deliberately not used as a lifetime boundary because all
 threads die with their process.
 
 A session lost that way does not leave permanent garbage, though: the session
-directory's metadata records the broker's pid, and a later `list` or a respawn
-under the same ID removes the directory once that process is provably gone.
-Anything short of proof — metadata missing or a pid that still exists — leaves
-the directory untouched, so a live session is never reaped. Proof, removal, and
-recreation are serialised through a lock on the sessions directory, so two
-concurrent respawns of the same ID cannot reap each other's fresh session.
+directory's metadata records the broker's pid, boot id and process start time,
+and a later `list` or a respawn under the same ID removes the directory once the
+broker is **provably** gone: its pid does not exist, or the recorded boot is not
+this boot (the pid then belongs to a machine that no longer exists), or the pid
+exists but its start time differs (the number was reused). Metadata written
+before those fields existed keeps the pid-only rule, and anything short of proof
+- missing or unreadable metadata, a pid that exists, an identity that cannot be
+read now - leaves the directory untouched, so a live session is never reaped.
+Proof, removal, and recreation are serialised through a lock on the sessions
+directory, so two concurrent respawns of the same ID cannot reap each other's
+fresh session. Reaping keeps the journal; see "Reaped journals". It assumes
+the lister shares the broker's pid namespace and `/proc`.
 
 ## License
 

@@ -1,6 +1,6 @@
 # Why an observer cannot escalate
 
-Status: written 2026-07-29 against protocol v2 on `feat/protocol-v2-observers`
+Status: written 2026-07-29 against protocol v2; claims 5-8 and the client and reaping arguments below revised 2026-10-06
 
 Protocol v2 lets processes attach to a pane read-only, alongside the single
 read-write frontend. That is a new class of peer with access to a live
@@ -66,15 +66,20 @@ allocate against a size it invented.
 
 ### 5. An observer cannot stall the pane
 
-The read-write client's writes are blocking, and that is correct for it: a
-frontend that stops reading should stop the shell, which is backpressure
-working as intended. An observer must not have that power over someone else's
-session.
+An observer must not have power over someone else's session, and stalling the
+pane is the obvious one. So observers get non-blocking sockets and a bounded
+queue, and one that falls behind is **disconnected rather than buffered**.
+Resume-from-offset is what makes that acceptable: a dropped observer reattaches
+and asks for the bytes it missed.
 
-So observers get non-blocking sockets and a bounded queue, and one that falls
-behind is **disconnected rather than buffered**. Resume-from-offset is what
-makes that acceptable: a dropped observer reattaches and asks for the bytes it
-missed.
+The read-write client is written through a bounded, non-blocking queue as well
+(since `96bf23f`; an earlier version of this document said its writes were
+blocking, which stopped being true then). The difference between the two is the
+overflow policy and nothing else: past a high-water mark the broker stops
+reading the PTY, the kernel's buffer fills, and the shell blocks in `write()` -
+so a frontend that stops reading still stops the shell, which is backpressure
+working as intended, but it can no longer stop the broker. The broker's loop is
+also its control plane, and `status` and `kill` keep working throughout.
 
 Asserted by test: eight observers attached and never read while a pane floods
 a megabyte, and the read-write client still receives every byte.
@@ -143,6 +148,92 @@ Every observer path either succeeds or closes that one connection. The
 the `goto fail` routes, and slots are initialised to `-1` before the first
 one — otherwise `memset` would leave them at 0 and cleanup would close
 descriptor 0.
+
+## The other direction: a client waiting on a broker
+
+Everything above defends the broker against its peers. The reverse needs an
+argument too, because the broker is another process and can be stopped
+(`SIGSTOP`), wedged, or starved, and a client that waits on it without a limit
+inherits that. Measured against the build before this section was written:
+stopping one broker made `list` never return and never print the healthy
+sessions, `status` and `kill` hang, and a `kill` that was abandoned was still
+applied when the broker was resumed. Consequences were not local to the CLI:
+anything that shells out to `list` with its own timeout lost every session
+because of one.
+
+The claim: **no client operation waits on a broker without a deadline.**
+
+- *Connect* is non-blocking until it completes. A stopped broker never
+  `accept()`s; once its backlog (16) fills with abandoned connections a blocking
+  `connect()` waits forever, a non-blocking one reports `EAGAIN`, which is
+  retried only until the deadline.
+- *Replies* are read with the same absolute, shared deadline the broker uses on
+  its own accept path (`read_all_bounded`): it covers the whole frame, so
+  dribbling a byte at a time does not extend it. Status, terminate and the
+  version-2 attach reply are all read this way; a plain version-1 attach has no
+  reply, so it waits (consuming nothing) for the first frame the broker sends.
+- *`list` queries every session concurrently under one deadline.* Sequential
+  per-session bounds add up: ten stopped brokers at 2 s each is twenty seconds,
+  longer than any caller's own timeout. In flight together they cost one
+  deadline however many are stuck, and a session that did not answer is
+  reported as unreachable rather than dropped, so a stuck broker is visible and
+  never hides a healthy one.
+- *What a timeout does not mean.* A request that was sent may still be acted on
+  later: a timed-out `kill` is applied when the broker resumes (it is in the
+  broker's backlog). The CLI says so (`the broker may still act on the request`)
+  and exits non-zero, rather than reporting either success or "nothing
+  happened". A caller that must know has to look again, and can bind the
+  second look to the exact process with `started_millis`, `boot_id` and
+  `start_ticks` from the status JSON.
+
+Limits, stated rather than implied: a deadline bounds the *caller*; it does not
+unwedge the broker, and a same-user process can still occupy a stopped broker's
+backlog so that later requests time out. This is a liveness property inside one
+trust domain, not a defence against a hostile same-user process.
+
+Asserted by test: a `SIGSTOP`ped broker with `status`, `kill`, both attach forms
+and `list`, in the library and in the CLI; four stopped brokers cost one
+deadline.
+
+## Reaping a dead session's directory
+
+`list` and a respawn delete session directories, which is destructive, so what
+licenses it is argued here.
+
+- *What counts as proof the broker is gone.* Only one of: the recorded pid does
+  not exist (`ESRCH`); the recorded `boot_id` is not this boot's (a persistent
+  runtime outlives a reboot, and the pid then names nothing, or something
+  unrelated); or the pid exists but its `/proc/PID/stat` start time is not the
+  recorded `start_ticks` (the number was reused within this boot). A zombie
+  still counts as alive, a pid that exists and matches counts as alive, and
+  anything that cannot be read now (no `/proc`) proves nothing. Metadata written
+  by an earlier build has no identity fields and is held to the pid rule alone;
+  a malformed identity field is treated as absent, so garbage can only make the
+  proof weaker, never supply one.
+- *Never on weaker evidence.* Missing, unreadable or malformed metadata, a
+  session that merely does not answer (it may be stopped, not dead), a directory
+  being created by a spawn that has not written metadata yet: all leave the
+  directory alone. A stopped broker is unreachable, not stale.
+- *The lock.* Proof, removal and recreation of a session directory happen under
+  an exclusive `flock` on `sessions/`, so a respawn that has just recreated a
+  directory cannot lose its fresh files to a concurrent walk holding proof from
+  the old metadata. Every holder releases it within microseconds.
+- *Archive, don't delete.* Before the directory goes, its journal is moved (an
+  atomic rename within the runtime) to `reaped/ID.STARTED_MILLIS.journal`
+  with a `.meta` beside it. Both are created `0600` in a `0700` directory,
+  `O_EXCL | O_NOFOLLOW`; a journal that is not a regular file owned by the
+  caller, or a `reaped/` that is a symlink or foreign, is not used - the old
+  delete happens instead, and nothing is written through a link.
+- *Bounds.* The archive is a new place for same-user data to accumulate, so the
+  broker bounds it itself: 256 MiB and 64 journals, oldest first, within the
+  same lock. A failure to archive never leaves a corpse that blocks its own ID,
+  because the fallback is the delete that existed before.
+
+Assumptions: the lister shares the broker's pid namespace and `/proc` (a runtime
+bind-mounted into another pid namespace would read every broker as gone), and
+the recorded identity is honest (it is written by the broker itself, in a
+directory only its owner can write; a same-user process can already do far worse
+than forge it).
 
 ## What this argument does not cover
 
