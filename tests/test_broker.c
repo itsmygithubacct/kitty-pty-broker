@@ -1261,8 +1261,18 @@ raw_send_frame(int fd, uint16_t type, const void *payload, uint32_t size) {
     header.version = htons(KPB_PROTOCOL_VERSION);
     header.type = htons(type);
     header.payload_size = htonl(size);
-    raw_write(fd, &header, sizeof header);
-    if (size) raw_write(fd, payload, size);
+    /* One write, not two.  A broker that refuses a frame acts on the header
+     * alone and closes the connection, so a payload written separately can land
+     * on a closed socket and kill the test with SIGPIPE - which it did, about
+     * one run in forty, in test_observer_resize_refused. */
+    {
+        unsigned char *frame = malloc(sizeof header + size);
+        CHECK(frame != NULL);
+        memcpy(frame, &header, sizeof header);
+        if (size) memcpy(frame + sizeof header, payload, size);
+        raw_write(fd, frame, sizeof header + size);
+        free(frame);
+    }
 }
 
 static bool
