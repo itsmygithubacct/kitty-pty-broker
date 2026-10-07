@@ -714,10 +714,8 @@ build_command(char output[KPB_COMMAND_MAX], char *const *argv) {
 /* Reads at most capacity-1 bytes and NUL-terminates.  The files it is used on
  * are tiny and live in /proc or the session directory. */
 static ssize_t
-read_small_file(const char *path, char *buffer, size_t capacity) {
+read_open_file(int fd, char *buffer, size_t capacity) {
     size_t used = 0;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return -1;
     while (used + 1 < capacity) {
         ssize_t count = read(fd, buffer + used, capacity - 1 - used);
         if (count < 0) {
@@ -733,6 +731,45 @@ read_small_file(const char *path, char *buffer, size_t capacity) {
     close(fd);
     buffer[used] = '\0';
     return (ssize_t)used;
+}
+
+/* For /proc files.  Opened without blocking and checked to be a regular file
+ * AFTER it is open (fstat on the descriptor, never a path check first): a FIFO
+ * where a regular file belongs would otherwise block the open or the read. */
+static ssize_t
+read_small_file(const char *path, char *buffer, size_t capacity) {
+    struct stat status;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    return read_open_file(fd, buffer, capacity);
+}
+
+#define KPB_IDENTITY_FILE_MAX 4096
+
+/* A file inside a session directory that a decision about the session rests on
+ * (its metadata, the caller's provisional copy, an archive's .meta).  Read under
+ * the sessions lock, so it must not be able to hold the lock: opened with
+ * O_NONBLOCK so a FIFO cannot block the open, checked on the DESCRIPTOR to be a
+ * regular file owned by us and of sane size, and only then read.  Anything else
+ * is no proof at all (-1, errno EINVAL) and the directory is left alone. */
+static ssize_t
+read_identity_file(const char *path, char *buffer, size_t capacity) {
+    struct stat status;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) return -1;
+    if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != geteuid() || status.st_size < 0 ||
+        status.st_size > KPB_IDENTITY_FILE_MAX) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    return read_open_file(fd, buffer, capacity);
 }
 
 /* The kernel's identifier for this boot.  Together with a pid and that
@@ -2288,28 +2325,65 @@ session_dir_holds_only_known_entries(const session_paths *paths) {
     return only;
 }
 
-/* Remove a session directory's own files and the directory, in an order that
- * never throws away the proof that it is stale before the directory is really
- * gone.
+/* True when the directory holds nothing but `only` (a full path, or NULL for
+ * nothing at all) - checked by LOOKING, not by recognising names. */
+static bool
+session_dir_holds_only(const session_paths *paths, const char *only) {
+    const char *base = only ? strrchr(only, '/') : NULL;
+    struct dirent *entry;
+    DIR *directory = opendir(paths->session_dir);
+    bool clean = true;
+    if (!directory) return errno == ENOENT;
+    if (base) base++;
+    while ((entry = readdir(directory))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (!base || strcmp(entry->d_name, base) != 0) {
+            clean = false;
+            break;
+        }
+    }
+    closedir(directory);
+    return clean;
+}
+
+static int
+unlink_known(const char *path) {
+    if (unlink(path) == 0 || errno == ENOENT) return 0;
+    return -1;
+}
+
+/* Remove a session directory's own files and the directory, never discarding the
+ * proof that it may be removed before everything else is really gone.
  *
- * The temporaries go first and EXACTLY by name - the broker's metadata.tmp and
- * the caller's metadata.provisional - then the socket and journal.  The canonical
- * metadata, the proof a later listing needs if this is interrupted or fails,
- * goes LAST, immediately before rmdir, and only if nothing else is in the
- * directory: an unknown entry means the directory is not ours to remove, so the
- * metadata stays and the directory is left exactly as it is.  (Removing it
- * first, as before, left a directory that rmdir then refused to delete and that
- * no later listing could prove stale: its ID was blocked for good.)  No globbing:
- * nothing but the five known names is ever unlinked. */
-static void
-remove_session_files(const session_paths *paths) {
-    (void)unlink(paths->metadata_tmp_path);
-    (void)unlink(paths->provisional_path);
-    (void)unlink(paths->socket_path);
-    (void)unlink(paths->journal_path);
-    if (!session_dir_holds_only_known_entries(paths)) return;
-    (void)unlink(paths->metadata_path);
-    (void)rmdir(paths->session_dir);
+ * `proof` is the one file whose contents licensed this (the broker's metadata, or
+ * - when that is absent - the caller's provisional copy), or NULL when nothing
+ * did (a broker clearing up after itself with no record left).  Every OTHER known
+ * name is unlinked first and EXACTLY (no globbing), and each unlink's result is
+ * checked: if any fails (EIO, a directory sitting at metadata.tmp, ...) nothing
+ * further is removed and the proof stays, so a later listing can try again.  Only
+ * then is the directory looked at - not for recognisable names, for NOTHING BUT
+ * the proof - and only if that holds is the proof unlinked and the directory
+ * removed.  Returns 0 when the directory is gone, -1 when it was left behind.
+ *
+ * The honest limit: unlinking the proof and removing the directory are two
+ * syscalls, and a process killed between them leaves an empty directory with no
+ * record in it.  Nothing here can close that - an empty directory is also what a
+ * spawn in flight looks like - so it is stated, not hidden. */
+static int
+remove_session_files(const session_paths *paths, const char *proof) {
+    const char *others[] = {
+        paths->metadata_tmp_path, paths->provisional_path, paths->socket_path,
+        paths->journal_path, paths->metadata_path,
+    };
+    size_t index;
+    for (index = 0; index < sizeof others / sizeof others[0]; index++) {
+        if (proof && strcmp(others[index], proof) == 0) continue;
+        if (unlink_known(others[index]) != 0) return -1;
+    }
+    if (!session_dir_holds_only(paths, proof)) return -1;
+    if (proof && unlink_known(proof) != 0) return -1;
+    if (rmdir(paths->session_dir) != 0 && errno != ENOENT) return -1;
+    return 0;
 }
 
 static void
@@ -2322,7 +2396,7 @@ cleanup_server(server_state *server) {
     if (server->journal_fd >= 0) close(server->journal_fd);
     if (server->transcript_fd >= 0) close(server->transcript_fd);
     free(server->input_buffer);
-    remove_session_files(&server->paths);
+    (void)remove_session_files(&server->paths, server->paths.metadata_path);
 }
 
 static int
@@ -2615,17 +2689,33 @@ parse_metadata(const char *data, metadata_info *info) {
  * directory whose broker never got as far as writing its own (it wedged, then
  * died) and whose caller was killed before linking the provisional file into
  * place: without it, nothing in that directory proves anything and its ID is
- * blocked forever.  It is accepted only when COMPLETE - it ends in a newline, so
- * a write cut short cannot be read as a different, shorter pid - and it belongs
+ * blocked forever.  It is accepted only when COMPLETE - newline terminated and carrying
+ * pid, boot id and start time, so a write cut short cannot be read as a
+ * different, shorter pid - and it belongs
  * to this directory's generation because the caller can only create it in the
  * directory it itself made (see write_provisional_metadata). */
 static ssize_t
-read_session_metadata(const session_paths *paths, char *buffer, size_t capacity) {
-    ssize_t size = read_small_file(paths->metadata_path, buffer, capacity);
+read_session_metadata(
+    const session_paths *paths,
+    char *buffer,
+    size_t capacity,
+    const char **proof_path
+) {
+    metadata_info info;
+    ssize_t size = read_identity_file(paths->metadata_path, buffer, capacity);
+    if (proof_path) *proof_path = paths->metadata_path;
     if (size > 0) return size;
     if (size < 0 && errno != ENOENT) return -1;
-    size = read_small_file(paths->provisional_path, buffer, capacity);
-    if (size > 0 && buffer[size - 1] == '\n') return size;
+    size = read_identity_file(paths->provisional_path, buffer, capacity);
+    if (proof_path) *proof_path = paths->provisional_path;
+    /* The fallback must be the WHOLE record the spawning caller writes: newline
+     * terminated, and carrying the pid AND the boot id AND the start time.  A
+     * file that is merely newline-terminated could be "broker_pid=" and nothing
+     * else, which is no identity at all. */
+    if (size > 0 && buffer[size - 1] == '\n' && parse_metadata(buffer, &info) &&
+        info.have_boot_id && info.have_ticks) {
+        return size;
+    }
     return -1;
 }
 
@@ -2655,7 +2745,7 @@ session_is_stale(const session_paths *paths) {
     metadata_info info;
     char current[64];
     uint64_t ticks;
-    ssize_t size = read_session_metadata(paths, data, sizeof data);
+    ssize_t size = read_session_metadata(paths, data, sizeof data, NULL);
     if (size <= 0) return false;
     if (!parse_metadata(data, &info)) return false;
     if (kill((pid_t)info.pid, 0) != 0 && errno == ESRCH) return true;
@@ -2872,7 +2962,7 @@ archive_journal(const session_paths *paths) {
         journal.st_uid != geteuid() || journal.st_size <= 0) {
         return;
     }
-    size = read_session_metadata(paths, data, sizeof data);
+    size = read_session_metadata(paths, data, sizeof data, NULL);
     if (size < 0) size = 0;
     if (size > 0 && parse_metadata(data, &info) && info.have_started) {
         started = info.started_millis;
@@ -2916,13 +3006,16 @@ archive_journal(const session_paths *paths) {
  * first.  Best-effort, and rmdir is the commit point: it fails if anything
  * unexpected is still inside, which is the safe direction.  Callers hold the
  * sessions-directory lock across both the proof and this removal. */
-static void
+static int
 reap_stale_session(const session_paths *paths) {
+    char data[2048];
+    const char *proof = NULL;
     /* An unknown entry means this is not a directory we made, whatever its
      * metadata says: leave it entirely alone (nothing archived, nothing removed). */
-    if (!session_dir_holds_only_known_entries(paths)) return;
+    if (!session_dir_holds_only_known_entries(paths)) return -1;
+    if (read_session_metadata(paths, data, sizeof data, &proof) <= 0) return -1;
     archive_journal(paths);
-    remove_session_files(paths);
+    return remove_session_files(paths, proof);
 }
 
 /* Serialise reaping against session creation.  The staleness proof and the
@@ -3786,6 +3879,8 @@ kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
 
 typedef enum { LIST_PENDING = 0, LIST_ACTIVE, LIST_DONE } list_state;
 
+typedef enum { REAP_NOT_STALE = 0, REAP_DONE, REAP_FAILED } reap_outcome;
+
 typedef struct {
     char id[KPB_SESSION_ID_MAX + 1];
     list_state state;
@@ -3794,6 +3889,9 @@ typedef struct {
     size_t received;
     unsigned char *buffer;
     kpb_status *status;
+    /* The connection ended (EOF or reset) before a single reply byte.  A candidate
+     * for "the broker is gone", not proof of it. */
+    bool unanswered;
 } list_slot;
 
 #define LIST_REPLY_SIZE (sizeof(kpb_frame_header) + sizeof(kpb_wire_status))
@@ -3865,15 +3963,16 @@ list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
 /* Take whatever the broker has sent so far; finish the slot when it is
  * complete or has failed.
  *
- * A connection that ends before ANY reply byte arrives is treated as "nothing is
- * listening" (KPB_ERR_NOT_FOUND), not as a failure of the session: it means the
- * listening socket went away while the request waited in its backlog.  That
- * happens for real - a broker killed a moment after it forked its command leaves
- * the listening socket open in the not-yet-run child for the instants until the
- * child closes it (or dies), so a connect to the dead broker can succeed and then
- * be reset.  Reporting that as unreachable (and not reaping) made a listing right
- * after the kill leave the corpse for the next one.  A connection that ends
- * MID-reply is still a failure. */
+ * A connection that ends before ANY reply byte arrives is a CANDIDATE for "the
+ * broker is gone", not proof of it, and is marked `unanswered`.  It does happen
+ * for a dead broker: one killed a moment after it forked its command leaves the
+ * listening socket open in the not-yet-run child for an instant, so a connect can
+ * succeed and then be reset.  But a LIVE broker closes without a word too - a
+ * valid request that reaches it after its handshake budget expired, a frame it
+ * refuses - so the listing decides by the same proof it uses for every reap: a
+ * stale identity reaps it in that listing, anything else keeps it as an
+ * unreachable row with a reason.  A connection that ends MID-reply is a failure
+ * either way. */
 static void
 list_receive(list_slot *slot) {
     for (;;) {
@@ -3885,15 +3984,18 @@ list_receive(list_slot *slot) {
         if (count < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            /* The connection was reset before a single byte came back: whoever
-             * held the listening socket let go of it while we were waiting. */
-            list_finish(
-                slot, errno == ECONNRESET && slot->received == 0 ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM);
+            if (errno == ECONNRESET && slot->received == 0) {
+                /* Reset before a single byte came back: whoever held the
+                 * listening socket let go of it while we waited. */
+                slot->unanswered = true;
+            }
+            list_finish(slot, KPB_ERR_SYSTEM);
             return;
         }
         if (count == 0) {
-            /* Ended with nothing said, the same. */
-            list_finish(slot, slot->received == 0 ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM);
+            /* Ended with nothing said. */
+            if (slot->received == 0) slot->unanswered = true;
+            list_finish(slot, KPB_ERR_SYSTEM);
             return;
         }
         slot->received += (size_t)count;
@@ -4052,27 +4154,37 @@ kpb_list_with_options(
     for (index = 0; index < count; index++) {
         list_slot *slot = &slots[index];
         kpb_list_entry item;
-        if (slot->error == KPB_ERR_NOT_FOUND) {
-            /* Nothing is listening in this directory.  If its metadata proves
-             * the recorded broker is gone this is a corpse from an uncleanly
-             * killed session, and this walk is the natural place to reap it -
-             * otherwise it stays invisible forever while still blocking its
-             * ID and costing every listing a connect() to a dead socket.
-             * Proof and removal happen under the sessions-directory lock, so
-             * a respawn that has just recreated this directory can never
-             * lose its fresh files to the walk. */
+        if (slot->error == KPB_ERR_NOT_FOUND || slot->unanswered) {
+            /* Nothing answered.  If this directory's metadata proves the
+             * recorded broker is gone it is a corpse from an uncleanly killed
+             * session, and this walk is the natural place to reap it - otherwise
+             * it stays invisible forever while still blocking its ID.  Proof and
+             * removal happen under the sessions-directory lock, so a respawn that
+             * has just recreated the directory can never lose its fresh files to
+             * the walk, and the lock is skipped, not waited for, past the
+             * deadline.
+             *
+             * What happens to the ROW depends on how nothing answered.  Nothing
+             * LISTENING (the connect failed) is silent, as it always was.  A
+             * connection that ENDED without a reply is silent only if the proof
+             * held - the broker is gone - and otherwise is an unreachable row: a
+             * live broker that refused a request must not vanish from a listing. */
+            reap_outcome outcome = REAP_NOT_STALE;
             session_paths stale;
             if (build_paths(runtime_dir, slot->id, &stale) == KPB_OK) {
-                /* Skipped, not waited for, when the lock cannot be had within the
-                 * deadline: the session is still not listed (nothing is
-                 * listening), and the next listing reaps it. */
                 int lock_fd = lock_sessions_dir_until(&stale, &deadline);
                 if (lock_fd >= 0) {
-                    if (session_is_stale(&stale)) reap_stale_session(&stale);
+                    if (session_is_stale(&stale)) {
+                        outcome = reap_stale_session(&stale) == 0 ? REAP_DONE : REAP_FAILED;
+                    }
                     close(lock_fd);
                 }
             }
-            continue;
+            if (outcome == REAP_DONE) continue;
+            if (slot->error == KPB_ERR_NOT_FOUND && outcome == REAP_NOT_STALE) continue;
+            /* Otherwise report it: a live broker that said nothing, or a proven
+             * corpse that could not be cleared. */
+            slot->error = KPB_ERR_SYSTEM;
         }
         if (stopped) continue;
         memset(&item, 0, sizeof item);
@@ -4170,7 +4282,7 @@ collect_reaped(const char *runtime_dir, kpb_reaped_entry **out, size_t *out_coun
         memcpy(item.meta_path, item.journal_path, sizeof item.meta_path);
         if (meta_path_for(item.meta_path, sizeof item.meta_path) == 0 &&
             lstat(item.meta_path, &meta) == 0 && S_ISREG(meta.st_mode)) {
-            ssize_t size = read_small_file(item.meta_path, data, sizeof data);
+            ssize_t size = read_identity_file(item.meta_path, data, sizeof data);
             const char *line = data;
             if (size > 0) {
                 while (line && *line) {
