@@ -6,15 +6,36 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* The harness must never hang, whatever the environment does to it.  kpb_receive
+ * waits for the first byte of a frame with no bound (that is the live stream), so
+ * the harness guarantees one of two things before calling it: the input has been
+ * delivered and the write side closed (the reader then sees data or end of file
+ * at once), or it stops here with a message.  Silently waiting would look like a
+ * hang in the fuzzer - which is what a sandbox that refuses shutdown() used to
+ * produce on the empty input. */
+static void
+fail_fast(const char *what) {
+    fprintf(stderr, "fuzz_protocol: %s (%s)\n", what, strerror(errno));
+    abort();
+}
+
+static void
+finish_input(int writer) {
+    if (shutdown(writer, SHUT_WR) != 0) fail_fast("shutdown(SHUT_WR) failed");
+}
+
 static void
 check_event(kpb_result result, const kpb_event *event, size_t capacity) {
-    if (result < KPB_OK || result > KPB_ERR_CHILD) abort();
+    if (result < KPB_OK || result > KPB_ERR_TIMEOUT) abort();
     if (result != KPB_OK) return;
     switch (event->type) {
         case KPB_EVENT_OUTPUT:
@@ -44,6 +65,10 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!data || size > 65536U || socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
         return 0;
     }
+    /* A writer that cannot make progress must fail, not block. */
+    if (fcntl(sockets[0], F_SETFL, fcntl(sockets[0], F_GETFL, 0) | O_NONBLOCK) != 0) {
+        fail_fast("fcntl(O_NONBLOCK) failed");
+    }
     if (size && (data[0] & 4U)) capacity = sizeof(kpb_wire_exit);
     if (size >= 2U && (data[0] & 1U)) {
         static const uint16_t types[] = {
@@ -71,15 +96,23 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         header.version = htons(KPB_PROTOCOL_VERSION);
         header.type = htons(type);
         header.payload_size = htonl(payload_size);
-        if (write_all_fd(sockets[0], &header, sizeof header) >= 0 &&
-            (!payload_size ||
-             write_all_fd(sockets[0], payload, payload_size) >= 0)) {
-            (void)shutdown(sockets[0], SHUT_WR);
+        /* If it cannot all be delivered without blocking, the reader gets what
+         * arrived and then end of file. */
+        if (write_all_fd(sockets[0], &header, sizeof header) >= 0 && payload_size) {
+            (void)write_all_fd(sockets[0], payload, payload_size);
         }
+        finish_input(sockets[0]);
     } else {
-        if (!size || write_all_fd(sockets[0], data, size) >= 0) {
-            (void)shutdown(sockets[0], SHUT_WR);
-        }
+        (void)(size && write_all_fd(sockets[0], data, size));
+        finish_input(sockets[0]);
+    }
+    {
+        struct pollfd ready = {.fd = sockets[1], .events = POLLIN, .revents = 0};
+        int polled;
+        do {
+            polled = poll(&ready, 1, 1000);
+        } while (polled < 0 && errno == EINTR);
+        if (polled <= 0) fail_fast("reader saw neither data nor end of file");
     }
     memset(&connection, 0, sizeof connection);
     connection.fd = sockets[1];
