@@ -21,6 +21,7 @@ CLI := $(BUILD_DIR)/kitty-pty-broker
 TEST := $(BUILD_DIR)/test-broker
 BENCHMARK := $(BUILD_DIR)/benchmark-broker
 FUZZ := $(BUILD_DIR)/fuzz-protocol
+FUZZ_PARSERS := $(BUILD_DIR)/fuzz-parsers
 FUZZ_SECONDS ?= 15
 SANITIZE_BUILD_DIR ?= $(BUILD_DIR)/sanitize
 
@@ -79,8 +80,16 @@ $(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/internal.h src/protoco
 		-fsanitize=fuzzer,address,undefined \
 		tests/fuzz_protocol.c src/kitty_pty_broker.c -o "$@" $(LDLIBS)
 
-fuzz: $(FUZZ)
+$(FUZZ_PARSERS): tests/fuzz_parsers.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
+		-fsanitize=fuzzer,address,undefined \
+		tests/fuzz_parsers.c -o "$@" $(LDLIBS)
+
+# The protocol parser (kpb_receive) and the parsers behind list and the reaped
+# archive each get FUZZ_SECONDS.
+fuzz: $(FUZZ) $(FUZZ_PARSERS)
 	"$(FUZZ)" -max_total_time=$(FUZZ_SECONDS) -timeout=2 -max_len=65536
+	"$(FUZZ_PARSERS)" -max_total_time=$(FUZZ_SECONDS) -timeout=2 -max_len=65536
 
 # The broker dup2s /dev/null over stderr and leaves through _exit, so a
 # sanitizer report raised inside it would otherwise be written to nowhere and
