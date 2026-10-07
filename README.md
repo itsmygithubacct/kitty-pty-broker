@@ -122,9 +122,21 @@ once a frame has started arriving, the rest of it must follow within 2 seconds.
 default is 2 seconds per operation, and 1 second for `list` and `tui`.
 
 A session that does not answer in time, or that fails for any reason other than
-"nothing is listening", is **unreachable**. `kill` that times out after sending
-its request says `kill session: timed out; the broker may still act on the
-request` and exits 1 - it did not necessarily fail.
+"nothing is listening", is **unreachable**. `kill` says which kind of timeout it
+was: one that expired after the request was sent says `kill session: timed out;
+the broker may still act on the request` and exits 1 - it did not necessarily
+fail - while one that expired before the request could be sent (the broker is not
+accepting connections) says `timed out before the request was sent ... nothing
+was done` and exits 6, and is safe to retry. `run` waits for the sessions lock no
+longer than `--timeout`, and for the new broker to come up at least 10 seconds;
+if either runs out it says `no session was started` and exits 1.
+
+When `attach` or `observe` ends for any reason other than the pane's own exit
+(the broker closed the connection, stopped in the middle of a frame, refused, the
+terminal went away) it exits 1 and says why, on one line:
+`kitty-pty-broker: attach ID: REASON`. Pressing `Ctrl-C`/`SIGTERM` ends an attach
+at once even while the pane is streaming output, and an `attach` whose standard
+input is already at end of file detaches cleanly.
 
 ### `list`
 
@@ -132,13 +144,15 @@ request` and exits 1 - it did not necessarily fail.
 runtime with any number of stuck brokers costs one deadline, not one each, and
 a stuck broker never hides a healthy one. For each session that did not answer,
 `list` prints `kitty-pty-broker: list: ID: REASON` on stderr (`timeout`,
-`security`, `protocol`, `system`) and still exits 0 with the sessions that did
+`security`, `protocol`, `system`, `name-too-long`, `invalid`, or the catch-all
+`error`) and still exits 0 with the sessions that did
 answer on stdout, because callers rely on that. Reaping a corpse during `list`
 needs the sessions lock, which is only waited for until `list`'s own deadline: if
 another process holds it, `list` skips the reap and still lists, and a later
-listing reaps. A directory with nothing
-listening is a corpse rather than a session; it is reaped (below) and not
-reported.
+listing reaps. A directory with nothing listening is not reported as a session.
+It is reaped (below) only when its broker is *proven* gone; a directory whose
+metadata is missing or malformed, or whose broker is alive but has lost its
+socket, is neither reaped nor listed and stays where it is.
 
 `list --all` also puts unreachable sessions in the listing:
 
@@ -153,15 +167,17 @@ reachable items gain `"reachable":true`.
 ### Status JSON
 
 `status ID --json` and each `list --json` item are one object. The session's own
-record keeps its field names, types and meaning; new fields are appended after
-them:
+record keeps its field names, types and meaning; new fields are added, in the
+places the table shows (`cwd_now` and `cwd_now_deleted` directly after `cwd`;
+`boot_id` and `start_ticks` after `command`; `reachable` last):
 
 | field | meaning |
 |---|---|
 | `id`, `broker_pid`, `child_pid`, `foreground_pgrp`, `started_millis` | as reported by the broker |
 | `journal_bytes`, `journal_epoch`, `attached`, `replay_complete`, `rows`, `columns` | as reported by the broker |
 | `cwd` | the directory the session **started** in; fixed for the life of the session |
-| `cwd_now` | the command's directory **now**, read by the caller from `/proc/CHILD/cwd`; `null` when unavailable |
+| `cwd_now` | the command's directory **now**, read by the caller from `/proc/CHILD/cwd`; `null` when unavailable, or when the directory was removed (never the kernel's `"/path (deleted)"` link text, which is not a path) |
+| `cwd_now_deleted` | `true` when `cwd_now` is `null` because that directory was removed; `false` otherwise |
 | `command` | the command line, truncated to 511 bytes |
 | `boot_id` | this machine's boot id, read by the caller; `null` when unavailable |
 | `start_ticks` | the broker process's start time (`/proc/PID/stat`, field 22), read by the caller; `null` when unavailable |
@@ -170,7 +186,9 @@ them:
 `boot_id` and `start_ticks` identify the broker process exactly; a caller that
 wants a later request to act on this session and no other (a `kill` after a
 `list`) can keep them, or `started_millis`, with the id. `cwd_now`, `boot_id` and
-`start_ticks` describe the machine and `/proc` the *caller* sees.
+`start_ticks` describe the machine and `/proc` the *caller* sees, and `cwd_now`
+is read from the `child_pid` the broker reported: it is trusted exactly as far as
+a same-user broker is.
 
 ### `tui`
 
@@ -214,8 +232,11 @@ but not before its journal, the last thing the pane showed, is kept:
   it is deleted as before, so a failure to archive can never leave a corpse that
   blocks its own ID;
 - the broker bounds `reaped/` itself, so a standalone install never grows
-  without limit: at most 256 MiB and 64 journals (a `.meta` file counts toward
-  the bytes, not the count), oldest evicted first. The process doing the reaping
+  without limit: at most 256 MiB and 64 entries, oldest evicted first. An entry
+  is a journal (its `.meta` counts toward the bytes, not the count) or a `.meta`
+  whose journal is gone, which is counted and evicted like any other so orphans
+  cannot pile up. A journal that is itself larger than the byte bound is not kept
+  - the bound is a bound. The process doing the reaping
   reads `KITTY_PTY_BROKER_REAPED_MAX_BYTES` and `KITTY_PTY_BROKER_REAPED_MAX_FILES`
   to override them. A host that wants to keep journals longer should compress
   and move them out of `reaped/` itself.
@@ -233,6 +254,7 @@ raw terminal output: replay it in a terminal, not on your own.
 | 2 | usage error |
 | 3 | `kill --expect-started`: refused, the id now names a different session; nothing was done |
 | 5 | `kill --expect-started`: the broker predates the check and cannot verify; nothing was done |
+| 6 | `kill`: timed out while still connecting, so the request was never sent; nothing was done |
 
 `run` and `attach` return the pane command's own exit status once it exits
 (`128+N` if it died from signal `N`), and 1 if they could not attach.
@@ -347,7 +369,7 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
   each bounded by a deadline (`KPB_DEFAULT_TIMEOUT_MILLIS`, 2 s; `list`
   1 s overall across all sessions) with `*_timeout` forms taking an explicit
   bound and `kpb_list_with_options` reporting unreachable sessions;
-- `kpb_terminate_expect` (identity-bound terminate), `kpb_check_runtime`, `kpb_session_socket_path`, `kpb_read_cwd_now`,
+- `kpb_terminate_expect` (identity-bound terminate), `kpb_check_runtime`, `kpb_session_socket_path`, `kpb_read_cwd_now` (and `kpb_read_cwd_now_ex`, which says when the directory was removed), `kpb_spawn_timeout`,
   `kpb_read_boot_id`/`kpb_read_start_ticks`, and the reaped archive
   (`kpb_list_reaped`, `kpb_reaped_path`), all additive;
 - read-only observation and resumable replay through `kpb_observe` and

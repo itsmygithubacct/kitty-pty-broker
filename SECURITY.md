@@ -188,7 +188,7 @@ fault, and a viewer must be able to sit on one for hours.
   descriptor keeps failing at once when nothing is waiting.
 - *The sessions lock is not an exception.* Reaping during `list` and the lock a
   spawn takes are acquired non-blocking and retried only until the caller's
-  deadline (`list`'s overall deadline, or 2 s for a spawn), never with a
+  deadline (`list`'s overall deadline, or the spawn's `--timeout`/2 s), never with a
   blocking `flock`. A `list` that cannot take the lock **skips reaping and still
   lists**: the corpse is already absent from the listing (nothing listens), and
   the next listing reaps it. A spawn that cannot take it returns
@@ -201,11 +201,23 @@ fault, and a viewer must be able to sit on one for hours.
   deadline however many are stuck, and a session that did not answer is
   reported as unreachable rather than dropped, so a stuck broker is visible and
   never hides a healthy one.
+- *A spawn waits on the new broker too.* After forking the broker, `kpb_spawn`
+  waits for its "ready" report - the one wait on another process that is not a
+  request to an existing broker - for at least 10 s (longer if `--timeout` is
+  larger), and gives up with `KPB_ERR_TIMEOUT`. Giving up closes the read end of
+  the report pipe; when the late broker then tries to report it fails, and its
+  own failure path kills the command and removes the session, so a timeout means
+  no session was left running. Asserted by test with a broker held (by ptrace) at
+  its first instruction.
 - *What a timeout does not mean.* A request that was sent may still be acted on
   later: a timed-out `kill` is applied when the broker resumes (it is in the
   broker's backlog). The CLI says so (`the broker may still act on the request`)
   and exits non-zero, rather than reporting either success or "nothing
-  happened". A caller that must know has to look again, and can bind the
+  happened". The CLI also says when the request was **never sent**: a deadline
+  that expires while still connecting (the broker is not accepting) is reported
+  as `KPB_ERR_NOT_SENT` / exit 6 and means nothing was or will be done, which is
+  safe to retry; only a timeout after the request left is "may still act". A
+  caller that must know has to look again, and can bind the
   second look to the exact process with `started_millis`, `boot_id` and
   `start_ticks` from the status JSON.
 
