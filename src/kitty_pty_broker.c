@@ -3400,6 +3400,18 @@ kpb_session_socket_path(
 }
 
 kpb_result
+kpb_read_boot_id(char output[64]) {
+    if (!output) return KPB_ERR_INVALID;
+    return current_boot_id(output) == 0 ? KPB_OK : KPB_ERR_NOT_FOUND;
+}
+
+kpb_result
+kpb_read_start_ticks(pid_t pid, uint64_t *ticks) {
+    if (!ticks) return KPB_ERR_INVALID;
+    return process_start_ticks((long)pid, ticks) == 0 ? KPB_OK : KPB_ERR_NOT_FOUND;
+}
+
+kpb_result
 kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
     char path[64];
     ssize_t size;

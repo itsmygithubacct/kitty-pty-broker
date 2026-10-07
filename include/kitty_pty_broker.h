@@ -359,6 +359,15 @@ kpb_result kpb_session_socket_path(
  * adds nothing to the wire. */
 kpb_result kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity);
 
+/* The identity of a broker process, read by the caller from /proc, so a later
+ * request can be bound to the exact session that was seen (a pid or an ID alone
+ * can be reused).  kpb_read_boot_id writes this machine's boot id (at most 63
+ * characters); kpb_read_start_ticks reads field 22 of /proc/PID/stat.  Both
+ * return KPB_ERR_NOT_FOUND where /proc is unavailable or the process is gone.
+ * They describe the machine and /proc the CALLER sees. */
+kpb_result kpb_read_boot_id(char output[64]);
+kpb_result kpb_read_start_ticks(pid_t pid, uint64_t *ticks);
+
 /* Journals of sessions whose broker died uncleanly.  Reaping such a session
  * moves its journal to RUNTIME/reaped/ID.STARTED_MILLIS.journal beside an
  * ID.STARTED_MILLIS.meta file instead of deleting it, and bounds that

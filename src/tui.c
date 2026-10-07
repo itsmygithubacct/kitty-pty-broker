@@ -19,6 +19,7 @@
 
 #define TUI_SESSION_LIMIT 2048U
 #define TUI_MESSAGE_MAX 256U
+#define TUI_DEFAULT_TIMEOUT_MILLIS 1000
 
 #define TUI_RESET "\033[0m"
 #define TUI_TITLE "\033[1;37m"
@@ -28,8 +29,11 @@
 #define TUI_SELECTED "\033[1;37;44m"
 #define TUI_DANGER "\033[1;37;41m"
 
+/* Sessions that did not answer are kept, shown as `unreachable`, so a wedged
+ * broker is visible instead of silently absent.  Each item carries the whole
+ * list entry: `status` is meaningful only while `reachable` is set. */
 typedef struct {
-    kpb_status *items;
+    kpb_list_entry *items;
     size_t count;
     size_t capacity;
     bool truncated;
@@ -66,9 +70,9 @@ handle_tui_stop(int signal_number) {
 }
 
 static int
-collect_session(const kpb_status *status, void *opaque) {
+collect_session(const kpb_list_entry *entry, void *opaque) {
     session_list *list = opaque;
-    kpb_status *resized;
+    kpb_list_entry *resized;
     size_t capacity;
     if (list->count >= TUI_SESSION_LIMIT) {
         list->truncated = true;
@@ -85,28 +89,35 @@ collect_session(const kpb_status *status, void *opaque) {
         list->items = resized;
         list->capacity = capacity;
     }
-    list->items[list->count++] = *status;
+    list->items[list->count++] = *entry;
     return 0;
 }
 
 static int
 compare_sessions(const void *left_opaque, const void *right_opaque) {
-    const kpb_status *left = left_opaque;
-    const kpb_status *right = right_opaque;
-    if (!!left->attached != !!right->attached) {
-        return left->attached ? 1 : -1;
+    const kpb_list_entry *left = left_opaque;
+    const kpb_list_entry *right = right_opaque;
+    if (!!left->reachable != !!right->reachable) {
+        return left->reachable ? -1 : 1;
     }
-    if (left->started_millis < right->started_millis) return 1;
-    if (left->started_millis > right->started_millis) return -1;
+    if (left->reachable) {
+        if (!!left->status.attached != !!right->status.attached) {
+            return left->status.attached ? 1 : -1;
+        }
+        if (left->status.started_millis < right->status.started_millis) return 1;
+        if (left->status.started_millis > right->status.started_millis) return -1;
+    }
     return strcmp(left->session_id, right->session_id);
 }
 
 static kpb_result
 refresh_sessions(
     const char *runtime_dir,
+    int timeout_millis,
     session_list *list,
     size_t *selected
 ) {
+    kpb_list_options options;
     char selected_id[KPB_SESSION_ID_MAX + 1] = "";
     size_t index;
     kpb_result result;
@@ -121,7 +132,8 @@ refresh_sessions(
     list->count = 0;
     list->truncated = false;
     list->allocation_failed = false;
-    result = kpb_list(runtime_dir, collect_session, list);
+    options.timeout_millis = timeout_millis;
+    result = kpb_list_with_options(runtime_dir, &options, collect_session, list);
     if (result != KPB_OK || list->allocation_failed) {
         list->count = 0;
         *selected = 0;
@@ -295,9 +307,36 @@ visible_page_start(size_t selected, size_t count, size_t rows) {
     return start;
 }
 
+/* Seconds for the header: "1s", "0.5s", "2.5s". */
+static void
+format_seconds(int millis, char output[16]) {
+    if (millis % 1000 == 0) snprintf(output, 16, "%ds", millis / 1000);
+    else snprintf(output, 16, "%d.%ds", millis / 1000, (millis % 1000) / 100);
+}
+
+/* Writes UTF-8 text clipped to `width` display cells.  The text is ours, never
+ * session data, so it is not sanitised - but it must not overrun the row, or on
+ * the last line the terminal would scroll the whole screen. */
+static void
+print_clipped(const char *text, unsigned int width) {
+    unsigned int cells = 0;
+    const unsigned char *cursor = (const unsigned char *)text;
+    while (*cursor) {
+        size_t size = 1;
+        if ((*cursor & 0xe0U) == 0xc0U) size = 2;
+        else if ((*cursor & 0xf0U) == 0xe0U) size = 3;
+        else if ((*cursor & 0xf8U) == 0xf0U) size = 4;
+        if (cells >= width) break;
+        fwrite(cursor, 1, size, stdout);
+        cursor += size;
+        cells++;
+    }
+}
+
 static void
 draw_screen(
     const char *runtime_dir,
+    int timeout_millis,
     const session_list *list,
     size_t selected,
     const char *message,
@@ -312,6 +351,7 @@ draw_screen(
     size_t start;
     size_t offset;
     size_t attached = 0;
+    size_t unreachable = 0;
     terminal_size(&rows, &columns);
     fputs(TUI_RESET "\033[H\033[2J", stdout);
 
@@ -335,7 +375,8 @@ draw_screen(
     fputs(TUI_RESET, stdout);
 
     for (offset = 0; offset < list->count; offset++) {
-        if (list->items[offset].attached) attached++;
+        if (!list->items[offset].reachable) unreachable++;
+        else if (list->items[offset].status.attached) attached++;
     }
     move_to(4, 2);
     if (message && *message) {
@@ -345,16 +386,28 @@ draw_screen(
         );
         fputs(TUI_RESET, stdout);
     } else {
-        char sizing[96];
-        int prefix_width = snprintf(
+        char sizing[160];
+        char seconds[16];
+        char unreachable_text[48] = "";
+        int prefix_width;
+        format_seconds(timeout_millis, seconds);
+        if (unreachable) {
+            snprintf(unreachable_text, sizeof unreachable_text, "%zu UNREACHABLE | ", unreachable);
+        }
+        prefix_width = snprintf(
             sizing,
             sizeof sizing,
-            "%zu SESSIONS | %zu ATTACHED | RUNTIME ",
+            "%zu SESSIONS | %zu ATTACHED | %sTIMEOUT %s | RUNTIME ",
             list->count,
-            attached
+            attached,
+            unreachable_text,
+            seconds
         );
         fputs(TUI_MUTED, stdout);
-        printf("%zu SESSIONS · %zu ATTACHED · RUNTIME ", list->count, attached);
+        printf(
+            "%zu SESSIONS · %zu ATTACHED · ", list->count, attached);
+        if (unreachable) printf("%zu UNREACHABLE · ", unreachable);
+        printf("TIMEOUT %s · RUNTIME ", seconds);
         print_sanitized_field(
             runtime_dir,
             prefix_width > 0 && (unsigned int)prefix_width + 2U < columns
@@ -383,13 +436,13 @@ draw_screen(
     id_width = columns / 4U;
     if (id_width < 12U) id_width = 12U;
     if (id_width > 24U) id_width = 24U;
-    command_width = columns - id_width - 32U;
+    command_width = columns - id_width - 34U;
     move_to(5, 2);
     fputs(TUI_TITLE "PTY SESSIONS" TUI_RESET, stdout);
     move_to(7, 2);
     fputs(TUI_MUTED "  ", stdout);
     print_sanitized_field("SESSION", id_width);
-    fputs("  STATE     AGE      SIZE     COMMAND", stdout);
+    fputs("  STATE       AGE      SIZE     COMMAND", stdout);
     fputs(TUI_RESET, stdout);
 
     page_rows = (size_t)rows - 10U;
@@ -403,40 +456,66 @@ draw_screen(
             continue;
         }
         {
-            const kpb_status *status = &list->items[index];
-            char age[16];
-            char size[20];
-            char dimensions[16];
-            format_age(status->started_millis, age);
-            format_bytes(status->journal_bytes, size);
-            snprintf(
-                dimensions, sizeof dimensions, "%ux%u",
-                status->columns, status->rows
-            );
+            const kpb_list_entry *entry = &list->items[index];
+            const kpb_status *status = &entry->status;
+            char age[16] = "-";
+            char dimensions[16] = "-";
+            char reason[48];
+            const char *state;
+            if (entry->reachable) {
+                format_age(status->started_millis, age);
+                snprintf(
+                    dimensions, sizeof dimensions, "%ux%u",
+                    status->columns, status->rows
+                );
+                state = status->attached ? "attached" : "detached";
+            } else {
+                state = "unreachable";
+                snprintf(
+                    reason, sizeof reason, "(%s)",
+                    entry->error == KPB_ERR_TIMEOUT ? "no answer within the timeout"
+                                                    : kpb_result_string(entry->error));
+            }
             if (index == selected) fputs(TUI_SELECTED, stdout);
             fputs(index == selected ? "▶ " : "  ", stdout);
-            print_sanitized_field(status->session_id, id_width);
+            print_sanitized_field(entry->session_id, id_width);
             fputs("  ", stdout);
-            print_sanitized_field(
-                status->attached ? "attached" : "detached", 9
-            );
+            print_sanitized_field(state, 11);
             fputc(' ', stdout);
             print_sanitized_field(age, 8);
             print_sanitized_field(dimensions, 9);
-            print_sanitized_field(status->command, command_width);
+            print_sanitized_field(entry->reachable ? status->command : reason, command_width);
             if (index == selected) fputs(TUI_RESET, stdout);
         }
     }
 
     move_to((unsigned short)(rows - 2U), 2);
-    if (list->count) {
-        const kpb_status *status = &list->items[selected];
-        char journal[20];
-        format_bytes(status->journal_bytes, journal);
-        fputs(TUI_MUTED "cwd     " TUI_RESET, stdout);
-        print_sanitized_field(
-            status->cwd, columns > 9U ? columns - 9U : 0U
+    if (list->count && !list->items[selected].reachable) {
+        fputs(TUI_ALERT "unreachable" TUI_RESET, stdout);
+        move_to((unsigned short)(rows - 1U), 2);
+        fputs(
+            "Not attachable. It may be stopped or wedged; x asks it to end.",
+            stdout
         );
+    } else if (list->count) {
+        const kpb_status *status = &list->items[selected].status;
+        char journal[20];
+        char cwd_now[KPB_PATH_MAX];
+        format_bytes(status->journal_bytes, journal);
+        /* `started in` is where the session began; `now` is read from /proc and
+         * is where its command is at the moment. */
+        if (kpb_read_cwd_now(status->child_pid, cwd_now, sizeof cwd_now) != KPB_OK ||
+            strcmp(cwd_now, status->cwd) == 0) {
+            fputs(TUI_MUTED "cwd     " TUI_RESET, stdout);
+            print_sanitized_field(
+                status->cwd, columns > 9U ? columns - 9U : 0U
+            );
+        } else {
+            fputs(TUI_MUTED "cwd now " TUI_RESET, stdout);
+            print_sanitized_field(
+                cwd_now, columns > 9U ? columns - 9U : 0U
+            );
+        }
         move_to((unsigned short)(rows - 1U), 2);
         printf(
             TUI_MUTED "pid     " TUI_RESET
@@ -474,12 +553,14 @@ draw_screen(
         print_sanitized_field(prompt, line_width);
         fputs(TUI_RESET, stdout);
     } else {
-        fputs(
-            TUI_MUTED
-            " Enter attach · x end · ↑/↓ move · r refresh · q quit"
-            TUI_RESET,
-            stdout
-        );
+        /* The full line is 65 cells; the narrowest supported terminal is 56.
+         * Writing past the last column on the bottom row would scroll the
+         * screen, so a short form is used when the long one does not fit. */
+        const char *full = " Enter attach · o observe · x end · ↑/↓ move · r refresh · q quit";
+        const char *brief = " Enter attach · o observe · x end · q quit";
+        fputs(TUI_MUTED, stdout);
+        print_clipped(columns >= 67U ? full : brief, columns > 1U ? columns - 1U : 0U);
+        fputs(TUI_RESET, stdout);
     }
     fflush(stdout);
 }
@@ -538,9 +619,18 @@ read_input(unsigned char *input, size_t capacity) {
     return count;
 }
 
+/* What a refresh failure should say.  "session not found" is the library's word
+ * for a missing session, and here it would mean the runtime itself vanished. */
+static const char *
+refresh_failure(kpb_result result) {
+    if (result == KPB_ERR_NOT_FOUND) return "the runtime directory is gone";
+    return kpb_result_string(result);
+}
+
 int
 kpb_tui_run(
     const char *runtime_dir,
+    int timeout_millis,
     char session_id[KPB_SESSION_ID_MAX + 1]
 ) {
     session_list list = {0};
@@ -557,13 +647,14 @@ kpb_tui_run(
         errno = EINVAL;
         return KPB_TUI_ERROR;
     }
+    if (timeout_millis <= 0) timeout_millis = TUI_DEFAULT_TIMEOUT_MILLIS;
     session_id[0] = '\0';
-    broker_result = refresh_sessions(runtime_dir, &list, &selected);
+    broker_result = refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
     if (broker_result != KPB_OK) {
         fprintf(
             stderr,
             "kitty-pty-broker: list sessions: %s\n",
-            kpb_result_string(broker_result)
+            refresh_failure(broker_result)
         );
         free(list.items);
         return KPB_TUI_ERROR;
@@ -598,7 +689,7 @@ kpb_tui_run(
         }
         if (redraw) {
             draw_screen(
-                runtime_dir, &list, selected, message, confirmation_id
+                runtime_dir, timeout_millis, &list, selected, message, confirmation_id
             );
             redraw = false;
         }
@@ -610,13 +701,13 @@ kpb_tui_run(
             break;
         }
         if (polled == 0) {
-            broker_result = refresh_sessions(runtime_dir, &list, &selected);
+            broker_result = refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
             if (broker_result != KPB_OK) {
                 snprintf(
                     message,
                     sizeof message,
                     "Refresh failed: %s",
-                    kpb_result_string(broker_result)
+                    refresh_failure(broker_result)
                 );
             }
             redraw = true;
@@ -644,12 +735,20 @@ kpb_tui_run(
                     sizeof terminated
                 );
                 terminated[sizeof terminated - 1U] = '\0';
-                broker_result = kpb_terminate(runtime_dir, terminated);
+                broker_result = kpb_terminate_timeout(
+                    runtime_dir, terminated, timeout_millis);
                 if (broker_result == KPB_OK) {
                     snprintf(
                         message,
                         sizeof message,
                         "Termination requested for %.64s.",
+                        terminated
+                    );
+                } else if (broker_result == KPB_ERR_TIMEOUT) {
+                    snprintf(
+                        message,
+                        sizeof message,
+                        "%.64s did not answer; it may still act on the request.",
                         terminated
                     );
                 } else {
@@ -661,7 +760,7 @@ kpb_tui_run(
                         kpb_result_string(broker_result)
                     );
                 }
-                (void)refresh_sessions(runtime_dir, &list, &selected);
+                (void)refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
                 confirming = false;
                 confirmation_id[0] = '\0';
             } else if (
@@ -693,7 +792,7 @@ kpb_tui_run(
             if (list.count) selected = list.count - 1U;
             redraw = true;
         } else if (input[0] == 'r' || input[0] == 'R') {
-            broker_result = refresh_sessions(runtime_dir, &list, &selected);
+            broker_result = refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
             if (broker_result == KPB_OK) {
                 snprintf(message, sizeof message, "Session list refreshed.");
             } else {
@@ -701,7 +800,7 @@ kpb_tui_run(
                     message,
                     sizeof message,
                     "Refresh failed: %s",
-                    kpb_result_string(broker_result)
+                    refresh_failure(broker_result)
                 );
             }
             redraw = true;
@@ -718,26 +817,44 @@ kpb_tui_run(
                 snprintf(message, sizeof message, "There is no session to terminate.");
             }
             redraw = true;
-        } else if (input[0] == '\r' || input[0] == '\n') {
+        } else if (
+            input[0] == '\r' || input[0] == '\n' ||
+            input[0] == 'o' || input[0] == 'O'
+        ) {
+            bool observing = input[0] == 'o' || input[0] == 'O';
             if (!list.count) {
-                snprintf(message, sizeof message, "There is no session to attach.");
+                snprintf(
+                    message, sizeof message,
+                    observing ? "There is no session to observe."
+                              : "There is no session to attach."
+                );
                 redraw = true;
-            } else if (list.items[selected].attached) {
+            } else if (!list.items[selected].reachable) {
                 snprintf(
                     message,
                     sizeof message,
-                    "%.64s is already attached.",
+                    "%.64s is unreachable and cannot be %s.",
+                    list.items[selected].session_id,
+                    observing ? "observed" : "attached"
+                );
+                redraw = true;
+            } else if (!observing && list.items[selected].status.attached) {
+                snprintf(
+                    message,
+                    sizeof message,
+                    "%.64s is already attached; o observes it read-only.",
                     list.items[selected].session_id
                 );
                 redraw = true;
             } else {
+                /* Observing is read-only and allowed for an attached pane. */
                 memcpy(
                     session_id,
                     list.items[selected].session_id,
                     KPB_SESSION_ID_MAX + 1U
                 );
                 session_id[KPB_SESSION_ID_MAX] = '\0';
-                result = KPB_TUI_ATTACH;
+                result = observing ? KPB_TUI_OBSERVE : KPB_TUI_ATTACH;
                 break;
             }
         }

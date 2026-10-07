@@ -3496,6 +3496,144 @@ test_archiving_failures_still_reap_the_session(void) {
     remove_tree(scratch);
 }
 
+
+static void
+cli_path_beside_test(char *cli_path, size_t capacity) {
+    const char *slash = strrchr(test_program_path, '/');
+    size_t directory_size;
+    CHECK(slash != NULL);
+    directory_size = (size_t)(slash - test_program_path);
+    CHECK(directory_size + sizeof "/kitty-pty-broker" < capacity);
+    memcpy(cli_path, test_program_path, directory_size);
+    memcpy(cli_path + directory_size, "/kitty-pty-broker", sizeof "/kitty-pty-broker");
+}
+
+/* `o` watches a pane read-only - including one that is already attached, which
+ * Enter refuses - and Ctrl-] returns to the list rather than ending the TUI.
+ * Keys typed while watching must not reach the pane. */
+static void
+test_tui_observes_an_attached_pane_and_returns(void) {
+    char *command[] = {
+        "/bin/sh", "-c", "printf OBSERVED_TEXT; stty -echo; cat > /dev/null", NULL};
+    char cli_path[KPB_PATH_MAX];
+    kpb_spawn_options options;
+    kpb_status status;
+    kpb_connection client;
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    unsigned char after[65536];
+    size_t used = 0;
+    size_t later = 0;
+    int master;
+    int wait_status;
+    pid_t child;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "tui-observe";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(attach_v2("tui-observe", &client, NULL, 0, 0, 0) == KPB_OK);
+    {
+        unsigned char seen[4096];
+        size_t seen_size = 0;
+        while (!memmem(seen, seen_size, "OBSERVED_TEXT", 13)) {
+            kpb_event event;
+            wait_readable(client.fd);
+            CHECK(kpb_receive(&client, seen + seen_size, sizeof seen - seen_size, &event) == KPB_OK);
+            if (event.type == KPB_EVENT_OUTPUT) seen_size += event.size;
+            CHECK(seen_size < sizeof seen);
+        }
+    }
+    CHECK(kpb_query_status(runtime_dir, "tui-observe", &status) == KPB_OK);
+    CHECK(status.attached);
+
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(cli_path, cli_path, "--runtime-dir", runtime_dir, "--timeout", "1.5",
+              "tui", (char *)NULL);
+        _exit(127);
+    }
+    used = read_pty_until(master, output, used, sizeof output, "tui-observe");
+    used = read_pty_until(master, output, used, sizeof output, "attached");
+    /* The key help names observe, and the header names the runtime and bound. */
+    used = read_pty_until(master, output, used, sizeof output, "o observe");
+    used = read_pty_until(master, output, used, sizeof output, "TIMEOUT 1.5s");
+    used = read_pty_until(master, output, used, sizeof output, runtime_dir);
+
+    /* Enter on an attached pane is refused and says to observe instead. */
+    CHECK(write(master, "\r", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "already attached");
+
+    CHECK(write(master, "o", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "OBSERVED_TEXT");
+    /* `x` would end the session if it reached the TUI's key handling, and
+     * anything typed here must never reach the pane. */
+    CHECK(write(master, "xyz\r", 4) == 4);
+    usleep(200000);
+    CHECK(kpb_query_status(runtime_dir, "tui-observe", &status) == KPB_OK);
+    CHECK(status.attached);
+    CHECK(write(master, "\x1d", 1) == 1);
+    while (later == 0 || !memmem(after, later, "PTY SESSIONS", 12)) {
+        ssize_t count;
+        wait_readable(master);
+        count = read(master, after + later, sizeof after - later);
+        CHECK(count > 0);
+        later += (size_t)count;
+        CHECK(later < sizeof after);
+    }
+    /* Back at the list, the attached client is still attached and the session
+     * still runs. */
+    CHECK(kpb_query_status(runtime_dir, "tui-observe", &status) == KPB_OK);
+    CHECK(status.attached);
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+    close(master);
+    kpb_detach(&client);
+    terminate_and_reap("tui-observe");
+}
+
+/* A broker that does not answer is shown, not hidden, and cannot be attached
+ * or observed from the list. */
+static void
+test_tui_shows_an_unreachable_session(void) {
+    char cli_path[KPB_PATH_MAX];
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    size_t used = 0;
+    int master;
+    int wait_status;
+    pid_t child;
+    pid_t broker;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    broker = spawn_sleeper("tui-wedged");
+    CHECK(kill(broker, SIGSTOP) == 0);
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(cli_path, cli_path, "--runtime-dir", runtime_dir, "--timeout", "0.3",
+              "tui", (char *)NULL);
+        _exit(127);
+    }
+    used = read_pty_until(master, output, used, sizeof output, "tui-wedged");
+    used = read_pty_until(master, output, used, sizeof output, "unreachable");
+    used = read_pty_until(master, output, used, sizeof output, "1 UNREACHABLE");
+    CHECK(write(master, "\r", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "cannot be attached");
+    CHECK(write(master, "o", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "cannot be observed");
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+    close(master);
+    resume_and_end(broker, "tui-wedged");
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -3586,6 +3724,8 @@ main(int argc, char **argv) {
     RUN(test_reaping_archives_the_journal_instead_of_deleting_it);
     RUN(test_the_reaped_archive_is_bounded_oldest_first);
     RUN(test_archiving_failures_still_reap_the_session);
+    RUN(test_tui_observes_an_attached_pane_and_returns);
+    RUN(test_tui_shows_an_unreachable_session);
     {
         char sessions[4096];
         snprintf(sessions, sizeof sessions, "%s/sessions", runtime_dir);

@@ -20,6 +20,13 @@
 static volatile sig_atomic_t resize_pending;
 static volatile sig_atomic_t stop_pending;
 
+/* --timeout, in milliseconds; 0 selects each operation's own default (2 s,
+ * and 1 s for list and tui). */
+static int timeout_millis;
+
+#define TIMEOUT_MIN_MILLIS 100
+#define TIMEOUT_MAX_MILLIS 60000
+
 static void
 handle_resize(int signal_number) {
     (void)signal_number;
@@ -75,6 +82,8 @@ parse_storage_limit(const char *text, uint64_t *value) {
         *value <= INT64_MAX ? 0 : -1;
 }
 
+static void report_socket_path_too_long(const char *runtime_dir, const char *session_id);
+
 /* `options` NULL keeps the plain version-1 attach that every existing caller
  * uses, which is also what makes this safe against a broker left running by a
  * previous build. */
@@ -112,21 +121,25 @@ bridge(
             request.xpixel = size.ws_xpixel;
             request.ypixel = size.ws_ypixel;
         }
-        result = kpb_attach_with_options(
-            runtime_dir, session_id, &request, &connection, &attached);
+        result = kpb_attach_with_options_timeout(
+            runtime_dir, session_id, &request, &connection, &attached, timeout_millis);
         if (result == KPB_OK && attached.version >= 2) {
             track_cursor = true;
             cursor_epoch = attached.journal_epoch;
             cursor_offset = attached.journal_offset;
         }
     } else {
-        result = kpb_attach(
+        result = kpb_attach_timeout(
             runtime_dir, session_id,
             size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel,
-            &connection
+            &connection, timeout_millis
         );
     }
     if (result != KPB_OK) {
+        if (result == KPB_ERR_NAME_TOO_LONG) {
+            report_socket_path_too_long(runtime_dir, session_id);
+            return 1;
+        }
         fprintf(stderr, "kitty-pty-broker: attach %s: %s", session_id, kpb_result_string(result));
         if (result == KPB_ERR_SYSTEM) fprintf(stderr, ": %s", strerror(errno));
         fputc('\n', stderr);
@@ -295,8 +308,17 @@ json_string(const char *value) {
     putchar('"');
 }
 
+/* Every status object - `status --json` and each `list --json` item - carries
+ * the session's own record (its fields keep their names, types and meaning)
+ * followed by fields the caller reads client-side: cwd_now, boot_id and
+ * start_ticks (null when unavailable).  `reachable` is added only under
+ * `list --all`. */
+typedef struct {
+    bool reachable;
+} json_shape;
+
 static void
-print_status_json(const kpb_status *status) {
+print_status_json(const kpb_status *status, json_shape shape) {
     fputs("{\"id\":", stdout);
     json_string(status->session_id);
     printf(
@@ -316,30 +338,95 @@ print_status_json(const kpb_status *status) {
         status->columns
     );
     json_string(status->cwd);
+    {
+        char now[KPB_PATH_MAX];
+        fputs(",\"cwd_now\":", stdout);
+        if (kpb_read_cwd_now(status->child_pid, now, sizeof now) == KPB_OK) json_string(now);
+        else fputs("null", stdout);
+    }
     fputs(",\"command\":", stdout);
     json_string(status->command);
+    {
+        char boot[64];
+        uint64_t ticks;
+        fputs(",\"boot_id\":", stdout);
+        if (kpb_read_boot_id(boot) == KPB_OK) json_string(boot);
+        else fputs("null", stdout);
+        fputs(",\"start_ticks\":", stdout);
+        if (kpb_read_start_ticks(status->broker_pid, &ticks) == KPB_OK) {
+            printf("%llu", (unsigned long long)ticks);
+        } else {
+            fputs("null", stdout);
+        }
+    }
+    if (shape.reachable) fputs(",\"reachable\":true", stdout);
     putchar('}');
+}
+
+/* A short, stable word for why a session could not be reached: what `list`
+ * prints after the id and what `list --all --json` carries in "error". */
+static const char *
+reason_token(kpb_result result) {
+    switch (result) {
+        case KPB_ERR_TIMEOUT: return "timeout";
+        case KPB_ERR_SECURITY: return "security";
+        case KPB_ERR_PROTOCOL: return "protocol";
+        case KPB_ERR_SYSTEM: return "system";
+        case KPB_ERR_NAME_TOO_LONG: return "name-too-long";
+        case KPB_ERR_INVALID: return "invalid";
+        default: return "error";
+    }
 }
 
 typedef struct {
     bool json;
+    bool all;
     bool first;
 } list_context;
 
+static void
+print_list_text(const kpb_status *status) {
+    printf(
+        "%s\t%s\tpid=%ld\t%s\n",
+        status->session_id,
+        status->attached ? "attached" : "detached",
+        (long)status->child_pid,
+        status->command
+    );
+}
+
 static int
-print_list_item(const kpb_status *status, void *opaque) {
+print_list_entry(const kpb_list_entry *entry, void *opaque) {
     list_context *context = opaque;
+    if (!entry->reachable) {
+        /* Always said on stderr, so a caller that only reads stdout and exits
+         * 0 on success (the engine, the launcher) still gets the warning in its
+         * logs; --all additionally puts the session in the listing. */
+        fprintf(
+            stderr, "kitty-pty-broker: list: %s: %s\n",
+            entry->session_id, reason_token(entry->error));
+        if (!context->all) return 0;
+        if (context->json) {
+            if (!context->first) putchar(',');
+            fputs("{\"id\":", stdout);
+            json_string(entry->session_id);
+            fputs(",\"reachable\":false,\"error\":", stdout);
+            json_string(reason_token(entry->error));
+            putchar('}');
+        } else {
+            printf(
+                "%s\tunreachable\tpid=-\terror=%s\n",
+                entry->session_id, reason_token(entry->error));
+        }
+        context->first = false;
+        return 0;
+    }
     if (context->json) {
+        json_shape shape = {.reachable = context->all};
         if (!context->first) putchar(',');
-        print_status_json(status);
+        print_status_json(&entry->status, shape);
     } else {
-        printf(
-            "%s\t%s\tpid=%ld\t%s\n",
-            status->session_id,
-            status->attached ? "attached" : "detached",
-            (long)status->child_pid,
-            status->command
-        );
+        print_list_text(&entry->status);
     }
     context->first = false;
     return 0;
@@ -357,21 +444,219 @@ report_result(const char *operation, kpb_result result) {
 }
 
 static void
+report_socket_path_too_long(const char *runtime_dir, const char *session_id) {
+    char path[KPB_PATH_MAX + KPB_SESSION_ID_MAX + 32];
+    (void)kpb_session_socket_path(runtime_dir, session_id, path, sizeof path);
+    fprintf(
+        stderr, "kitty-pty-broker: socket path too long (%zu bytes, limit %d): %s\n",
+        strlen(path[0] ? path : runtime_dir), KPB_SOCKET_PATH_LIMIT,
+        path[0] ? path : runtime_dir);
+}
+
+/* The failures every command that takes a runtime shares.  Checked up front so
+ * a typo'd --runtime-dir says so, instead of looking like "no sessions" or
+ * "session not found". */
+static int
+require_runtime(const char *runtime_dir) {
+    kpb_result result = kpb_check_runtime(runtime_dir);
+    if (result == KPB_OK) return 0;
+    if (result == KPB_ERR_NOT_FOUND) {
+        fprintf(
+            stderr,
+            "kitty-pty-broker: runtime directory does not exist: %s "
+            "(set KITTY_PTY_BROKER_RUNTIME or pass --runtime-dir)\n",
+            runtime_dir);
+    } else if (result == KPB_ERR_SECURITY) {
+        fprintf(
+            stderr,
+            "kitty-pty-broker: runtime directory is not safe to use (it must be a real "
+            "directory owned by you, not a symlink): %s\n",
+            runtime_dir);
+    } else {
+        fprintf(
+            stderr, "kitty-pty-broker: runtime directory %s: %s\n",
+            runtime_dir, kpb_result_string(result));
+    }
+    return 1;
+}
+
+/* Operations on one session: the same message for every command. */
+static int
+report_session_result(
+    const char *operation,
+    const char *runtime_dir,
+    const char *session_id,
+    kpb_result result
+) {
+    if (result == KPB_OK) return 0;
+    if (result == KPB_ERR_NAME_TOO_LONG) {
+        report_socket_path_too_long(runtime_dir, session_id);
+        return 1;
+    }
+    return report_result(operation, result);
+}
+
+/* Decimal seconds, 0.1 to 60: digits with at most one point, nothing else.
+ * strtod alone would also take leading space, signs, exponents, "inf" and
+ * "nan", none of which a unit of seconds should quietly accept. */
+static int
+parse_timeout(const char *text, int *millis) {
+    size_t index;
+    size_t digits = 0;
+    bool point = false;
+    double seconds;
+    char *end = NULL;
+    if (!text || !*text) return -1;
+    for (index = 0; text[index]; index++) {
+        if (text[index] >= '0' && text[index] <= '9') {
+            digits++;
+        } else if (text[index] == '.' && !point) {
+            point = true;
+        } else {
+            return -1;
+        }
+    }
+    if (digits == 0 || digits > 12) return -1;
+    seconds = strtod(text, &end);
+    if (!end || *end != '\0') return -1;
+    if (seconds < TIMEOUT_MIN_MILLIS / 1000.0 - 1e-9 || seconds > TIMEOUT_MAX_MILLIS / 1000.0 + 1e-9) {
+        return -1;
+    }
+    *millis = (int)(seconds * 1000.0 + 0.5);
+    if (*millis < TIMEOUT_MIN_MILLIS) *millis = TIMEOUT_MIN_MILLIS;
+    if (*millis > TIMEOUT_MAX_MILLIS) *millis = TIMEOUT_MAX_MILLIS;
+    return 0;
+}
+
+static void
 usage(FILE *stream) {
     fputs(
+        "kitty-pty-broker: keep a terminal pane alive without its frontend\n"
+        "\n"
         "usage:\n"
-        "  kitty-pty-broker [--runtime-dir DIR] run [--id ID] [--journal-limit BYTES]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] run [--id ID] [--journal-limit BYTES]\n"
         "                   [--transcript PATH] [--transcript-limit BYTES]\n"
         "                   [--transcript-graphics elide|keep] -- COMMAND [ARG...]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] attach ID [--resume EPOCH:OFFSET]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] observe ID [--from EPOCH:OFFSET]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] list [--json]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] status ID [--json]\n"
-        "  kitty-pty-broker [--runtime-dir DIR] kill ID\n"
-        "  kitty-pty-broker [--runtime-dir DIR] tui\n"
-        "  kitty-pty-broker version\n",
+        "  kitty-pty-broker [GLOBAL OPTIONS] attach ID [--resume EPOCH:OFFSET]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] observe ID [--from EPOCH:OFFSET]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] list [--json] [--all]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] status ID [--json]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] kill ID\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] reaped [--json]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] reaped path ID\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] tui\n"
+        "  kitty-pty-broker version\n"
+        "  kitty-pty-broker help | -h | --help\n"
+        "\n"
+        "commands:\n"
+        "  run       start a session running COMMAND and attach this terminal to it\n"
+        "  attach    attach read-write (one client at a time); --resume continues from a cursor\n"
+        "  observe   attach read-only; keys are not forwarded, Ctrl-] leaves\n"
+        "  list      one line per reachable session; --json for a JSON array;\n"
+        "            --all also lists sessions that did not answer, as unreachable\n"
+        "  status    one session's record; JSON also has cwd_now (the command's directory now;\n"
+        "            cwd is where it started), boot_id and start_ticks (null if unavailable)\n"
+        "  kill      ask a session to end (SIGTERM, then SIGKILL after a grace period)\n"
+        "  reaped    journals kept from sessions whose broker died; `reaped path ID` prints\n"
+        "            the newest journal for ID\n"
+        "  tui       interactive session manager (Enter attach, o observe, x end, q quit)\n"
+        "\n"
+        "global options (before the command, in either order):\n"
+        "  --runtime-dir DIR   the runtime directory, an absolute path. Default: the absolute\n"
+        "                      $KITTY_PTY_BROKER_RUNTIME if set, else\n"
+        "                      $XDG_RUNTIME_DIR/kitty-pty-broker, else\n"
+        "                      /tmp/kitty-pty-broker-UID\n"
+        "  --timeout SECONDS   bound on each wait for a broker, in decimal SECONDS from 0.1 to\n"
+        "                      60 (default 2; list and tui default to 1). A session that does\n"
+        "                      not answer in time is unreachable; list asks all sessions at\n"
+        "                      once, so the bound is shared, not per session\n"
+        "\n"
+        "exit status: 0 success; 1 failure (including a missing or unsafe runtime directory);\n"
+        "2 usage error. run and attach exit with the pane command's status once it exits.\n",
         stream
     );
+}
+
+static bool
+is_help_flag(const char *argument) {
+    return strcmp(argument, "-h") == 0 || strcmp(argument, "--help") == 0;
+}
+
+typedef struct {
+    bool json;
+} reaped_context;
+
+static int
+print_reaped_entry(const kpb_reaped_entry *entry, void *opaque) {
+    static bool first = true;
+    reaped_context *context = opaque;
+    if (context->json) {
+        if (!first) putchar(',');
+        fputs("{\"id\":", stdout);
+        json_string(entry->session_id);
+        printf(
+            ",\"started_millis\":%llu,\"reaped_millis\":",
+            (unsigned long long)entry->started_millis);
+        if (entry->reaped_millis) printf("%llu", (unsigned long long)entry->reaped_millis);
+        else fputs("null", stdout);
+        printf(",\"journal_bytes\":%llu,\"journal\":", (unsigned long long)entry->journal_bytes);
+        json_string(entry->journal_path);
+        fputs(",\"meta\":", stdout);
+        if (entry->meta_path[0]) json_string(entry->meta_path);
+        else fputs("null", stdout);
+        putchar('}');
+    } else {
+        printf(
+            "%s\tstarted=%llu\tbytes=%llu\t%s\n",
+            entry->session_id,
+            (unsigned long long)entry->started_millis,
+            (unsigned long long)entry->journal_bytes,
+            entry->journal_path);
+    }
+    first = false;
+    return 0;
+}
+
+/* Parse the global options that precede the command.  Returns 0 to continue,
+ * or an exit code (help is 0 and `done` is set). */
+static int
+parse_global_options(
+    int argc,
+    char **argv,
+    int *index,
+    const char **runtime_dir,
+    bool *done
+) {
+    *done = false;
+    while (*index < argc) {
+        const char *argument = argv[*index];
+        if (is_help_flag(argument)) {
+            usage(stdout);
+            *done = true;
+            return 0;
+        }
+        if (strcmp(argument, "--runtime-dir") == 0) {
+            if (*index + 1 >= argc) {
+                usage(stderr);
+                *done = true;
+                return 2;
+            }
+            *runtime_dir = argv[*index + 1];
+            *index += 2;
+        } else if (strcmp(argument, "--timeout") == 0) {
+            if (*index + 1 >= argc || parse_timeout(argv[*index + 1], &timeout_millis) != 0) {
+                fprintf(
+                    stderr,
+                    "kitty-pty-broker: --timeout takes SECONDS, a decimal from 0.1 to 60\n");
+                *done = true;
+                return 2;
+            }
+            *index += 2;
+        } else {
+            break;
+        }
+    }
+    return 0;
 }
 
 int
@@ -380,26 +665,36 @@ main(int argc, char **argv) {
     const char *runtime_dir = NULL;
     const char *command;
     int index = 1;
-    if (index < argc && strcmp(argv[index], "--runtime-dir") == 0) {
-        if (index + 1 >= argc) {
-            usage(stderr);
-            return 2;
-        }
-        runtime_dir = argv[index + 1];
-        index += 2;
-    }
+    bool done;
+    int code = parse_global_options(argc, argv, &index, &runtime_dir, &done);
+    if (done) return code;
     if (!runtime_dir) runtime_dir = default_runtime(runtime_buffer);
     if (!runtime_dir || index >= argc) {
         usage(stderr);
         return 2;
     }
     command = argv[index++];
+    if (strcmp(command, "help") == 0) {
+        usage(stdout);
+        return 0;
+    }
     if (strcmp(command, "version") == 0) {
         printf(
             "%d.%d.%d protocol=%d protocol-max=%d\n",
             KPB_VERSION_MAJOR, KPB_VERSION_MINOR, KPB_VERSION_PATCH,
             kpb_protocol_version(), kpb_protocol_version_max());
         return 0;
+    }
+    /* `COMMAND --help` is help, not a usage error.  Arguments after `--` belong
+     * to the command being run and are never inspected. */
+    {
+        int scan;
+        for (scan = index; scan < argc && strcmp(argv[scan], "--") != 0; scan++) {
+            if (is_help_flag(argv[scan])) {
+                usage(stdout);
+                return 0;
+            }
+        }
     }
     if (strcmp(command, "run") == 0) {
         kpb_spawn_options options;
@@ -474,7 +769,7 @@ main(int argc, char **argv) {
         options.xpixel = size.ws_xpixel;
         options.ypixel = size.ws_ypixel;
         result = kpb_spawn(&options, &status);
-        if (result != KPB_OK) return report_result("start session", result);
+        if (result != KPB_OK) return report_session_result("start session", runtime_dir, id, result);
         return bridge(runtime_dir, id, NULL);
     }
     if (strcmp(command, "observe") == 0) {
@@ -502,6 +797,7 @@ main(int argc, char **argv) {
                 usage(stderr);
                 return 2;
             }
+            if (require_runtime(runtime_dir) != 0) return 1;
             return bridge(runtime_dir, session_id, &options);
         }
     }
@@ -514,7 +810,10 @@ main(int argc, char **argv) {
         session_id = argv[index++];
         /* Plain `attach ID` still emits a version-1 attach, so the shipped
          * path is unchanged and works against any broker. */
-        if (index == argc) return bridge(runtime_dir, session_id, NULL);
+        if (index == argc) {
+            if (require_runtime(runtime_dir) != 0) return 1;
+            return bridge(runtime_dir, session_id, NULL);
+        }
         {
             kpb_attach_options options;
             kpb_attach_options_init(&options);
@@ -527,6 +826,7 @@ main(int argc, char **argv) {
                 return 2;
             }
             options.resume = 1;
+            if (require_runtime(runtime_dir) != 0) return 1;
             return bridge(runtime_dir, session_id, &options);
         }
     }
@@ -537,13 +837,32 @@ main(int argc, char **argv) {
             usage(stderr);
             return 2;
         }
-        tui_result = kpb_tui_run(runtime_dir, session_id);
-        if (tui_result == KPB_TUI_ATTACH) {
-            resize_pending = 0;
-            stop_pending = 0;
-            return bridge(runtime_dir, session_id, NULL);
+        if (require_runtime(runtime_dir) != 0) return 1;
+        for (;;) {
+            tui_result = kpb_tui_run(runtime_dir, timeout_millis, session_id);
+            if (tui_result == KPB_TUI_ATTACH) {
+                resize_pending = 0;
+                stop_pending = 0;
+                return bridge(runtime_dir, session_id, NULL);
+            }
+            if (tui_result == KPB_TUI_OBSERVE) {
+                kpb_attach_options options;
+                kpb_attach_options_init(&options);
+                options.mode = KPB_ATTACH_OBSERVE;
+                resize_pending = 0;
+                stop_pending = 0;
+                /* Watched on the alternate screen so leaving it with Ctrl-]
+                 * puts the list back exactly as it was, with nothing from the
+                 * pane left in the scrollback. */
+                fputs("\033[?1049h\033[2J\033[H", stdout);
+                fflush(stdout);
+                (void)bridge(runtime_dir, session_id, &options);
+                fputs("\033[?1049l", stdout);
+                fflush(stdout);
+                continue;
+            }
+            return tui_result == KPB_TUI_QUIT ? 0 : 1;
         }
-        return tui_result == KPB_TUI_QUIT ? 0 : 1;
     }
     if (strcmp(command, "kill") == 0) {
         kpb_result result;
@@ -551,8 +870,16 @@ main(int argc, char **argv) {
             usage(stderr);
             return 2;
         }
-        result = kpb_terminate(runtime_dir, argv[index]);
-        return report_result("kill session", result);
+        if (require_runtime(runtime_dir) != 0) return 1;
+        result = kpb_terminate_timeout(runtime_dir, argv[index], timeout_millis);
+        if (result == KPB_ERR_TIMEOUT) {
+            fprintf(
+                stderr,
+                "kitty-pty-broker: kill session: timed out; "
+                "the broker may still act on the request\n");
+            return 1;
+        }
+        return report_session_result("kill session", runtime_dir, argv[index], result);
     }
     if (strcmp(command, "status") == 0) {
         kpb_status status;
@@ -572,20 +899,63 @@ main(int argc, char **argv) {
             usage(stderr);
             return 2;
         }
-        result = kpb_query_status(runtime_dir, session_id, &status);
-        if (result != KPB_OK) return report_result("query session", result);
+        if (require_runtime(runtime_dir) != 0) return 1;
+        result = kpb_query_status_timeout(runtime_dir, session_id, &status, timeout_millis);
+        if (result != KPB_OK) {
+            return report_session_result("query session", runtime_dir, session_id, result);
+        }
         if (json) {
-            print_status_json(&status);
+            json_shape shape = {.reachable = false};
+            print_status_json(&status, shape);
             putchar('\n');
         } else {
-            list_context context = {.json = false, .first = true};
-            print_list_item(&status, &context);
+            print_list_text(&status);
         }
         return 0;
     }
     if (strcmp(command, "list") == 0) {
-        list_context context = {.json = false, .first = true};
+        list_context context = {.json = false, .all = false, .first = true};
+        kpb_list_options options;
         kpb_result result;
+        while (index < argc) {
+            if (strcmp(argv[index], "--json") == 0) {
+                context.json = true;
+            } else if (strcmp(argv[index], "--all") == 0) {
+                context.all = true;
+            } else {
+                usage(stderr);
+                return 2;
+            }
+            index++;
+        }
+        if (require_runtime(runtime_dir) != 0) return 1;
+        options.timeout_millis = timeout_millis;
+        if (context.json) putchar('[');
+        result = kpb_list_with_options(runtime_dir, &options, print_list_entry, &context);
+        if (context.json) puts("]");
+        return report_result("list sessions", result);
+    }
+    if (strcmp(command, "reaped") == 0) {
+        reaped_context context = {.json = false};
+        kpb_result result;
+        if (index < argc && strcmp(argv[index], "path") == 0) {
+            char path[KPB_PATH_MAX];
+            if (index + 2 != argc) {
+                usage(stderr);
+                return 2;
+            }
+            if (require_runtime(runtime_dir) != 0) return 1;
+            result = kpb_reaped_path(runtime_dir, argv[index + 1], path, sizeof path);
+            if (result == KPB_ERR_NOT_FOUND) {
+                fprintf(
+                    stderr, "kitty-pty-broker: reaped: no archived journal for %s\n",
+                    argv[index + 1]);
+                return 1;
+            }
+            if (result != KPB_OK) return report_result("reaped path", result);
+            puts(path);
+            return 0;
+        }
         if (index < argc && strcmp(argv[index], "--json") == 0) {
             context.json = true;
             index++;
@@ -594,10 +964,11 @@ main(int argc, char **argv) {
             usage(stderr);
             return 2;
         }
+        if (require_runtime(runtime_dir) != 0) return 1;
         if (context.json) putchar('[');
-        result = kpb_list(runtime_dir, print_list_item, &context);
+        result = kpb_list_reaped(runtime_dir, print_reaped_entry, &context);
         if (context.json) puts("]");
-        return report_result("list sessions", result);
+        return report_result("list reaped journals", result);
     }
     usage(stderr);
     return 2;
