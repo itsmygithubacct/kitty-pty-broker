@@ -3819,6 +3819,9 @@ test_spawn_does_not_wait_forever_for_the_sessions_lock(void) {
 /* Set before a call to make the stand-in close the connection right after its
  * lead bytes instead of holding it open; cleared by the call. */
 static bool fake_broker_closes;
+/* Likewise: accept, wait for the client's request to arrive, then close WITHOUT
+ * reading it, which resets the client's connection instead of ending it cleanly. */
+static bool fake_broker_resets;
 
 static pid_t
 fake_broker(
@@ -3838,7 +3841,9 @@ fake_broker(
     pid_t child;
     char byte;
     bool closes = fake_broker_closes;
+    bool resets = fake_broker_resets;
     fake_broker_closes = false;
+    fake_broker_resets = false;
     make_fake_session(runtime, session_id, NULL, NULL, directory);
     CHECK(snprintf(socket_path, sizeof socket_path, "%s/control.sock", directory)
           < (int)sizeof socket_path);
@@ -3860,6 +3865,11 @@ fake_broker(
         if (write(ready[1], "x", 1) != 1) _exit(1);
         fd = accept(listener, NULL, NULL);
         if (fd < 0) _exit(1);
+        if (resets) {
+            usleep(300000);   /* the request is now unread in our queue */
+            close(fd);        /* closing with unread data resets the peer */
+            for (;;) pause();
+        }
         /* The client's first frame, whatever it is: a header and its payload. */
         {
             kpb_frame_header header;
@@ -5793,6 +5803,22 @@ test_a_connection_that_ends_without_a_reply_is_nothing_listening(void) {
     CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
     CHECK(tally.healthy == 0 && tally.unreachable == 0);   /* not reported ... */
     CHECK(!exists(directory));                             /* ... and reaped, in ONE listing */
+    end_child(server);
+
+    /* Closes with the request unread: the client sees a RESET, not an end of file.
+     * The same meaning: nothing is listening. */
+    fake_broker_resets = true;
+    server = fake_broker(scratch, "reset", NULL, 0, NULL, 0, 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/reset", scratch) < (int)sizeof directory);
+    CHECK(snprintf(metadata, sizeof metadata,
+        "version=1\nid=reset\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\n",
+        (long)dead_pid()) < (int)sizeof metadata);
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    write_text_file(path, metadata);
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    CHECK(tally.healthy == 0 && tally.unreachable == 0);
+    CHECK(!exists(directory));
     end_child(server);
 
     /* Says part of a reply, then closes: a failure, reported, directory kept. */
