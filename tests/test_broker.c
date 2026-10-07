@@ -6100,7 +6100,6 @@ test_a_fifo_carrying_a_complete_record_is_still_no_proof(void) {
     char scratch[64];
     char directory[KPB_PATH_MAX];
     char path[KPB_PATH_MAX];
-    char text[512];
     int writer;
     int seen = 0;
     int round;
@@ -6113,14 +6112,26 @@ test_a_fifo_carrying_a_complete_record_is_still_no_proof(void) {
     writer = open(path, O_RDWR | O_NONBLOCK);
     CHECK(writer >= 0);
     {
+        /* A FIFO is consumed by reading, and a decision reads the file twice (the
+         * proof, then the removal), so the writer leaves the same 89-byte record
+         * forty times: each 2047-byte read then ends on a record boundary and is a
+         * complete, valid, stale record of its own. */
         char boot[64];
+        char record[160];
+        size_t length;
+        int copy;
         read_current_boot_id(boot);
-        CHECK(snprintf(
-            text, sizeof text,
-            "version=1\nid=pipe-proof\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\n"
-            "boot_id=%s\nstart_ticks=1\n", (long)dead_pid(), boot) < (int)sizeof text);
+        length = (size_t)snprintf(
+            record, sizeof record, "broker_pid=2147483646\nboot_id=%s\nstart_ticks=1\n", boot);
+        CHECK(length < 89);
+        length += (size_t)snprintf(record + length, sizeof record - length, "pad=");
+        while (length < 88) record[length++] = 'a';
+        record[length++] = '\n';
+        CHECK(length == 89);
+        for (copy = 0; copy < 40; copy++) {
+            CHECK(write(writer, record, length) == (ssize_t)length);
+        }
     }
-    CHECK(write(writer, text, strlen(text)) == (ssize_t)strlen(text));
     alarm(20);
     for (round = 0; round < 3; round++) {
         CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
