@@ -127,6 +127,7 @@ bridge(
     bool have_termios = false;
     bool replay_done = false;
     bool stdin_hung_up = false;
+    bool stdin_hup_seen = false;
     bool track_cursor = false;
     uint64_t cursor_epoch = 0;
     uint64_t cursor_offset = 0;
@@ -205,6 +206,7 @@ bridge(
     while (!stop_pending) {
         struct pollfd descriptors[2];
         int count;
+        bool stdin_watched;
         /* ppoll unblocks the signals only while it waits, and returns without
          * delivering one that is already pending if a descriptor is ready at
          * the same moment.  With a descriptor ready every time round - a
@@ -230,8 +232,9 @@ bridge(
         /* A hung-up stdin (a pipe whose writer is gone) is reported by poll
          * whether or not it is being watched, and never clears: left in the set
          * it makes ppoll return at once, forever. */
-        descriptors[1].fd = stdin_hung_up ? -1 : STDIN_FILENO;
+        descriptors[1].fd = (stdin_hung_up || (stdin_hup_seen && !replay_done)) ? -1 : STDIN_FILENO;
         descriptors[1].events = replay_done ? POLLIN : 0;
+        stdin_watched = replay_done;
         descriptors[1].revents = 0;
         count = ppoll(descriptors, 2, NULL, &original);
         if (count < 0) {
@@ -247,10 +250,12 @@ bridge(
                 if (descriptors[0].revents & POLLIN) {
                     exit_code = 1;
                     if (result == KPB_ERR_TIMEOUT) {
+                        /* observe continues with --from, attach with --resume. */
                         snprintf(
                             reason, sizeof reason,
                             "the broker stopped in the middle of a frame (timed out); "
-                            "reattach with --resume %llu:%llu to continue",
+                            "reattach with %s %llu:%llu to continue",
+                            observing ? "--from" : "--resume",
                             (unsigned long long)cursor_epoch,
                             (unsigned long long)cursor_offset);
                         if (!track_cursor) {
@@ -307,12 +312,18 @@ bridge(
         }
         if (descriptors[1].revents & (POLLHUP | POLLERR | POLLNVAL) &&
             !(descriptors[1].revents & POLLIN)) {
-            /* stdin is gone.  Before the replay is done it cannot be acted on,
-             * so remember it and stop polling it; afterwards it means the same
-             * as end of file below. */
-            stdin_hung_up = true;
+            /* stdin has hung up, and what that means depends on whether it was
+             * being watched for input when ppoll ran.  Poll masks POLLIN on a
+             * descriptor that was not asked about it, so a pipe whose writer
+             * already closed reports POLLHUP alone while data it was sent is
+             * still unread.  Seen while NOT watched (the replay is not done),
+             * that only means "stop polling it for now": the data is read once
+             * the replay is done.  Only a hang-up seen while watched - POLLIN
+             * was requested and there is nothing to read - is end of file. */
+            if (stdin_watched) stdin_hung_up = true;
+            else stdin_hup_seen = true;
         }
-        if (stdin_hung_up && replay_done) break;
+        if (stdin_hung_up) break;
         if (descriptors[1].revents & POLLIN) {
             ssize_t received = read(STDIN_FILENO, buffer, sizeof buffer);
             if (observing) {
@@ -866,8 +877,9 @@ main(int argc, char **argv) {
         if (result == KPB_ERR_TIMEOUT) {
             fprintf(
                 stderr,
-                "kitty-pty-broker: start session: timed out waiting for the sessions lock or "
-                "for the new broker; no session was started\n");
+                "kitty-pty-broker: start session: timed out: the sessions lock stayed busy, "
+                "or the new broker did not answer in time; if it is only slow it removes the "
+                "session itself\n");
             return 1;
         }
         if (result != KPB_OK) return report_session_result("start session", runtime_dir, id, result);

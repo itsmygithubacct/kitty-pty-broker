@@ -285,6 +285,28 @@ while [ "$attempt" -lt 40 ] && kill -0 "$attach_pid" 2>/dev/null; do attempt=$((
 kill -KILL "$attach_pid" 2>/dev/null; wait "$attach_pid" 2>/dev/null
 kpb --runtime-dir "$rt" kill flood >/dev/null 2>&1; kpb --runtime-dir "$rt" kill eofsess >/dev/null 2>&1
 
+# F-N1: input piped into `attach` must be delivered even when the writer has
+# already closed the pipe by the time the replay finishes.  A pipe with a closed
+# writer reports POLLHUP only - POLLIN is masked while it is not being asked for -
+# so a hang-up seen BEFORE the replay is done must not end the loop; only one seen
+# while stdin was being watched is end of file.
+piped_input_check() { # piped_input_check LABEL WRITER_COMMAND ATTACH_ARGS...
+    label=$1; writer=$2; shift 2
+    out="$scratch/piped-$label"
+    : > "$out"
+    start "piped$label" sh -c "head -n 1 > '$out'; sleep 300" >/dev/null
+    # shellcheck disable=SC2086
+    eval "$writer" | timeout 6 env -i PATH="$PATH" "$cli" --runtime-dir "$rt" attach "piped$label" "$@" >/dev/null 2>&1
+    sleep 0.4
+    [ "$(cat "$out")" = "hello-$label" ]
+    check "piped input is delivered ($label)" $?
+    kpb --runtime-dir "$rt" kill "piped$label" >/dev/null 2>&1
+}
+piped_input_check immediate "printf 'hello-immediate\n'"
+piped_input_check delayed "( printf 'hello-delayed\n'; sleep 1 )"
+piped_input_check resume-immediate "printf 'hello-resume-immediate\n'" --resume 0:0
+piped_input_check resume-delayed "( printf 'hello-resume-delayed\n'; sleep 1 )" --resume 0:0
+
 # A process holding the sessions lock (here: stopped while holding it) must not
 # hang `list`: reaping is skipped when the lock cannot be taken in time.
 if command -v flock >/dev/null 2>&1; then
