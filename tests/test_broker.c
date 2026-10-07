@@ -5959,7 +5959,6 @@ test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes(void) {
     char scratch[64];
     size_t which;
     size_t how;
-    int seen = 0;
 
     make_scratch_runtime(scratch, sizeof scratch);
     CHECK(chmod(scratch, 0700) == 0);
@@ -5999,7 +5998,17 @@ test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes(void) {
 
             /* The cleanup fails, repeatedly, and the proof is still there. */
             for (round = 0; round < 3; round++) {
-                CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+                /* ... and it is VISIBLE while it fails: exactly one row, for this
+                 * session, unreachable, with the reason `system` - a failed cleanup
+                 * must not make a proven corpse silently disappear from the listing. */
+                list_tally tally;
+                kpb_list_options listing = {.timeout_millis = 1000};
+                memset(&tally, 0, sizeof tally);
+                CHECK(kpb_list_with_options(scratch, &listing, tally_entry, &tally) == KPB_OK);
+                CHECK(tally.healthy == 0);
+                CHECK(tally.unreachable == 1);
+                CHECK(tally_has(tally.unreachable_ids, tally.unreachable, id));
+                CHECK(tally.last_error == (int)KPB_ERR_SYSTEM);
                 CHECK(exists(directory));
                 CHECK(snprintf(path, sizeof path, "%s/%s", directory,
                                provisional_proof[how] ? "metadata.provisional" : "metadata")
@@ -6009,7 +6018,14 @@ test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes(void) {
             /* Once the obstruction is gone ONE listing finishes the job. */
             CHECK(snprintf(path, sizeof path, "%s/%s", directory, obstructed[which]) < (int)sizeof path);
             CHECK(rmdir(path) == 0);
-            CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+            {
+                /* The listing that finishes the job shows no row: the corpse is gone. */
+                list_tally tally;
+                kpb_list_options listing = {.timeout_millis = 1000};
+                memset(&tally, 0, sizeof tally);
+                CHECK(kpb_list_with_options(scratch, &listing, tally_entry, &tally) == KPB_OK);
+                CHECK(tally.healthy == 0 && tally.unreachable == 0);
+            }
             CHECK(!exists(directory));
             kpb_spawn_options_init(&options);
             options.runtime_dir = scratch;
