@@ -59,6 +59,11 @@ typedef struct {
     char socket_path[KPB_PATH_MAX];
     char journal_path[KPB_PATH_MAX];
     char metadata_path[KPB_PATH_MAX];
+    /* The two temporary names a session directory can hold: the broker's own
+     * (written, fsynced, renamed over metadata) and the spawning caller's (written,
+     * linked to metadata).  Known exactly, so cleanup can remove exactly these. */
+    char metadata_tmp_path[KPB_PATH_MAX];
+    char provisional_path[KPB_PATH_MAX];
 } session_paths;
 
 /* A bounded queue of encoded frames awaiting a non-blocking socket.
@@ -293,7 +298,9 @@ build_paths(const char *runtime_dir, const char *session_id, session_paths *path
     if (join_path(paths->session_dir, sizeof paths->session_dir, paths->sessions_dir, session_id) != 0 ||
         join_path(paths->socket_path, sizeof paths->socket_path, paths->session_dir, "control.sock") != 0 ||
         join_path(paths->journal_path, sizeof paths->journal_path, paths->session_dir, "journal.bin") != 0 ||
-        join_path(paths->metadata_path, sizeof paths->metadata_path, paths->session_dir, "metadata") != 0) {
+        join_path(paths->metadata_path, sizeof paths->metadata_path, paths->session_dir, "metadata") != 0 ||
+        join_path(paths->metadata_tmp_path, sizeof paths->metadata_tmp_path, paths->session_dir, "metadata.tmp") != 0 ||
+        join_path(paths->provisional_path, sizeof paths->provisional_path, paths->session_dir, "metadata.provisional") != 0) {
         return KPB_ERR_NAME_TOO_LONG;
     }
     if (strlen(paths->socket_path) > KPB_SOCKET_PATH_LIMIT) return KPB_ERR_NAME_TOO_LONG;
@@ -791,7 +798,7 @@ write_metadata(server_state *server) {
     int fd;
     int count;
     int more;
-    if (snprintf(temporary, sizeof temporary, "%s.tmp", server->paths.metadata_path) >= (int)sizeof temporary) {
+    if (copy_string(temporary, sizeof temporary, server->paths.metadata_tmp_path) != 0) {
         errno = ENAMETOOLONG;
         return -1;
     }
@@ -2255,6 +2262,56 @@ server_loop(server_state *server) {
     return wait_status_to_exit_code(child_status);
 }
 
+/* The only names a session directory is ever supposed to hold. */
+static bool
+known_session_entry(const char *name) {
+    return strcmp(name, "metadata") == 0 || strcmp(name, "metadata.tmp") == 0 ||
+           strcmp(name, "metadata.provisional") == 0 || strcmp(name, "journal.bin") == 0 ||
+           strcmp(name, "control.sock") == 0;
+}
+
+/* True when the directory holds nothing but those names (or does not exist). */
+static bool
+session_dir_holds_only_known_entries(const session_paths *paths) {
+    struct dirent *entry;
+    DIR *directory = opendir(paths->session_dir);
+    bool only = true;
+    if (!directory) return errno == ENOENT;
+    while ((entry = readdir(directory))) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (!known_session_entry(entry->d_name)) {
+            only = false;
+            break;
+        }
+    }
+    closedir(directory);
+    return only;
+}
+
+/* Remove a session directory's own files and the directory, in an order that
+ * never throws away the proof that it is stale before the directory is really
+ * gone.
+ *
+ * The temporaries go first and EXACTLY by name - the broker's metadata.tmp and
+ * the caller's metadata.provisional - then the socket and journal.  The canonical
+ * metadata, the proof a later listing needs if this is interrupted or fails,
+ * goes LAST, immediately before rmdir, and only if nothing else is in the
+ * directory: an unknown entry means the directory is not ours to remove, so the
+ * metadata stays and the directory is left exactly as it is.  (Removing it
+ * first, as before, left a directory that rmdir then refused to delete and that
+ * no later listing could prove stale: its ID was blocked for good.)  No globbing:
+ * nothing but the five known names is ever unlinked. */
+static void
+remove_session_files(const session_paths *paths) {
+    (void)unlink(paths->metadata_tmp_path);
+    (void)unlink(paths->provisional_path);
+    (void)unlink(paths->socket_path);
+    (void)unlink(paths->journal_path);
+    if (!session_dir_holds_only_known_entries(paths)) return;
+    (void)unlink(paths->metadata_path);
+    (void)rmdir(paths->session_dir);
+}
+
 static void
 cleanup_server(server_state *server) {
     observers_close_all(server);
@@ -2265,10 +2322,7 @@ cleanup_server(server_state *server) {
     if (server->journal_fd >= 0) close(server->journal_fd);
     if (server->transcript_fd >= 0) close(server->transcript_fd);
     free(server->input_buffer);
-    unlink(server->paths.socket_path);
-    unlink(server->paths.journal_path);
-    unlink(server->paths.metadata_path);
-    rmdir(server->paths.session_dir);
+    remove_session_files(&server->paths);
 }
 
 static int
@@ -2556,6 +2610,25 @@ parse_metadata(const char *data, metadata_info *info) {
     return info->pid > 0;
 }
 
+/* The session's identity record: the broker's metadata, or - when that is not
+ * there - the spawning caller's provisional copy.  The fallback exists for the
+ * directory whose broker never got as far as writing its own (it wedged, then
+ * died) and whose caller was killed before linking the provisional file into
+ * place: without it, nothing in that directory proves anything and its ID is
+ * blocked forever.  It is accepted only when COMPLETE - it ends in a newline, so
+ * a write cut short cannot be read as a different, shorter pid - and it belongs
+ * to this directory's generation because the caller can only create it in the
+ * directory it itself made (see write_provisional_metadata). */
+static ssize_t
+read_session_metadata(const session_paths *paths, char *buffer, size_t capacity) {
+    ssize_t size = read_small_file(paths->metadata_path, buffer, capacity);
+    if (size > 0) return size;
+    if (size < 0 && errno != ENOENT) return -1;
+    size = read_small_file(paths->provisional_path, buffer, capacity);
+    if (size > 0 && buffer[size - 1] == '\n') return size;
+    return -1;
+}
+
 /* The metadata file's consumer: decide whether a session directory is a
  * corpse.  The broker cannot clean up after SIGKILL or the OOM killer, and a
  * directory it leaves behind would otherwise be permanent - invisible to
@@ -2582,7 +2655,7 @@ session_is_stale(const session_paths *paths) {
     metadata_info info;
     char current[64];
     uint64_t ticks;
-    ssize_t size = read_small_file(paths->metadata_path, data, sizeof data);
+    ssize_t size = read_session_metadata(paths, data, sizeof data);
     if (size <= 0) return false;
     if (!parse_metadata(data, &info)) return false;
     if (kill((pid_t)info.pid, 0) != 0 && errno == ESRCH) return true;
@@ -2799,7 +2872,7 @@ archive_journal(const session_paths *paths) {
         journal.st_uid != geteuid() || journal.st_size <= 0) {
         return;
     }
-    size = read_small_file(paths->metadata_path, data, sizeof data);
+    size = read_session_metadata(paths, data, sizeof data);
     if (size < 0) size = 0;
     if (size > 0 && parse_metadata(data, &info) && info.have_started) {
         started = info.started_millis;
@@ -2845,11 +2918,11 @@ archive_journal(const session_paths *paths) {
  * sessions-directory lock across both the proof and this removal. */
 static void
 reap_stale_session(const session_paths *paths) {
+    /* An unknown entry means this is not a directory we made, whatever its
+     * metadata says: leave it entirely alone (nothing archived, nothing removed). */
+    if (!session_dir_holds_only_known_entries(paths)) return;
     archive_journal(paths);
-    (void)unlink(paths->socket_path);
-    (void)unlink(paths->journal_path);
-    (void)unlink(paths->metadata_path);
-    (void)rmdir(paths->session_dir);
+    remove_session_files(paths);
 }
 
 /* Serialise reaping against session creation.  The staleness proof and the
@@ -2904,20 +2977,16 @@ lock_sessions_dir_until(const session_paths *paths, const struct timespec *deadl
  * rename replaces this one.  Best-effort: failing to write it only means the old,
  * more conservative behaviour. */
 static void
-write_provisional_metadata(const session_paths *paths, pid_t broker_pid) {
-    char temporary[KPB_PATH_MAX];
+write_provisional_metadata(int directory_fd, const char *session_id, pid_t broker_pid) {
     char data[1024];
     char boot_id[64];
     uint64_t ticks;
     int count;
     int fd;
-    if (snprintf(temporary, sizeof temporary, "%s.provisional", paths->metadata_path) >= (int)sizeof temporary) {
-        return;
-    }
     count = snprintf(
         data, sizeof data,
         "version=%u\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=%llu\n",
-        KPB_PROTOCOL_VERSION, paths->session_id, (long)broker_pid,
+        KPB_PROTOCOL_VERSION, session_id, (long)broker_pid,
         (unsigned long long)realtime_millis());
     if (count < 0 || (size_t)count >= sizeof data) return;
     if (current_boot_id(boot_id) == 0) {
@@ -2929,17 +2998,29 @@ write_provisional_metadata(const session_paths *paths, pid_t broker_pid) {
             data + count, sizeof data - (size_t)count, "start_ticks=%llu\n", (unsigned long long)ticks);
         if (more > 0 && (size_t)more < sizeof data - (size_t)count) count += more;
     }
-    fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    /* Every operation is relative to `directory_fd`, the directory THIS call
+     * created, not to the session ID's path.  By the time a delayed caller gets
+     * here its broker may be long gone and the ID may belong to a newer
+     * generation; a path would then land in that newer directory and publish a
+     * dead broker's identity there, and a listing would reap a live session.  An
+     * unlinked directory refuses new entries (ENOENT), so a caller whose
+     * directory has been removed publishes nothing at all.  (Comparing
+     * device/inode against the path would add nothing the descriptor does not
+     * already guarantee: it names the directory itself, not whatever the path
+     * resolves to now.) */
+    fd = openat(
+        directory_fd, "metadata.provisional",
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return;
     if (write_all_fd(fd, data, (size_t)count) < 0) {
         close(fd);
-        (void)unlink(temporary);
+        (void)unlinkat(directory_fd, "metadata.provisional", 0);
         return;
     }
     close(fd);
     /* EEXIST (the broker's own file is already there) is the expected loss. */
-    if (link(temporary, paths->metadata_path) != 0) errno = 0;
-    (void)unlink(temporary);
+    if (linkat(directory_fd, "metadata.provisional", directory_fd, "metadata", 0) != 0) errno = 0;
+    (void)unlinkat(directory_fd, "metadata.provisional", 0);
 }
 
 kpb_result
@@ -2954,6 +3035,7 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
     char generated[KPB_SESSION_ID_MAX + 1];
     const char *session_id;
     int ready_pipe[2];
+    int session_fd = -1;
     pid_t pid;
     server_ready ready;
     kpb_result result;
@@ -3024,10 +3106,22 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
             close(lock_fd);
             return taken ? KPB_ERR_EXISTS : KPB_ERR_SYSTEM;
         }
+        /* Pin the directory just created, while the lock still stops anyone
+         * replacing it: everything this call later does to it is relative to
+         * this descriptor, never to the ID's path. */
+        session_fd = open(paths.session_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (session_fd < 0) {
+            int saved = errno;
+            (void)rmdir(paths.session_dir);
+            close(lock_fd);
+            errno = saved;
+            return KPB_ERR_SYSTEM;
+        }
         close(lock_fd);
     }
     if (pipe2(ready_pipe, O_CLOEXEC) != 0) {
         rmdir(paths.session_dir);
+        close(session_fd);
         return KPB_ERR_SYSTEM;
     }
     pid = fork();
@@ -3035,6 +3129,7 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
         int saved = errno;
         close(ready_pipe[0]);
         close(ready_pipe[1]);
+        close(session_fd);
         rmdir(paths.session_dir);
         errno = saved;
         return KPB_ERR_SYSTEM;
@@ -3042,11 +3137,13 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
     if (pid == 0) {
         int code;
         close(ready_pipe[0]);
+        close(session_fd);
         code = server_main(options, session_id, ready_pipe[1]);
         _exit(code);
     }
     close(ready_pipe[1]);
-    write_provisional_metadata(&paths, pid);
+    write_provisional_metadata(session_fd, session_id, pid);
+    close(session_fd);
     /* Bounded: the new broker is another process, and a start that wedges
      * (a filesystem that stops answering, a stopped process) must not hang the
      * caller.  When this gives up the read end closes; a broker that is merely
