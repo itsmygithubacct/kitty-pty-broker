@@ -2672,10 +2672,14 @@ spawn_sleeper(const char *session_id) {
     return status.broker_pid;
 }
 
+/* A request that timed out against a stopped broker is still queued in its
+ * backlog, so the broker may already be shutting down when it resumes: do not
+ * insist that this terminate be the one that is answered. */
 static void
 resume_and_end(pid_t broker, const char *session_id) {
     (void)kill(broker, SIGCONT);
-    terminate_and_reap(session_id);
+    (void)kpb_terminate(runtime_dir, session_id);
+    wait_for_session_end(session_id);
 }
 
 /* The finding: SIGSTOP one broker and `list`, `status` and `kill` hung, and the
