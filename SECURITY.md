@@ -346,9 +346,20 @@ licenses it is argued here.
   (an `EIO`, a directory sitting where `metadata.tmp` belongs, an entry nobody
   wrote) stops there with the proof and the directory intact, the listing shows the
   session as unreachable, and a later listing finishes once the obstruction is
-  gone. The honest limit: the last two steps are two syscalls, and a process killed
-  between them leaves an empty directory with no record in it; nothing can close
-  that, because an empty directory is also what a spawn in flight looks like.
+  gone. "Intact" means the proof is retained; unlinks made before the failure may
+  already have happened. Three limits remain, stated plainly:
+  1. The final proof unlink and `rmdir` are two syscalls. A process killed, or an
+     `EIO`, between them leaves an empty directory with no record in it. It blocks
+     that ID until someone removes it by hand; nothing can close that, because an
+     empty directory is also what a spawn in flight looks like.
+  2. The "nothing but the proof" scan is not atomic with the unlink. An unknown
+     entry created after the last scan has the same effect: `rmdir` fails and the
+     directory stays until removed by hand.
+  3. The reaper carries a PATH, not a pinned identity, from the stale check to the
+     unlink. If the proof file is replaced outside the sessions lock in that
+     window, the replacement is deleted on the earlier evidence. This is safe only
+     under the documented assumption that writers of the runtime directory
+     cooperate.
 - *The provisional proof is the whole record.* When the canonical metadata is
   absent the caller's provisional file is accepted only if it is newline-terminated
   AND carries the pid, the boot id and the start time; a file that merely parses as

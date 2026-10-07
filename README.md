@@ -141,10 +141,16 @@ caller keeps a descriptor of the session directory it made (opened under the
 sessions lock) and publishes through it, never through the ID's path, so a caller
 that is delayed past its broker's end - and past a respawn of the same ID - cannot
 put its dead broker's identity into the newer session's directory. When a broker or
-the reaper removes a session directory it removes exactly the known files
-(`metadata.tmp`, `metadata.provisional`, `control.sock`, `journal.bin`) and the
-canonical `metadata` last, only if nothing else is in the directory; an unknown
-entry leaves the directory entirely alone.
+the reaper removes a session directory it touches only the known names
+(`metadata.tmp`, `metadata.provisional`, `control.sock`, `journal.bin`, `metadata`).
+The file that licensed the cleanup - the canonical `metadata`, or, when that is
+absent, the provisional copy - is kept until last: every other known name is
+unlinked first (each result checked), the directory must then hold nothing but that
+proof, and only then are the proof and the directory removed. On any failure or
+unknown entry the cleanup stops. "Directory left intact" means the proof is
+retained, so a later listing can finish the job; unlinks that came before the
+failure may already have happened. The listing shows such a session as unreachable
+(reason `system`) until then.
 
 When `attach` or `observe` ends for any reason other than the pane's own exit
 (the broker closed the connection, stopped in the middle of a frame, refused, the
