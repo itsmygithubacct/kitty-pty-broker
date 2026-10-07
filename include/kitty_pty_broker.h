@@ -39,6 +39,10 @@ extern "C" {
 /* The overall deadline of a whole list, shared by every session it queries. */
 #define KPB_DEFAULT_LIST_TIMEOUT_MILLIS 1000
 
+/* Once any byte of a frame has arrived, kpb_receive requires the rest within
+ * this, the same budget the broker gives an attached client's frames. */
+#define KPB_FRAME_TIMEOUT_MILLIS 2000
+
 /* The longest socket path a Unix domain socket can bind, excluding the NUL. */
 #define KPB_SOCKET_PATH_LIMIT 107
 
@@ -281,7 +285,14 @@ kpb_result kpb_resize(
  * event it would have delivered (0 for types that carry no payload).  Skipped
  * output is journal content, so a protocol-2 caller that keeps a cursor (see
  * kpb_attach_result) can recover the bytes by reattaching with resume from
- * that cursor, which the failed call does not advance. */
+ * that cursor, which the failed call does not advance.
+ *
+ * Waiting for a frame to BEGIN is unbounded - this is the live stream, and a
+ * quiet pane is not a fault - but once any byte of a frame has arrived the rest
+ * of it must follow within KPB_FRAME_TIMEOUT_MILLIS.  If it does not, the call
+ * returns KPB_ERR_TIMEOUT; the stream is then out of step and the connection
+ * should be dropped (reattach with resume to continue).  A non-blocking
+ * descriptor still fails at once when no data is waiting. */
 kpb_result kpb_receive(
     kpb_connection *connection,
     void *buffer,

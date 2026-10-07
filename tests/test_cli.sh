@@ -222,5 +222,31 @@ err=$(kpb --runtime-dir "$rt" reaped path nobody 2>&1 >/dev/null); status=$?
 check "reaped path for an unknown id fails" $?
 [ "$(stat -c %a "$rt/reaped")" = 700 ] && [ "$(stat -c %a "$journal")" = 600 ]; check "reaped/ is 0700 and journals 0600" $?
 
+# A process holding the sessions lock (here: stopped while holding it) must not
+# hang `list`: reaping is skipped when the lock cannot be taken in time.
+if command -v flock >/dev/null 2>&1; then
+    lockrt=$scratch/lockrt
+    mkdir -p "$lockrt/sessions/dead" && chmod 700 "$lockrt" "$lockrt/sessions"
+    printf 'version=1\nid=dead\nbroker_pid=%s\nchild_pid=1\nstarted_millis=1\n' 2147483000 > "$lockrt/sessions/dead/metadata"
+    # flock(1) runs `sleep` as its child, and it is the child that keeps the
+    # descriptor - and so the lock - open; both are stopped and both recorded.
+    flock "$lockrt/sessions" sleep 30 &
+    holder=$!
+    sleep 0.3
+    holder_child=$(pgrep -P "$holder")
+    printf '%s\n%s\n' "$holder" "$holder_child" >> "$pidfile"
+    kill -STOP "$holder" $holder_child 2>/dev/null
+    t0=$(now_ms)
+    timeout 5 env -i PATH="$PATH" "$cli" --runtime-dir "$lockrt" --timeout 0.2 list >/dev/null 2>&1; status=$?
+    elapsed=$(( $(now_ms) - t0 ))
+    [ "$status" -eq 0 ] && [ "$elapsed" -lt 2000 ] && [ -d "$lockrt/sessions/dead" ]
+    check "list does not wait for a held sessions lock, and skips reaping ($elapsed ms, exit $status)" $?
+    kill -CONT "$holder" $holder_child 2>/dev/null; kill -KILL "$holder" $holder_child 2>/dev/null; wait "$holder" 2>/dev/null
+    kpb --runtime-dir "$lockrt" list >/dev/null 2>&1
+    [ ! -d "$lockrt/sessions/dead" ]; check "once the lock is free the corpse is reaped" $?
+else
+    printf 'skip  sessions-lock test (flock(1) not available)\n'
+fi
+
 [ "$fail_count" -eq 0 ] || { printf '%s CLI check(s) failed\n' "$fail_count" >&2; exit 1; }
 printf 'kitty-pty-broker CLI behaviour tests passed\n'

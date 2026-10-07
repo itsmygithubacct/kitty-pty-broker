@@ -470,17 +470,6 @@ receive_frame_bounded(
     return KPB_OK;
 }
 
-static kpb_result
-receive_frame(
-    int fd,
-    uint16_t *type,
-    void *payload,
-    size_t capacity,
-    uint32_t *payload_size
-) {
-    return receive_frame_bounded(fd, type, payload, capacity, payload_size, NULL);
-}
-
 static bool peer_is_owner(int fd);
 
 /* Connect under `deadline`.  The socket is non-blocking only for the connect:
@@ -2817,17 +2806,36 @@ reap_stale_session(const session_paths *paths) {
  * the directory, and the second - still holding its ESRCH proof from the old
  * metadata - unlinks the fresh socket and journal by path.  An exclusive
  * lock on the sessions directory makes proof, removal, and recreation one
- * step; every holder releases it within microseconds. */
+ * step.
+ *
+ * The lock is taken NON-blocking and retried until `deadline`, never with a
+ * blocking flock.  Holders are expected to release it within microseconds, but
+ * "expected" is not a bound: a holder that is stopped, or stuck on a slow
+ * filesystem, would otherwise hang every caller that needs the lock, and with
+ * it `list` and the TUI refresh.  One attempt is always made, even when the
+ * deadline has already passed, so an uncontended lock costs nothing.  Returns
+ * the locked descriptor, or -1 (errno EWOULDBLOCK when it timed out). */
 static int
-lock_sessions_dir(const session_paths *paths) {
+lock_sessions_dir_until(const session_paths *paths, const struct timespec *deadline) {
     int fd = open(paths->sessions_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) return -1;
-    while (flock(fd, LOCK_EX) != 0) {
-        if (errno == EINTR) continue;
-        close(fd);
-        return -1;
+    for (;;) {
+        long remaining;
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) return fd;
+        if (errno != EWOULDBLOCK && errno != EINTR) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        remaining = millis_until(deadline);
+        if (remaining <= 0) {
+            close(fd);
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+        (void)poll(NULL, 0, remaining < 5 ? (int)remaining : 5);
     }
-    return fd;
 }
 
 kpb_result
@@ -2873,8 +2881,13 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
         /* Everything from the staleness proof to mkdir happens under the
          * sessions-directory lock: a concurrent respawn or list walk could
          * otherwise reap the directory this call has just recreated. */
-        int lock_fd = lock_sessions_dir(&paths);
-        if (lock_fd < 0) return KPB_ERR_SYSTEM;
+        struct timespec lock_deadline;
+        int lock_fd;
+        deadline_in(&lock_deadline, KPB_DEFAULT_TIMEOUT_MILLIS);
+        lock_fd = lock_sessions_dir_until(&paths, &lock_deadline);
+        /* Bounded like every other wait: a holder that is stopped is reported,
+         * and nothing has been created yet. */
+        if (lock_fd < 0) return errno == EWOULDBLOCK ? KPB_ERR_TIMEOUT : KPB_ERR_SYSTEM;
         if (lstat(paths.session_dir, &existing) == 0) {
             /* A leftover directory whose broker is provably gone must not
              * block this ID forever: a stable `run --id` pane could otherwise
@@ -2959,7 +2972,6 @@ kpb_attach_timeout(
 ) {
     kpb_wire_winsize size;
     struct timespec deadline;
-    struct pollfd waiting;
     int fd;
     kpb_result result;
     if (!connection) return KPB_ERR_INVALID;
@@ -2979,29 +2991,53 @@ kpb_attach_timeout(
     }
     /* A version-1 attach has no reply frame, so "the broker took it" can only
      * be seen as the broker's first frame: the replay (at least REPLAY_DONE) or
-     * a refusal, both of which a live broker sends at once.  Waiting for it to
-     * become readable consumes nothing, and is what keeps a stopped broker -
-     * which accepts into its backlog and then says nothing - from looking like
-     * a successful attach. */
-    waiting.fd = fd;
-    waiting.events = POLLIN;
+     * a refusal, both of which a live broker sends at once.  The wait is for
+     * that frame to be COMPLETE, not for its first byte: a peer that sends one
+     * byte and stops would otherwise pass this check and hang the caller in
+     * its first read.  The frame is only peeked - the caller reads it - so
+     * nothing is consumed.  A first frame too large to peek (over one I/O
+     * chunk) is waited for through its header only; the rest is read under
+     * kpb_receive's own bound. */
     for (;;) {
+        unsigned char peeked[sizeof(kpb_frame_header) + KPB_IO_CHUNK];
         long remaining = millis_until(&deadline);
-        int ready;
+        ssize_t count;
         if (remaining <= 0) {
             close(fd);
             return KPB_ERR_TIMEOUT;
         }
-        waiting.revents = 0;
-        ready = poll(&waiting, 1, (int)remaining);
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0) {
+        count = recv(fd, peeked, sizeof peeked, MSG_PEEK | MSG_DONTWAIT);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             int saved = errno;
             close(fd);
             errno = saved;
             return KPB_ERR_SYSTEM;
         }
-        if (ready > 0) break;
+        if (count == 0) break;  /* closed: the caller's read reports it */
+        if (count > 0 && (size_t)count >= sizeof(kpb_frame_header)) {
+            kpb_frame_header header;
+            size_t payload;
+            size_t need;
+            memcpy(&header, peeked, sizeof header);
+            payload = ntohl(header.payload_size);
+            if (ntohl(header.magic) != KPB_PROTOCOL_MAGIC ||
+                ntohs(header.version) != KPB_PROTOCOL_VERSION ||
+                payload > KPB_PROTOCOL_MAX_PAYLOAD) {
+                break;  /* not a frame: the caller's read reports it */
+            }
+            need = sizeof header + (payload < KPB_IO_CHUNK ? payload : KPB_IO_CHUNK);
+            if ((size_t)count >= need) break;
+        }
+        if (count < 0) {
+            /* Nothing yet: wait for the first byte. */
+            struct pollfd waiting = {.fd = fd, .events = POLLIN, .revents = 0};
+            (void)poll(&waiting, 1, (int)(remaining < 1000 ? remaining : 1000));
+        } else {
+            /* Some of a frame is here; poll would return at once, so wait a
+             * moment for the rest. */
+            (void)poll(NULL, 0, remaining < 5 ? (int)remaining : 5);
+        }
     }
     connection->fd = fd;
     copy_string(connection->session_id, sizeof connection->session_id, session_id);
@@ -3215,7 +3251,34 @@ kpb_receive(
         return KPB_ERR_INVALID;
     }
     memset(event, 0, sizeof *event);
-    result = receive_frame(connection->fd, &type, buffer, capacity, &payload_size);
+    /* Waiting for a frame to BEGIN is unbounded: this is the live stream, and
+     * a quiet pane is not a fault.  Once any byte of a frame has arrived the
+     * rest of it is read under a deadline, so a peer that sends half a frame and
+     * stops cannot hang the caller.  A non-blocking descriptor keeps its
+     * contract of failing at once when nothing is there. */
+    {
+        int flags = fcntl(connection->fd, F_GETFL, 0);
+        if (flags >= 0 && (flags & O_NONBLOCK)) {
+            char probe;
+            if (recv(connection->fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT) < 0 &&
+                (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return KPB_ERR_SYSTEM;
+            }
+        } else {
+            struct pollfd waiting = {.fd = connection->fd, .events = POLLIN, .revents = 0};
+            int ready;
+            do {
+                ready = poll(&waiting, 1, -1);
+            } while (ready < 0 && errno == EINTR);
+            if (ready < 0) return KPB_ERR_SYSTEM;
+        }
+    }
+    {
+        struct timespec deadline;
+        deadline_in(&deadline, KPB_FRAME_TIMEOUT_MILLIS);
+        result = receive_frame_bounded(
+            connection->fd, &type, buffer, capacity, &payload_size, &deadline);
+    }
     if (result != KPB_OK) {
         /* A frame that does not fit has already been consumed off the stream
          * to preserve framing, so its payload is unrecoverable here.  Report
@@ -3573,14 +3636,17 @@ list_receive(list_slot *slot) {
  * behind the first wedged one.  Here every query is in flight together, so the
  * whole listing costs one deadline however many sessions are stuck. */
 static void
-list_query_all(const char *runtime_dir, list_slot *slots, size_t count, int timeout_millis) {
+list_query_all(
+    const char *runtime_dir,
+    list_slot *slots,
+    size_t count,
+    const struct timespec *deadline
+) {
     struct pollfd descriptors[KPB_LIST_WINDOW];
     list_slot *active[KPB_LIST_WINDOW];
-    struct timespec deadline;
     size_t next = 0;
     size_t in_flight = 0;
     size_t finished = 0;
-    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);
     while (finished < count) {
         size_t index;
         size_t polled = 0;
@@ -3594,7 +3660,7 @@ list_query_all(const char *runtime_dir, list_slot *slots, size_t count, int time
             else in_flight++;
         }
         if (in_flight == 0) continue;
-        remaining = millis_until(&deadline);
+        remaining = millis_until(deadline);
         if (remaining <= 0) {
             for (index = 0; index < count; index++) {
                 if (slots[index].state == LIST_ACTIVE) {
@@ -3644,12 +3710,16 @@ kpb_list_with_options(
     struct dirent *entry;
     DIR *directory;
     list_slot *slots = NULL;
+    struct timespec deadline;
     size_t count = 0;
     size_t capacity = 0;
     size_t index;
     bool stopped = false;
     kpb_result result;
     if (!callback) return KPB_ERR_INVALID;
+    /* ONE deadline for the whole call - the queries and the reaping lock. */
+    deadline_from_timeout(
+        &deadline, options ? options->timeout_millis : 0, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);
     result = kpb_check_runtime(runtime_dir);
     if (result != KPB_OK) return result;
     result = build_paths(runtime_dir, NULL, &paths);
@@ -3679,7 +3749,7 @@ kpb_list_with_options(
     }
     closedir(directory);
 
-    list_query_all(runtime_dir, slots, count, options ? options->timeout_millis : 0);
+    list_query_all(runtime_dir, slots, count, &deadline);
 
     for (index = 0; index < count; index++) {
         list_slot *slot = &slots[index];
@@ -3695,7 +3765,10 @@ kpb_list_with_options(
              * lose its fresh files to the walk. */
             session_paths stale;
             if (build_paths(runtime_dir, slot->id, &stale) == KPB_OK) {
-                int lock_fd = lock_sessions_dir(&stale);
+                /* Skipped, not waited for, when the lock cannot be had within the
+                 * deadline: the session is still not listed (nothing is
+                 * listening), and the next listing reaps it. */
+                int lock_fd = lock_sessions_dir_until(&stale, &deadline);
                 if (lock_fd >= 0) {
                     if (session_is_stale(&stale)) reap_stale_session(&stale);
                     close(lock_fd);

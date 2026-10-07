@@ -161,7 +161,11 @@ applied when the broker was resumed. Consequences were not local to the CLI:
 anything that shells out to `list` with its own timeout lost every session
 because of one.
 
-The claim: **no client operation waits on a broker without a deadline.**
+The claim, stated exactly: **every request a client makes of a broker, and every
+lock it takes to do so, has a deadline; once a frame has begun to arrive the rest
+of it has one too; only waiting for a frame to *begin* on an established stream
+is unbounded.** That last exception is the live stream: a quiet pane is not a
+fault, and a viewer must be able to sit on one for hours.
 
 - *Connect* is non-blocking until it completes. A stopped broker never
   `accept()`s; once its backlog (16) fills with abandoned connections a blocking
@@ -170,8 +174,27 @@ The claim: **no client operation waits on a broker without a deadline.**
 - *Replies* are read with the same absolute, shared deadline the broker uses on
   its own accept path (`read_all_bounded`): it covers the whole frame, so
   dribbling a byte at a time does not extend it. Status, terminate and the
-  version-2 attach reply are all read this way; a plain version-1 attach has no
-  reply, so it waits (consuming nothing) for the first frame the broker sends.
+  version-2 attach reply are all read this way. A plain version-1 attach has no
+  reply, so its handshake is the broker's first frame, and the wait is for that
+  frame to be **complete** - peeked, not consumed - not for its first byte: a
+  peer that sends one byte and stops would otherwise pass a readability check and
+  leave the caller blocked in its first read, which an earlier version of this
+  argument missed.
+- *Frames in flight.* `kpb_receive` waits without limit for a frame to begin,
+  then reads the remainder of that frame (header and payload) under a 2 s
+  deadline - the budget the broker gives an attached client's frames - and
+  returns `KPB_ERR_TIMEOUT` if it does not arrive; the stream is then out of
+  step and the connection is dropped (resume picks it up again). A non-blocking
+  descriptor keeps failing at once when nothing is waiting.
+- *The sessions lock is not an exception.* Reaping during `list` and the lock a
+  spawn takes are acquired non-blocking and retried only until the caller's
+  deadline (`list`'s overall deadline, or 2 s for a spawn), never with a
+  blocking `flock`. A `list` that cannot take the lock **skips reaping and still
+  lists**: the corpse is already absent from the listing (nothing listens), and
+  the next listing reaps it. A spawn that cannot take it returns
+  `KPB_ERR_TIMEOUT` having created nothing. Measured before this change: a
+  holder stopped while holding the lock made `list` (and the TUI refresh) block
+  until the holder was continued.
 - *`list` queries every session concurrently under one deadline.* Sequential
   per-session bounds add up: ten stopped brokers at 2 s each is twenty seconds,
   longer than any caller's own timeout. In flight together they cost one
@@ -193,7 +216,8 @@ trust domain, not a defence against a hostile same-user process.
 
 Asserted by test: a `SIGSTOP`ped broker with `status`, `kill`, both attach forms
 and `list`, in the library and in the CLI; four stopped brokers cost one
-deadline.
+deadline; a held, even stopped, sessions lock with `list` and with a spawn; a
+peer that sends one byte of the first frame, or half of a later one, and stops.
 
 ## Reaping a dead session's directory
 
@@ -217,7 +241,11 @@ licenses it is argued here.
 - *The lock.* Proof, removal and recreation of a session directory happen under
   an exclusive `flock` on `sessions/`, so a respawn that has just recreated a
   directory cannot lose its fresh files to a concurrent walk holding proof from
-  the old metadata. Every holder releases it within microseconds.
+  the old metadata. Holders normally release it within microseconds, but nothing
+  relies on that: a holder that is stopped or stuck cannot hang anyone, because
+  the lock is only ever waited for until the caller's own deadline (see "The
+  sessions lock is not an exception" above) - `list` skips the reap, a spawn
+  reports a timeout.
 - *Archive, don't delete.* Before the directory goes, its journal is moved (an
   atomic rename within the runtime) to `reaped/ID.STARTED_MILLIS.journal`
   with a `.meta` beside it. Both are created `0600` in a `0700` directory,

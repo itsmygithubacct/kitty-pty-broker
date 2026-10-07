@@ -111,8 +111,11 @@ runtime such as `/run/user/UID/kpb`.
 
 ### Waiting is bounded
 
-Nothing waits on a broker without a deadline. A broker that is stopped, wedged
-or swapped out would otherwise hang every caller that asks about it.
+No request to a broker, and no lock taken to make one, waits without a deadline.
+A broker that is stopped, wedged or swapped out would otherwise hang every
+caller that asks about it. The only unbounded wait is for the next frame of an
+established `attach`/`observe` stream to *begin* (a quiet pane is not a fault);
+once a frame has started arriving, the rest of it must follow within 2 seconds.
 `--timeout SECONDS` (a decimal number of **seconds**, 0.1 to 60, given with
 `--runtime-dir` before the command, in either order) bounds each wait: the
 default is 2 seconds per operation, and 1 second for `list` and `tui`.
@@ -129,7 +132,10 @@ runtime with any number of stuck brokers costs one deadline, not one each, and
 a stuck broker never hides a healthy one. For each session that did not answer,
 `list` prints `kitty-pty-broker: list: ID: REASON` on stderr (`timeout`,
 `security`, `protocol`, `system`) and still exits 0 with the sessions that did
-answer on stdout, because callers rely on that. A directory with nothing
+answer on stdout, because callers rely on that. Reaping a corpse during `list`
+needs the sessions lock, which is only waited for until `list`'s own deadline: if
+another process holds it, `list` skips the reap and still lists, and a later
+listing reaps. A directory with nothing
 listening is a corpse rather than a session; it is reaped (below) and not
 reported.
 

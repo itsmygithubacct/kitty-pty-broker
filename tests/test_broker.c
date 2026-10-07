@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -3638,6 +3639,276 @@ test_tui_shows_an_unreachable_session(void) {
     resume_and_end(broker, "tui-wedged");
 }
 
+
+/* --- fix round 1: the sessions lock, and partial frames ------------------- */
+
+/* A process this test starts that holds an exclusive flock on RUNTIME/sessions
+ * for as long as it lives (and may be stopped while holding it).  Returns its
+ * pid; the caller kills it. */
+static pid_t
+hold_sessions_lock(const char *runtime) {
+    char sessions[KPB_PATH_MAX];
+    int ready[2];
+    pid_t child;
+    char byte;
+    CHECK(snprintf(sessions, sizeof sessions, "%s/sessions", runtime) < (int)sizeof sessions);
+    CHECK(pipe(ready) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int fd = open(sessions, O_RDONLY | O_DIRECTORY);
+        if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(1);
+        if (write(ready[1], "x", 1) != 1) _exit(1);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1);
+    close(ready[0]);
+    return child;
+}
+
+static void
+end_child(pid_t child) {
+    CHECK(kill(child, SIGKILL) == 0);
+    CHECK(waitpid(child, NULL, 0) == child);
+}
+
+/* The finding: reaping during `list` took the sessions lock with a blocking
+ * flock after the query deadline, so a holder that was stopped or slow hung
+ * every listing, and the TUI refresh with it. */
+static void
+test_list_does_not_wait_for_a_held_sessions_lock(void) {
+    char scratch[64];
+    char metadata[256];
+    char directory[KPB_PATH_MAX];
+    kpb_list_options options = {.timeout_millis = 300};
+    list_tally tally;
+    pid_t holder;
+    long started;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(
+        metadata, sizeof metadata,
+        "version=1\nid=dead\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\n",
+        (long)dead_pid()) < (int)sizeof metadata);
+    make_fake_session(scratch, "dead", metadata, NULL, directory);
+    holder = hold_sessions_lock(scratch);
+
+    alarm(20);
+    memset(&tally, 0, sizeof tally);
+    started = now_millis();
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    elapsed = now_millis() - started;
+    alarm(0);
+    CHECK(elapsed < 1500);
+    CHECK(tally.healthy == 0 && tally.unreachable == 0);
+    /* Reaping was skipped, not forgotten: the corpse is still there. */
+    CHECK(exists(directory));
+
+    /* Once the holder is gone the same call reaps it. */
+    end_child(holder);
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    CHECK(!exists(directory));
+    remove_tree(scratch);
+}
+
+/* A spawn that cannot get the lock says so within its bound instead of
+ * waiting, and creates nothing. */
+static void
+test_spawn_does_not_wait_forever_for_the_sessions_lock(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char directory[KPB_PATH_MAX];
+    kpb_spawn_options options;
+    pid_t holder;
+    long started;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(kpb_prepare_runtime(scratch) == KPB_OK);
+    holder = hold_sessions_lock(scratch);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "locked-out";
+    options.cwd = "/tmp";
+    options.argv = command;
+    alarm(20);
+    started = now_millis();
+    CHECK(kpb_spawn(&options, NULL) == KPB_ERR_TIMEOUT);
+    elapsed = now_millis() - started;
+    alarm(0);
+    CHECK(elapsed >= 1500 && elapsed < 4000);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/locked-out", scratch)
+          < (int)sizeof directory);
+    CHECK(!exists(directory));
+    end_child(holder);
+    remove_tree(scratch);
+}
+
+/* A same-uid stand-in for a broker, on RUNTIME/sessions/ID/control.sock.  It
+ * accepts one connection, reads the client's first frame, then sends `lead`
+ * (raw bytes) and holds the connection open, sending `more` after `delay`
+ * milliseconds if given.  Returns the server's pid; the caller kills it. */
+static pid_t
+fake_broker(
+    const char *runtime,
+    const char *session_id,
+    const void *lead,
+    size_t lead_size,
+    const void *more,
+    size_t more_size,
+    int delay_millis
+) {
+    char directory[KPB_PATH_MAX];
+    char socket_path[KPB_PATH_MAX];
+    struct sockaddr_un address;
+    int listener;
+    int ready[2];
+    pid_t child;
+    char byte;
+    make_fake_session(runtime, session_id, NULL, NULL, directory);
+    CHECK(snprintf(socket_path, sizeof socket_path, "%s/control.sock", directory)
+          < (int)sizeof socket_path);
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    CHECK(strlen(socket_path) < sizeof address.sun_path);
+    strcpy(address.sun_path, socket_path);
+    CHECK(bind(listener, (struct sockaddr *)&address, sizeof address) == 0);
+    CHECK(listen(listener, 4) == 0);
+    CHECK(pipe(ready) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        unsigned char request[64];
+        int fd;
+        close(ready[0]);
+        if (write(ready[1], "x", 1) != 1) _exit(1);
+        fd = accept(listener, NULL, NULL);
+        if (fd < 0) _exit(1);
+        /* The client's first frame: a 12-byte header and an 8-byte attach. */
+        if (read(fd, request, 20) != 20) _exit(1);
+        if (lead_size && write(fd, lead, lead_size) != (ssize_t)lead_size) _exit(1);
+        if (more_size) {
+            usleep((useconds_t)delay_millis * 1000U);
+            if (write(fd, more, more_size) != (ssize_t)more_size) _exit(1);
+        }
+        for (;;) pause();
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1);
+    close(ready[0]);
+    close(listener);
+    return child;
+}
+
+static void
+frame_header_bytes(unsigned char out[12], uint16_t type, uint32_t payload_size) {
+    kpb_frame_header header;
+    header.magic = htonl(KPB_PROTOCOL_MAGIC);
+    header.version = htons(KPB_PROTOCOL_VERSION);
+    header.type = htons(type);
+    header.payload_size = htonl(payload_size);
+    memcpy(out, &header, sizeof header);
+}
+
+/* The finding: a v1 attach returned as soon as ONE byte of the first frame was
+ * readable, and the caller then read the rest with no deadline. */
+static void
+test_a_partial_first_frame_does_not_complete_the_v1_attach_handshake(void) {
+    char scratch[64];
+    unsigned char header[12];
+    kpb_connection connection;
+    pid_t server;
+    long started;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    frame_header_bytes(header, KPB_FRAME_REPLAY_DONE, 0);
+    server = fake_broker(scratch, "partial", header, 1, NULL, 0, 0);
+    alarm(20);
+    started = now_millis();
+    CHECK(kpb_attach_timeout(scratch, "partial", 24, 80, 0, 0, &connection, 300) ==
+          KPB_ERR_TIMEOUT);
+    elapsed = now_millis() - started;
+    alarm(0);
+    CHECK(connection.fd == -1);
+    CHECK(elapsed >= 250 && elapsed < 1500);
+    end_child(server);
+
+    /* A first frame that arrives in pieces inside the deadline is fine. */
+    server = fake_broker(scratch, "pieces", header, 5, header + 5, 7, 100);
+    CHECK(kpb_attach_timeout(scratch, "pieces", 24, 80, 0, 0, &connection, 1500) == KPB_OK);
+    {
+        unsigned char buffer[64];
+        kpb_event event;
+        CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_OK);
+        CHECK(event.type == KPB_EVENT_REPLAY_DONE);
+    }
+    kpb_detach(&connection);
+    end_child(server);
+    remove_tree(scratch);
+}
+
+/* Once any byte of a frame has arrived the rest is read under a deadline, so a
+ * peer that sends half a frame and holds cannot hang the client.  Waiting for
+ * the NEXT frame to begin stays unbounded: that is live streaming. */
+static void
+test_a_stalled_partial_frame_times_out_but_an_idle_stream_does_not(void) {
+    char scratch[64];
+    unsigned char first[12];
+    unsigned char second[12 + 5];
+    unsigned char lead[12 + 6];
+    kpb_connection connection;
+    kpb_event event;
+    unsigned char buffer[64];
+    pid_t server;
+    long started;
+    long elapsed;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    frame_header_bytes(first, KPB_FRAME_REPLAY_DONE, 0);
+    frame_header_bytes(second, KPB_FRAME_OUTPUT, 5);
+    memcpy(second + 12, "hello", 5);
+
+    /* One whole frame, then 6 bytes of the next header, then silence. */
+    memcpy(lead, first, 12);
+    memcpy(lead + 12, second, 6);
+    server = fake_broker(scratch, "stalls", lead, sizeof lead, NULL, 0, 0);
+    CHECK(kpb_attach_timeout(scratch, "stalls", 24, 80, 0, 0, &connection, 1000) == KPB_OK);
+    CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_OK);
+    CHECK(event.type == KPB_EVENT_REPLAY_DONE);
+    alarm(20);
+    started = now_millis();
+    CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_ERR_TIMEOUT);
+    elapsed = now_millis() - started;
+    alarm(0);
+    CHECK(elapsed >= 1500 && elapsed < 5000);
+    kpb_detach(&connection);
+    end_child(server);
+
+    /* Silence BETWEEN frames is not a stall: the second frame arrives after
+     * longer than the partial-frame budget and is delivered intact. */
+    server = fake_broker(scratch, "idle", first, 12, second, sizeof second, 2600);
+    CHECK(kpb_attach_timeout(scratch, "idle", 24, 80, 0, 0, &connection, 1000) == KPB_OK);
+    CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_OK);
+    CHECK(event.type == KPB_EVENT_REPLAY_DONE);
+    alarm(20);
+    CHECK(kpb_receive(&connection, buffer, sizeof buffer, &event) == KPB_OK);
+    alarm(0);
+    CHECK(event.type == KPB_EVENT_OUTPUT && event.size == 5);
+    CHECK(memcmp(buffer, "hello", 5) == 0);
+    kpb_detach(&connection);
+    end_child(server);
+    remove_tree(scratch);
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -3730,6 +4001,10 @@ main(int argc, char **argv) {
     RUN(test_archiving_failures_still_reap_the_session);
     RUN(test_tui_observes_an_attached_pane_and_returns);
     RUN(test_tui_shows_an_unreachable_session);
+    RUN(test_list_does_not_wait_for_a_held_sessions_lock);
+    RUN(test_spawn_does_not_wait_forever_for_the_sessions_lock);
+    RUN(test_a_partial_first_frame_does_not_complete_the_v1_attach_handshake);
+    RUN(test_a_stalled_partial_frame_times_out_but_an_idle_stream_does_not);
     {
         char sessions[4096];
         snprintf(sessions, sizeof sessions, "%s/sessions", runtime_dir);
