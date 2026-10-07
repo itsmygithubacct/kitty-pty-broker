@@ -51,8 +51,10 @@ typedef struct {
 } server_ready;
 
 typedef struct {
+    char session_id[KPB_SESSION_ID_MAX + 1];
     char runtime_dir[KPB_PATH_MAX];
     char sessions_dir[KPB_PATH_MAX];
+    char reaped_dir[KPB_PATH_MAX];
     char session_dir[KPB_PATH_MAX];
     char socket_path[KPB_PATH_MAX];
     char journal_path[KPB_PATH_MAX];
@@ -230,29 +232,71 @@ ensure_private_directory(const char *path, bool create) {
     return KPB_OK;
 }
 
+/* The runtime directory as the kernel will see it, whether or not it exists
+ * yet.  realpath() fails outright on a path that does not exist, which would
+ * leave the caller measuring an unresolved path; resolving the longest existing
+ * ancestor and appending the rest gives the same answer the directory will
+ * have once it is created, so a path that is too long is refused BEFORE
+ * anything is made. */
+static kpb_result
+resolve_runtime(const char *runtime_dir, char output[KPB_PATH_MAX]) {
+    char prefix[KPB_PATH_MAX];
+    char resolved[KPB_PATH_MAX];
+    size_t length = strlen(runtime_dir);
+    size_t end = length;
+    const char *suffix;
+    int count;
+    if (length >= KPB_PATH_MAX) return KPB_ERR_NAME_TOO_LONG;
+    for (;;) {
+        if (end == 0) {
+            strcpy(prefix, "/");
+        } else {
+            memcpy(prefix, runtime_dir, end);
+            prefix[end] = '\0';
+        }
+        if (realpath(prefix, resolved)) break;
+        if (errno != ENOENT && errno != ENOTDIR) return KPB_ERR_SYSTEM;
+        if (end == 0) return KPB_ERR_SYSTEM;
+        while (end > 0 && runtime_dir[end - 1] != '/') end--;
+        if (end > 0) end--;
+    }
+    suffix = runtime_dir + end;
+    if (*suffix && (strstr(suffix, "/../") || strstr(suffix, "/./") ||
+                    (length >= 3 && strcmp(runtime_dir + length - 3, "/..") == 0) ||
+                    (length >= 2 && strcmp(runtime_dir + length - 2, "/.") == 0))) {
+        return KPB_ERR_INVALID;
+    }
+    count = snprintf(
+        output, KPB_PATH_MAX, "%s%s",
+        strcmp(resolved, "/") == 0 ? "" : resolved, suffix);
+    if (count < 0 || count >= KPB_PATH_MAX) return KPB_ERR_NAME_TOO_LONG;
+    if (output[0] == '\0') strcpy(output, "/");
+    return KPB_OK;
+}
+
 static kpb_result
 build_paths(const char *runtime_dir, const char *session_id, session_paths *paths) {
     char resolved[KPB_PATH_MAX];
+    kpb_result result;
     if (!runtime_dir || runtime_dir[0] != '/' || !paths) return KPB_ERR_INVALID;
-    if (strlen(runtime_dir) >= sizeof resolved) return KPB_ERR_INVALID;
-    if (!realpath(runtime_dir, resolved)) {
-        if (errno != ENOENT) return KPB_ERR_SYSTEM;
-        if (copy_string(resolved, sizeof resolved, runtime_dir) != 0) return KPB_ERR_INVALID;
-    }
+    result = resolve_runtime(runtime_dir, resolved);
+    if (result != KPB_OK) return result;
     memset(paths, 0, sizeof *paths);
     if (copy_string(paths->runtime_dir, sizeof paths->runtime_dir, resolved) != 0 ||
-        join_path(paths->sessions_dir, sizeof paths->sessions_dir, resolved, "sessions") != 0) {
-        return KPB_ERR_INVALID;
+        join_path(paths->sessions_dir, sizeof paths->sessions_dir, resolved, "sessions") != 0 ||
+        join_path(paths->reaped_dir, sizeof paths->reaped_dir, resolved, "reaped") != 0) {
+        return KPB_ERR_NAME_TOO_LONG;
     }
     if (!session_id) return KPB_OK;
     if (!valid_component(session_id)) return KPB_ERR_INVALID;
+    copy_string(paths->session_id, sizeof paths->session_id, session_id);
     if (join_path(paths->session_dir, sizeof paths->session_dir, paths->sessions_dir, session_id) != 0 ||
         join_path(paths->socket_path, sizeof paths->socket_path, paths->session_dir, "control.sock") != 0 ||
         join_path(paths->journal_path, sizeof paths->journal_path, paths->session_dir, "journal.bin") != 0 ||
         join_path(paths->metadata_path, sizeof paths->metadata_path, paths->session_dir, "metadata") != 0) {
-        return KPB_ERR_INVALID;
+        return KPB_ERR_NAME_TOO_LONG;
     }
-    if (strlen(paths->socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) return KPB_ERR_INVALID;
+    if (strlen(paths->socket_path) > KPB_SOCKET_PATH_LIMIT) return KPB_ERR_NAME_TOO_LONG;
     return KPB_OK;
 }
 
@@ -269,6 +313,15 @@ deadline_in(struct timespec *out, long millis) {
     }
 }
 
+/* Milliseconds left before `deadline`, <= 0 once it has passed. */
+static long
+millis_until(const struct timespec *deadline) {
+    struct timespec moment;
+    clock_gettime(CLOCK_MONOTONIC, &moment);
+    return (long)(deadline->tv_sec - moment.tv_sec) * 1000L +
+           (deadline->tv_nsec - moment.tv_nsec) / 1000000L;
+}
+
 /* read_all_fd under a wall-clock deadline.
  *
  * The server reads a new peer's first frame from inside its event loop, so time
@@ -278,22 +331,20 @@ deadline_in(struct timespec *out, long millis) {
  * forever; the budget has to be absolute and shared across the whole frame,
  * which is what this is.
  *
- * A caller passing NULL gets the old blocking behaviour, which is correct for
- * the client side of the protocol: there the peer is the broker, the process is
- * doing nothing else, and a hang is visible to whoever ran it. */
+ * A caller passing NULL gets plain blocking reads.  That is right only for a
+ * stream that is already established and is read by its owner at its own pace
+ * (kpb_receive).  Every request/reply a client makes of a broker carries a
+ * deadline: the broker is another process, it can be stopped or wedged, and an
+ * unbounded wait turns one such session into a hang for the caller. */
 static ssize_t
 read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadline) {
     unsigned char *cursor = data;
     size_t received = 0;
     if (!deadline) return read_all_fd(fd, data, size);
     while (received < size) {
-        struct timespec moment;
         struct pollfd waiting;
-        long remaining;
+        long remaining = millis_until(deadline);
         ssize_t count;
-        clock_gettime(CLOCK_MONOTONIC, &moment);
-        remaining = (long)(deadline->tv_sec - moment.tv_sec) * 1000L +
-                    (deadline->tv_nsec - moment.tv_nsec) / 1000000L;
         if (remaining <= 0) {
             errno = ETIMEDOUT;
             return -1;
@@ -391,7 +442,9 @@ receive_frame_bounded(
     kpb_frame_header header;
     uint32_t size;
     unsigned char discard[4096];
-    if (read_all_bounded(fd, &header, sizeof header, deadline) < 0) return KPB_ERR_SYSTEM;
+    if (read_all_bounded(fd, &header, sizeof header, deadline) < 0) {
+        return errno == ETIMEDOUT ? KPB_ERR_TIMEOUT : KPB_ERR_SYSTEM;
+    }
     if (ntohl(header.magic) != KPB_PROTOCOL_MAGIC ||
         ntohs(header.version) != KPB_PROTOCOL_VERSION) {
         return KPB_ERR_PROTOCOL;
@@ -404,12 +457,16 @@ receive_frame_bounded(
         uint32_t left = size;
         while (left) {
             size_t chunk = left < sizeof discard ? left : sizeof discard;
-            if (read_all_bounded(fd, discard, chunk, deadline) < 0) return KPB_ERR_SYSTEM;
+            if (read_all_bounded(fd, discard, chunk, deadline) < 0) {
+                return errno == ETIMEDOUT ? KPB_ERR_TIMEOUT : KPB_ERR_SYSTEM;
+            }
             left -= (uint32_t)chunk;
         }
         return KPB_ERR_BUFFER;
     }
-    if (size && read_all_bounded(fd, payload, size, deadline) < 0) return KPB_ERR_SYSTEM;
+    if (size && read_all_bounded(fd, payload, size, deadline) < 0) {
+        return errno == ETIMEDOUT ? KPB_ERR_TIMEOUT : KPB_ERR_SYSTEM;
+    }
     return KPB_OK;
 }
 
@@ -426,23 +483,53 @@ receive_frame(
 
 static bool peer_is_owner(int fd);
 
+/* Connect under `deadline`.  The socket is non-blocking only for the connect:
+ * a stopped broker never accept()s, and once its backlog is full a blocking
+ * connect() waits for room that never comes, which is precisely the hang the
+ * deadline exists to prevent.  A non-blocking connect to a full backlog reports
+ * EAGAIN instead, which is retried until the deadline. */
 static kpb_result
-connect_session(const char *runtime_dir, const char *session_id, int *fd_out) {
+connect_session_until(
+    const char *runtime_dir,
+    const char *session_id,
+    int *fd_out,
+    const struct timespec *deadline
+) {
     session_paths paths;
     struct sockaddr_un address;
     int fd;
+    int flags;
     kpb_result result = build_paths(runtime_dir, session_id, &paths);
     if (result != KPB_OK) return result;
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return KPB_ERR_SYSTEM;
     memset(&address, 0, sizeof address);
     address.sun_family = AF_UNIX;
     copy_string(address.sun_path, sizeof address.sun_path, paths.socket_path);
-    if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
-        int saved = errno;
+    for (;;) {
+        int saved;
+        if (connect(fd, (struct sockaddr *)&address, sizeof address) == 0) break;
+        saved = errno;
+        if (saved == EINTR) continue;
+        if (saved == EAGAIN) {
+            long remaining = millis_until(deadline);
+            if (remaining <= 0) {
+                close(fd);
+                return KPB_ERR_TIMEOUT;
+            }
+            (void)poll(NULL, 0, remaining < 10 ? (int)remaining : 10);
+            continue;
+        }
         close(fd);
         errno = saved;
         return saved == ENOENT || saved == ECONNREFUSED ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM;
+    }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return KPB_ERR_SYSTEM;
     }
     /* The server validates clients; the client must validate the server too.
      * Otherwise an explicitly supplied public runtime path could feed terminal
@@ -453,6 +540,12 @@ connect_session(const char *runtime_dir, const char *session_id, int *fd_out) {
     }
     *fd_out = fd;
     return KPB_OK;
+}
+
+/* A caller's timeout in milliseconds as a deadline; <= 0 is the default. */
+static void
+deadline_from_timeout(struct timespec *deadline, int timeout_millis, int fallback) {
+    deadline_in(deadline, timeout_millis > 0 ? (long)timeout_millis : (long)fallback);
 }
 
 static void
@@ -557,6 +650,8 @@ kpb_result_string(kpb_result result) {
         case KPB_ERR_PROTOCOL: return "protocol error";
         case KPB_ERR_BUFFER: return "buffer too small";
         case KPB_ERR_CHILD: return "child could not start";
+        case KPB_ERR_TIMEOUT: return "timed out";
+        case KPB_ERR_NAME_TOO_LONG: return "socket path too long";
     }
     return "unknown error";
 }
@@ -617,12 +712,93 @@ build_command(char output[KPB_COMMAND_MAX], char *const *argv) {
     }
 }
 
+/* Reads at most capacity-1 bytes and NUL-terminates.  The files it is used on
+ * are tiny and live in /proc or the session directory. */
+static ssize_t
+read_small_file(const char *path, char *buffer, size_t capacity) {
+    size_t used = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    while (used + 1 < capacity) {
+        ssize_t count = read(fd, buffer + used, capacity - 1 - used);
+        if (count < 0) {
+            int saved = errno;
+            if (saved == EINTR) continue;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        if (count == 0) break;
+        used += (size_t)count;
+    }
+    close(fd);
+    buffer[used] = '\0';
+    return (ssize_t)used;
+}
+
+/* The kernel's identifier for this boot.  Together with a pid and that
+ * process's start time it names one process uniquely across reboots and pid
+ * reuse, which a bare pid cannot. */
+static int
+current_boot_id(char output[64]) {
+    char data[96];
+    ssize_t size = read_small_file("/proc/sys/kernel/random/boot_id", data, sizeof data);
+    size_t index;
+    if (size <= 0) return -1;
+    while (size > 0 && (data[size - 1] == '\n' || data[size - 1] == ' ')) data[--size] = '\0';
+    if (size <= 0 || size >= 64) return -1;
+    for (index = 0; index < (size_t)size; index++) {
+        char c = data[index];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F') || c == '-')) {
+            return -1;
+        }
+    }
+    memcpy(output, data, (size_t)size + 1);
+    return 0;
+}
+
+/* Field 22 of /proc/PID/stat: the process's start time in clock ticks since
+ * boot.  The command name (field 2) is parenthesised and may itself contain
+ * spaces and parentheses, so fields are counted from the LAST ')'. */
+static int
+process_start_ticks(long pid, uint64_t *ticks) {
+    char path[64];
+    char data[1024];
+    char *cursor;
+    char *end = NULL;
+    int field;
+    unsigned long long value;
+    if (pid <= 0 || snprintf(path, sizeof path, "/proc/%ld/stat", pid) >= (int)sizeof path) {
+        return -1;
+    }
+    if (read_small_file(path, data, sizeof data) <= 0) return -1;
+    cursor = strrchr(data, ')');
+    if (!cursor) return -1;
+    cursor++;
+    for (field = 3; field < 22; field++) {
+        while (*cursor == ' ') cursor++;
+        if (!*cursor) return -1;
+        while (*cursor && *cursor != ' ') cursor++;
+    }
+    while (*cursor == ' ') cursor++;
+    if (*cursor < '0' || *cursor > '9') return -1;
+    errno = 0;
+    value = strtoull(cursor, &end, 10);
+    if (errno || end == cursor) return -1;
+    *ticks = (uint64_t)value;
+    return 0;
+}
+
 static int
 write_metadata(server_state *server) {
     char temporary[KPB_PATH_MAX];
     char data[2048];
+    char boot_id[64];
+    uint64_t ticks;
     int fd;
     int count;
+    int more;
     if (snprintf(temporary, sizeof temporary, "%s.tmp", server->paths.metadata_path) >= (int)sizeof temporary) {
         errno = ENAMETOOLONG;
         return -1;
@@ -639,6 +815,26 @@ write_metadata(server_state *server) {
     if (count < 0 || (size_t)count >= sizeof data) {
         errno = EOVERFLOW;
         return -1;
+    }
+    /* The identity a later reaper can prove a pid against.  Written only when
+     * it can be read: metadata without these fields keeps the pid-only rule. */
+    if (current_boot_id(boot_id) == 0) {
+        more = snprintf(data + count, sizeof data - (size_t)count, "boot_id=%s\n", boot_id);
+        if (more < 0 || (size_t)more >= sizeof data - (size_t)count) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        count += more;
+    }
+    if (process_start_ticks((long)getpid(), &ticks) == 0) {
+        more = snprintf(
+            data + count, sizeof data - (size_t)count, "start_ticks=%llu\n",
+            (unsigned long long)ticks);
+        if (more < 0 || (size_t)more >= sizeof data - (size_t)count) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        count += more;
     }
     fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
@@ -2296,6 +2492,61 @@ fail_after_ready:
     return 255;
 }
 
+typedef struct {
+    long pid;
+    bool have_started;
+    uint64_t started_millis;
+    bool have_boot_id;
+    char boot_id[64];
+    bool have_ticks;
+    uint64_t start_ticks;
+} metadata_info;
+
+/* Parse the session metadata.  Returns false when broker_pid is missing or
+ * malformed, which leaves the directory alone.  The identity fields added
+ * later are optional, and a malformed one is treated as absent rather than as
+ * evidence: it can only ever weaken a proof, never supply one. */
+static bool
+parse_metadata(const char *data, metadata_info *info) {
+    const char *line;
+    memset(info, 0, sizeof *info);
+    info->pid = -1;
+    for (line = data; line && *line;) {
+        char *end = NULL;
+        errno = 0;
+        if (strncmp(line, "broker_pid=", 11) == 0) {
+            info->pid = strtol(line + 11, &end, 10);
+            if (errno || !end || (*end != '\n' && *end != '\0') || info->pid <= 0) {
+                return false;
+            }
+        } else if (strncmp(line, "started_millis=", 15) == 0) {
+            unsigned long long value = strtoull(line + 15, &end, 10);
+            if (!errno && end && end != line + 15 && (*end == '\n' || *end == '\0') &&
+                line[15] >= '0' && line[15] <= '9') {
+                info->started_millis = (uint64_t)value;
+                info->have_started = true;
+            }
+        } else if (strncmp(line, "boot_id=", 8) == 0) {
+            size_t size = strcspn(line + 8, "\n");
+            if (size > 0 && size < sizeof info->boot_id) {
+                memcpy(info->boot_id, line + 8, size);
+                info->boot_id[size] = '\0';
+                info->have_boot_id = true;
+            }
+        } else if (strncmp(line, "start_ticks=", 12) == 0) {
+            unsigned long long value = strtoull(line + 12, &end, 10);
+            if (!errno && end && end != line + 12 && (*end == '\n' || *end == '\0') &&
+                line[12] >= '0' && line[12] <= '9') {
+                info->start_ticks = (uint64_t)value;
+                info->have_ticks = true;
+            }
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    return info->pid > 0;
+}
+
 /* The metadata file's consumer: decide whether a session directory is a
  * corpse.  The broker cannot clean up after SIGKILL or the OOM killer, and a
  * directory it leaves behind would otherwise be permanent - invisible to
@@ -2303,45 +2554,257 @@ fail_after_ready:
  * list a connect() to a dead socket.
  *
  * Every path here is deliberately conservative: anything short of positive
- * proof that the recorded broker process is gone - metadata missing,
- * unreadable, malformed, or naming a pid that still exists in any form -
- * leaves the directory alone, so a live or merely slow session is never
- * destroyed. */
+ * proof that the recorded broker process is gone leaves the directory alone,
+ * so a live or merely slow session is never destroyed.  Proof is one of:
+ *
+ *   - the recorded pid does not exist (ESRCH);
+ *   - the recorded boot_id is not this boot's, so the pid belongs to a machine
+ *     that no longer exists - the case a bare pid check gets wrong, because a
+ *     persistent runtime outlives the reboot and the pid is then recycled;
+ *   - the pid exists but its start time differs from the recorded start_ticks,
+ *     so it is a different process that reused the number.
+ *
+ * Metadata without the identity fields (written by an earlier build) is held
+ * to the pid rule alone, and an identity that cannot be read now - no /proc -
+ * proves nothing. */
 static bool
 session_is_stale(const session_paths *paths) {
     char data[2048];
-    ssize_t size;
-    const char *line;
-    long pid = -1;
-    int fd = open(paths->metadata_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return false;
-    size = read(fd, data, sizeof data - 1);
-    close(fd);
+    metadata_info info;
+    char current[64];
+    uint64_t ticks;
+    ssize_t size = read_small_file(paths->metadata_path, data, sizeof data);
     if (size <= 0) return false;
-    data[size] = '\0';
-    for (line = data; line && *line;) {
-        if (strncmp(line, "broker_pid=", 11) == 0) {
-            char *end = NULL;
-            errno = 0;
-            pid = strtol(line + 11, &end, 10);
-            if (errno || !end || (*end != '\n' && *end != '\0') || pid <= 0) {
-                return false;
-            }
-            break;
-        }
-        line = strchr(line, '\n');
-        if (line) line++;
+    if (!parse_metadata(data, &info)) return false;
+    if (kill((pid_t)info.pid, 0) != 0 && errno == ESRCH) return true;
+    if (info.have_boot_id && current_boot_id(current) == 0 &&
+        strcmp(info.boot_id, current) != 0) {
+        return true;
     }
-    if (pid <= 0) return false;
-    return kill((pid_t)pid, 0) != 0 && errno == ESRCH;
+    if (info.have_ticks && process_start_ticks(info.pid, &ticks) == 0 &&
+        ticks != info.start_ticks) {
+        return true;
+    }
+    return false;
 }
 
-/* Remove a directory session_is_stale() has vouched for.  Best-effort, and
- * rmdir is the commit point: it fails if anything unexpected is still
- * inside, which is the safe direction.  Callers hold the sessions-directory
- * lock across both the proof and this removal. */
+static uint64_t
+reaped_limit_from_environment(const char *name, uint64_t fallback) {
+    const char *value = getenv(name);
+    char *end = NULL;
+    unsigned long long parsed;
+    if (!value || value[0] < '0' || value[0] > '9') return fallback;
+    errno = 0;
+    parsed = strtoull(value, &end, 10);
+    if (errno || !end || *end != '\0' || parsed == 0 || parsed > INT64_MAX) return fallback;
+    return (uint64_t)parsed;
+}
+
+/* "ID.STARTED_MILLIS.journal".  Session IDs may contain '.', so the millis are
+ * the part after the LAST dot. */
+static bool
+parse_archive_name(const char *name, char id[KPB_SESSION_ID_MAX + 1], uint64_t *started) {
+    static const char suffix[] = ".journal";
+    size_t length = strlen(name);
+    size_t cut;
+    size_t digits;
+    uint64_t value = 0;
+    size_t index;
+    if (length <= sizeof suffix - 1 ||
+        strcmp(name + length - (sizeof suffix - 1), suffix) != 0) {
+        return false;
+    }
+    length -= sizeof suffix - 1;
+    cut = length;
+    while (cut > 0 && name[cut - 1] != '.') cut--;
+    if (cut <= 1) return false;
+    digits = length - cut;
+    if (digits == 0 || digits > 19) return false;
+    for (index = cut; index < length; index++) {
+        if (name[index] < '0' || name[index] > '9') return false;
+        value = value * 10U + (uint64_t)(name[index] - '0');
+    }
+    if (cut - 1 > KPB_SESSION_ID_MAX) return false;
+    memcpy(id, name, cut - 1);
+    id[cut - 1] = '\0';
+    if (!valid_component(id)) return false;
+    *started = value;
+    return true;
+}
+
+typedef struct {
+    char name[KPB_SESSION_ID_MAX + 64];
+    uint64_t started;
+    uint64_t journal_bytes;
+    uint64_t meta_bytes;
+    struct timespec age;
+} archive_item;
+
+static int
+compare_archive_items(const void *left_opaque, const void *right_opaque) {
+    const archive_item *left = left_opaque;
+    const archive_item *right = right_opaque;
+    if (left->age.tv_sec != right->age.tv_sec) {
+        return left->age.tv_sec < right->age.tv_sec ? -1 : 1;
+    }
+    if (left->age.tv_nsec != right->age.tv_nsec) {
+        return left->age.tv_nsec < right->age.tv_nsec ? -1 : 1;
+    }
+    if (left->started != right->started) return left->started < right->started ? -1 : 1;
+    return strcmp(left->name, right->name);
+}
+
+/* The .meta file that rides along with "NAME.journal", in place. */
+static int
+meta_path_for(char *path, size_t capacity) {
+    size_t length = strlen(path);
+    if (length <= sizeof ".journal" - 1 ||
+        length - (sizeof ".journal" - 1) + sizeof ".meta" > capacity) {
+        return -1;
+    }
+    memcpy(path + length - (sizeof ".journal" - 1), ".meta", sizeof ".meta");
+    return 0;
+}
+
+/* Remove a journal and its .meta from the archive. */
+static void
+remove_archive_item(const char *reaped_dir, const archive_item *item) {
+    char path[KPB_PATH_MAX];
+    if (join_path(path, sizeof path, reaped_dir, item->name) != 0) return;
+    (void)unlink(path);
+    if (meta_path_for(path, sizeof path) == 0) (void)unlink(path);
+}
+
+/* Keep RUNTIME/reaped/ inside its bounds, evicting the oldest first.  Age is
+ * the .meta file's mtime - written when the session was reaped - falling back
+ * to the journal's.  The bound is on journals (their .meta files ride along
+ * and count toward the bytes, not the file count), because a standalone
+ * install has nothing else that would ever empty this directory. */
+static void
+evict_reaped(const char *reaped_dir) {
+    uint64_t max_bytes = reaped_limit_from_environment(
+        "KITTY_PTY_BROKER_REAPED_MAX_BYTES", KPB_DEFAULT_REAPED_MAX_BYTES);
+    uint64_t max_files = reaped_limit_from_environment(
+        "KITTY_PTY_BROKER_REAPED_MAX_FILES", KPB_DEFAULT_REAPED_MAX_FILES);
+    archive_item *items = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    size_t index;
+    uint64_t total = 0;
+    struct dirent *entry;
+    DIR *directory = opendir(reaped_dir);
+    if (!directory) return;
+    while ((entry = readdir(directory))) {
+        archive_item item;
+        char id[KPB_SESSION_ID_MAX + 1];
+        char path[KPB_PATH_MAX];
+        struct stat journal;
+        struct stat meta;
+        memset(&item, 0, sizeof item);
+        if (!parse_archive_name(entry->d_name, id, &item.started)) continue;
+        if (join_path(path, sizeof path, reaped_dir, entry->d_name) != 0 ||
+            lstat(path, &journal) != 0 || !S_ISREG(journal.st_mode)) {
+            continue;
+        }
+        copy_string(item.name, sizeof item.name, entry->d_name);
+        item.journal_bytes = (uint64_t)journal.st_size;
+        item.age = journal.st_mtim;
+        if (meta_path_for(path, sizeof path) == 0 &&
+            lstat(path, &meta) == 0 && S_ISREG(meta.st_mode)) {
+            item.meta_bytes = (uint64_t)meta.st_size;
+            item.age = meta.st_mtim;
+        }
+        if (count == capacity) {
+            size_t grown = capacity ? capacity * 2U : 32U;
+            archive_item *replacement = realloc(items, grown * sizeof *items);
+            if (!replacement) break;
+            items = replacement;
+            capacity = grown;
+        }
+        items[count++] = item;
+    }
+    closedir(directory);
+    if (count > 1) qsort(items, count, sizeof *items, compare_archive_items);
+    for (index = 0; index < count; index++) total += items[index].journal_bytes + items[index].meta_bytes;
+    for (index = 0; index < count && (count - index > max_files || total > max_bytes); index++) {
+        remove_archive_item(reaped_dir, &items[index]);
+        total -= items[index].journal_bytes + items[index].meta_bytes;
+    }
+    free(items);
+}
+
+/* Keep a dead session's journal instead of deleting it.  The journal is what
+ * the screen looked like when the session died, which is exactly what someone
+ * investigating an OOM kill wants and exactly what deleting the directory
+ * destroyed.  A rename within one filesystem is atomic and O(1) however large
+ * the journal is, so this adds nothing a list walk would notice.
+ *
+ * Best-effort in every step, and a failure falls back to the old behaviour
+ * (the journal is deleted with the directory): an archive that cannot be made
+ * - reaped/ unwritable, a foreign or symlinked reaped/, another filesystem -
+ * must never leave a corpse that blocks `run --id` from respawning. */
+static void
+archive_journal(const session_paths *paths) {
+    char data[2048];
+    char destination[KPB_PATH_MAX];
+    char meta_path[KPB_PATH_MAX];
+    metadata_info info;
+    struct stat journal;
+    struct stat probe;
+    ssize_t size;
+    uint64_t started = 0;
+    int fd;
+    if (lstat(paths->journal_path, &journal) != 0 || !S_ISREG(journal.st_mode) ||
+        journal.st_uid != geteuid() || journal.st_size <= 0) {
+        return;
+    }
+    size = read_small_file(paths->metadata_path, data, sizeof data);
+    if (size < 0) size = 0;
+    if (size > 0 && parse_metadata(data, &info) && info.have_started) {
+        started = info.started_millis;
+    }
+    if (ensure_private_directory(paths->reaped_dir, true) != KPB_OK) return;
+    if (snprintf(
+            destination, sizeof destination, "%s/%s.%llu.journal",
+            paths->reaped_dir, paths->session_id, (unsigned long long)started
+        ) >= (int)sizeof destination ||
+        snprintf(
+            meta_path, sizeof meta_path, "%s/%s.%llu.meta",
+            paths->reaped_dir, paths->session_id, (unsigned long long)started
+        ) >= (int)sizeof meta_path) {
+        return;
+    }
+    if (lstat(destination, &probe) == 0 || lstat(meta_path, &probe) == 0) return;
+    if (rename(paths->journal_path, destination) != 0) return;
+    (void)chmod(destination, 0600);
+    fd = open(meta_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd >= 0) {
+        char tail[64];
+        int tail_size = snprintf(
+            tail, sizeof tail, "%sreaped_millis=%llu\n",
+            size > 0 && data[size - 1] != '\n' ? "\n" : "",
+            (unsigned long long)realtime_millis());
+        (void)fchmod(fd, 0600);
+        if ((size > 0 && write_all_fd(fd, data, (size_t)size) < 0) ||
+            tail_size < 0 || write_all_fd(fd, tail, (size_t)tail_size) < 0) {
+            /* A journal without its .meta is still listed; one with a
+             * truncated .meta is not worth keeping a half-written file for. */
+            close(fd);
+            (void)unlink(meta_path);
+        } else {
+            close(fd);
+        }
+    }
+    evict_reaped(paths->reaped_dir);
+}
+
+/* Remove a directory session_is_stale() has vouched for, keeping its journal
+ * first.  Best-effort, and rmdir is the commit point: it fails if anything
+ * unexpected is still inside, which is the safe direction.  Callers hold the
+ * sessions-directory lock across both the proof and this removal. */
 static void
 reap_stale_session(const session_paths *paths) {
+    archive_journal(paths);
     (void)unlink(paths->socket_path);
     (void)unlink(paths->journal_path);
     (void)unlink(paths->metadata_path);
@@ -2396,6 +2859,12 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
         session_id = generated;
     }
     if (kpb_validate_session_id(session_id) != KPB_OK) return KPB_ERR_INVALID;
+    /* Every path is validated BEFORE anything is created.  A socket path over
+     * the 107-byte limit cannot be bound, and finding that out after
+     * kpb_prepare_runtime would leave runtime/ and sessions/ behind for a
+     * spawn that was refused. */
+    result = build_paths(options->runtime_dir, session_id, &paths);
+    if (result != KPB_OK) return result;
     result = kpb_prepare_runtime(options->runtime_dir);
     if (result != KPB_OK) return result;
     result = build_paths(options->runtime_dir, session_id, &paths);
@@ -2478,22 +2947,26 @@ kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
 }
 
 kpb_result
-kpb_attach(
+kpb_attach_timeout(
     const char *runtime_dir,
     const char *session_id,
     unsigned short rows,
     unsigned short columns,
     unsigned short xpixel,
     unsigned short ypixel,
-    kpb_connection *connection
+    kpb_connection *connection,
+    int timeout_millis
 ) {
     kpb_wire_winsize size;
+    struct timespec deadline;
+    struct pollfd waiting;
     int fd;
     kpb_result result;
     if (!connection) return KPB_ERR_INVALID;
     memset(connection, 0, sizeof *connection);
     connection->fd = -1;
-    result = connect_session(runtime_dir, session_id, &fd);
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
     if (result != KPB_OK) return result;
     size.rows = htons(rows);
     size.columns = htons(columns);
@@ -2504,9 +2977,49 @@ kpb_attach(
         close(fd);
         return result;
     }
+    /* A version-1 attach has no reply frame, so "the broker took it" can only
+     * be seen as the broker's first frame: the replay (at least REPLAY_DONE) or
+     * a refusal, both of which a live broker sends at once.  Waiting for it to
+     * become readable consumes nothing, and is what keeps a stopped broker -
+     * which accepts into its backlog and then says nothing - from looking like
+     * a successful attach. */
+    waiting.fd = fd;
+    waiting.events = POLLIN;
+    for (;;) {
+        long remaining = millis_until(&deadline);
+        int ready;
+        if (remaining <= 0) {
+            close(fd);
+            return KPB_ERR_TIMEOUT;
+        }
+        waiting.revents = 0;
+        ready = poll(&waiting, 1, (int)remaining);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return KPB_ERR_SYSTEM;
+        }
+        if (ready > 0) break;
+    }
     connection->fd = fd;
     copy_string(connection->session_id, sizeof connection->session_id, session_id);
     return KPB_OK;
+}
+
+kpb_result
+kpb_attach(
+    const char *runtime_dir,
+    const char *session_id,
+    unsigned short rows,
+    unsigned short columns,
+    unsigned short xpixel,
+    unsigned short ypixel,
+    kpb_connection *connection
+) {
+    return kpb_attach_timeout(
+        runtime_dir, session_id, rows, columns, xpixel, ypixel, connection, 0);
 }
 
 void
@@ -2535,6 +3048,20 @@ kpb_attach_with_options(
     kpb_connection *connection,
     kpb_attach_result *result
 ) {
+    return kpb_attach_with_options_timeout(
+        runtime_dir, session_id, options, connection, result, 0);
+}
+
+kpb_result
+kpb_attach_with_options_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    const kpb_attach_options *options,
+    kpb_connection *connection,
+    kpb_attach_result *result,
+    int timeout_millis
+) {
+    struct timespec deadline;
     kpb_wire_attach request;
     kpb_wire_attach_reply reply;
     unsigned char staging[256];
@@ -2559,15 +3086,16 @@ kpb_attach_with_options(
         return KPB_ERR_INVALID;
     }
     if (options->max_version < 2) {
-        outcome = kpb_attach(
+        outcome = kpb_attach_timeout(
             runtime_dir, session_id,
             options->rows, options->columns,
-            options->xpixel, options->ypixel, connection);
+            options->xpixel, options->ypixel, connection, timeout_millis);
         if (outcome == KPB_OK && result) result->version = 1;
         return outcome;
     }
 
-    outcome = connect_session(runtime_dir, session_id, &fd);
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    outcome = connect_session_until(runtime_dir, session_id, &fd, &deadline);
     if (outcome != KPB_OK) return outcome;
 
     memset(&request, 0, sizeof request);
@@ -2596,7 +3124,8 @@ kpb_attach_with_options(
     }
     /* A broker that predates version 2 answers with ERROR "invalid request",
      * which lands here as a type mismatch and becomes a protocol error. */
-    outcome = receive_frame(fd, &type, staging, sizeof staging, &payload_size);
+    outcome = receive_frame_bounded(
+        fd, &type, staging, sizeof staging, &payload_size, &deadline);
     if (outcome != KPB_OK) {
         close(fd);
         return outcome;
@@ -2753,22 +3282,26 @@ kpb_detach(kpb_connection *connection) {
 }
 
 kpb_result
-kpb_query_status(
+kpb_query_status_timeout(
     const char *runtime_dir,
     const char *session_id,
-    kpb_status *status
+    kpb_status *status,
+    int timeout_millis
 ) {
     kpb_wire_status wire;
+    struct timespec deadline;
     uint16_t type;
     uint32_t payload_size;
     int fd;
     kpb_result result;
     if (!status) return KPB_ERR_INVALID;
-    result = connect_session(runtime_dir, session_id, &fd);
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
     if (result != KPB_OK) return result;
     result = send_frame(fd, KPB_FRAME_STATUS, NULL, 0);
     if (result == KPB_OK) {
-        result = receive_frame(fd, &type, &wire, sizeof wire, &payload_size);
+        result = receive_frame_bounded(
+            fd, &type, &wire, sizeof wire, &payload_size, &deadline);
         if (result == KPB_OK &&
             (type != KPB_FRAME_STATUS_REPLY || payload_size != sizeof wire)) {
             result = KPB_ERR_PROTOCOL;
@@ -2779,16 +3312,33 @@ kpb_query_status(
 }
 
 kpb_result
-kpb_terminate(const char *runtime_dir, const char *session_id) {
+kpb_query_status(
+    const char *runtime_dir,
+    const char *session_id,
+    kpb_status *status
+) {
+    return kpb_query_status_timeout(runtime_dir, session_id, status, 0);
+}
+
+kpb_result
+kpb_terminate_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    int timeout_millis
+) {
     unsigned char payload[128];
+    struct timespec deadline;
     uint16_t type;
     uint32_t payload_size;
     int fd;
-    kpb_result result = connect_session(runtime_dir, session_id, &fd);
+    kpb_result result;
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
     if (result != KPB_OK) return result;
     result = send_frame(fd, KPB_FRAME_TERMINATE, NULL, 0);
     if (result == KPB_OK) {
-        result = receive_frame(fd, &type, payload, sizeof payload, &payload_size);
+        result = receive_frame_bounded(
+            fd, &type, payload, sizeof payload, &payload_size, &deadline);
         if (result == KPB_OK && (type != KPB_FRAME_ACK || payload_size != 0)) {
             result = KPB_ERR_PROTOCOL;
         }
@@ -2798,21 +3348,331 @@ kpb_terminate(const char *runtime_dir, const char *session_id) {
 }
 
 kpb_result
-kpb_list(const char *runtime_dir, kpb_list_callback callback, void *data) {
+kpb_terminate(const char *runtime_dir, const char *session_id) {
+    return kpb_terminate_timeout(runtime_dir, session_id, 0);
+}
+
+/* --- listing ----------------------------------------------------------- */
+
+static kpb_result
+check_directory(const char *path) {
+    struct stat status;
+    if (lstat(path, &status) != 0) {
+        if (errno == ENOENT) return KPB_ERR_NOT_FOUND;
+        if (errno == ENOTDIR || errno == ELOOP) return KPB_ERR_SECURITY;
+        return KPB_ERR_SYSTEM;
+    }
+    if (S_ISLNK(status.st_mode) || !S_ISDIR(status.st_mode) || status.st_uid != geteuid()) {
+        return KPB_ERR_SECURITY;
+    }
+    return KPB_OK;
+}
+
+kpb_result
+kpb_check_runtime(const char *runtime_dir) {
+    if (!runtime_dir || runtime_dir[0] != '/') return KPB_ERR_INVALID;
+    return check_directory(runtime_dir);
+}
+
+kpb_result
+kpb_session_socket_path(
+    const char *runtime_dir,
+    const char *session_id,
+    char *output,
+    size_t capacity
+) {
+    char resolved[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX + KPB_SESSION_ID_MAX + 32];
+    size_t length;
+    kpb_result result;
+    if (!output || capacity == 0) return KPB_ERR_INVALID;
+    output[0] = '\0';
+    if (!runtime_dir || runtime_dir[0] != '/' || kpb_validate_session_id(session_id) != KPB_OK) {
+        return KPB_ERR_INVALID;
+    }
+    result = resolve_runtime(runtime_dir, resolved);
+    if (result != KPB_OK) return result;
+    length = (size_t)snprintf(
+        path, sizeof path, "%s/sessions/%s/control.sock",
+        strcmp(resolved, "/") == 0 ? "" : resolved, session_id);
+    if (length < capacity) memcpy(output, path, length + 1);
+    return length > KPB_SOCKET_PATH_LIMIT ? KPB_ERR_NAME_TOO_LONG : KPB_OK;
+}
+
+kpb_result
+kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
+    char path[64];
+    ssize_t size;
+    if (!output || capacity < 2) return KPB_ERR_INVALID;
+    output[0] = '\0';
+    if (child_pid <= 0 ||
+        snprintf(path, sizeof path, "/proc/%ld/cwd", (long)child_pid) >= (int)sizeof path) {
+        return KPB_ERR_NOT_FOUND;
+    }
+    size = readlink(path, output, capacity - 1);
+    /* readlink does not NUL-terminate, and a result that fills the buffer may
+     * have been cut short, which would be a plausible but wrong directory. */
+    if (size <= 0 || (size_t)size >= capacity - 1) {
+        output[0] = '\0';
+        return KPB_ERR_NOT_FOUND;
+    }
+    output[size] = '\0';
+    return KPB_OK;
+}
+
+/* At most this many sessions are being queried at once, so a runtime with a
+ * very large number of sessions cannot exhaust descriptors.  Sessions not yet
+ * started when the deadline passes are reported as timed out. */
+#define KPB_LIST_WINDOW 128
+
+typedef enum { LIST_PENDING = 0, LIST_ACTIVE, LIST_DONE } list_state;
+
+typedef struct {
+    char id[KPB_SESSION_ID_MAX + 1];
+    list_state state;
+    kpb_result error;
+    int fd;
+    size_t received;
+    unsigned char *buffer;
+    kpb_status *status;
+} list_slot;
+
+#define LIST_REPLY_SIZE (sizeof(kpb_frame_header) + sizeof(kpb_wire_status))
+
+static void
+list_finish(list_slot *slot, kpb_result error) {
+    if (slot->fd >= 0) close(slot->fd);
+    slot->fd = -1;
+    free(slot->buffer);
+    slot->buffer = NULL;
+    slot->error = error;
+    slot->state = LIST_DONE;
+}
+
+/* Begin one status query without waiting: connect (non-blocking), check the
+ * peer, send the request.  Returns -1 only when descriptors ran out and the
+ * caller should retry once an in-flight query finishes. */
+static int
+list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
+    session_paths paths;
+    struct sockaddr_un address;
+    kpb_result result = build_paths(runtime_dir, slot->id, &paths);
+    int fd;
+    slot->fd = -1;
+    if (result != KPB_OK) {
+        list_finish(slot, result);
+        return 0;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+        if ((errno == EMFILE || errno == ENFILE) && can_defer) return -1;
+        list_finish(slot, KPB_ERR_SYSTEM);
+        return 0;
+    }
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    copy_string(address.sun_path, sizeof address.sun_path, paths.socket_path);
+    if (connect(fd, (struct sockaddr *)&address, sizeof address) != 0) {
+        int saved = errno;
+        close(fd);
+        /* EAGAIN: a full backlog.  The broker is not accepting, which is what
+         * a stopped one looks like once enough dead connections have piled up
+         * behind it. */
+        list_finish(
+            slot,
+            saved == ENOENT || saved == ECONNREFUSED ? KPB_ERR_NOT_FOUND
+            : saved == EAGAIN ? KPB_ERR_TIMEOUT : KPB_ERR_SYSTEM);
+        return 0;
+    }
+    slot->fd = fd;
+    if (!peer_is_owner(fd)) {
+        list_finish(slot, KPB_ERR_SECURITY);
+        return 0;
+    }
+    if (send_frame(fd, KPB_FRAME_STATUS, NULL, 0) != KPB_OK) {
+        list_finish(slot, KPB_ERR_SYSTEM);
+        return 0;
+    }
+    slot->buffer = malloc(LIST_REPLY_SIZE);
+    if (!slot->buffer) {
+        list_finish(slot, KPB_ERR_SYSTEM);
+        return 0;
+    }
+    slot->received = 0;
+    slot->state = LIST_ACTIVE;
+    return 0;
+}
+
+/* Take whatever the broker has sent so far; finish the slot when it is
+ * complete or has failed. */
+static void
+list_receive(list_slot *slot) {
+    for (;;) {
+        ssize_t count;
+        if (slot->received >= LIST_REPLY_SIZE) break;
+        count = recv(
+            slot->fd, slot->buffer + slot->received,
+            LIST_REPLY_SIZE - slot->received, MSG_DONTWAIT);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            list_finish(slot, KPB_ERR_SYSTEM);
+            return;
+        }
+        if (count == 0) {
+            list_finish(slot, KPB_ERR_SYSTEM);
+            return;
+        }
+        slot->received += (size_t)count;
+        if (slot->received >= sizeof(kpb_frame_header)) {
+            kpb_frame_header header;
+            memcpy(&header, slot->buffer, sizeof header);
+            if (ntohl(header.magic) != KPB_PROTOCOL_MAGIC ||
+                ntohs(header.version) != KPB_PROTOCOL_VERSION ||
+                ntohs(header.type) != KPB_FRAME_STATUS_REPLY ||
+                ntohl(header.payload_size) != sizeof(kpb_wire_status)) {
+                list_finish(slot, KPB_ERR_PROTOCOL);
+                return;
+            }
+        }
+    }
+    {
+        kpb_wire_status wire;
+        kpb_result result;
+        memcpy(&wire, slot->buffer + sizeof(kpb_frame_header), sizeof wire);
+        slot->status = malloc(sizeof *slot->status);
+        if (!slot->status) {
+            list_finish(slot, KPB_ERR_SYSTEM);
+            return;
+        }
+        result = wire_to_status(&wire, slot->status);
+        if (result != KPB_OK) {
+            free(slot->status);
+            slot->status = NULL;
+        }
+        list_finish(slot, result);
+    }
+}
+
+/* Query every session at once under one deadline.  The point is that the cost
+ * of wedged brokers does not add up: asking N stopped brokers one after another
+ * with a per-session bound costs N bounds, and a caller with its own timeout
+ * (the engine gives `list` two seconds) would give up on the healthy sessions
+ * behind the first wedged one.  Here every query is in flight together, so the
+ * whole listing costs one deadline however many sessions are stuck. */
+static void
+list_query_all(const char *runtime_dir, list_slot *slots, size_t count, int timeout_millis) {
+    struct pollfd descriptors[KPB_LIST_WINDOW];
+    list_slot *active[KPB_LIST_WINDOW];
+    struct timespec deadline;
+    size_t next = 0;
+    size_t in_flight = 0;
+    size_t finished = 0;
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);
+    while (finished < count) {
+        size_t index;
+        size_t polled = 0;
+        long remaining;
+        int ready;
+        while (next < count && in_flight < KPB_LIST_WINDOW) {
+            list_slot *slot = &slots[next];
+            if (list_start(runtime_dir, slot, in_flight > 0) < 0) break;
+            next++;
+            if (slot->state == LIST_DONE) finished++;
+            else in_flight++;
+        }
+        if (in_flight == 0) continue;
+        remaining = millis_until(&deadline);
+        if (remaining <= 0) {
+            for (index = 0; index < count; index++) {
+                if (slots[index].state == LIST_ACTIVE) {
+                    list_finish(&slots[index], KPB_ERR_TIMEOUT);
+                } else if (slots[index].state == LIST_PENDING) {
+                    slots[index].error = KPB_ERR_TIMEOUT;
+                    slots[index].state = LIST_DONE;
+                }
+            }
+            return;
+        }
+        for (index = 0; index < next; index++) {
+            if (slots[index].state != LIST_ACTIVE) continue;
+            active[polled] = &slots[index];
+            descriptors[polled].fd = slots[index].fd;
+            descriptors[polled].events = POLLIN;
+            descriptors[polled].revents = 0;
+            polled++;
+        }
+        ready = poll(descriptors, (nfds_t)polled, (int)(remaining > 1000L ? 1000L : remaining));
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            for (index = 0; index < polled; index++) list_finish(active[index], KPB_ERR_SYSTEM);
+            finished += polled;
+            in_flight -= polled;
+            continue;
+        }
+        for (index = 0; index < polled; index++) {
+            if (!(descriptors[index].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            list_receive(active[index]);
+            if (active[index]->state == LIST_DONE) {
+                finished++;
+                in_flight--;
+            }
+        }
+    }
+}
+
+kpb_result
+kpb_list_with_options(
+    const char *runtime_dir,
+    const kpb_list_options *options,
+    kpb_list_entry_callback callback,
+    void *data
+) {
     session_paths paths;
     struct dirent *entry;
     DIR *directory;
+    list_slot *slots = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    size_t index;
+    bool stopped = false;
     kpb_result result;
     if (!callback) return KPB_ERR_INVALID;
+    result = kpb_check_runtime(runtime_dir);
+    if (result != KPB_OK) return result;
     result = build_paths(runtime_dir, NULL, &paths);
+    if (result != KPB_OK) return result;
+    result = check_directory(paths.sessions_dir);
+    if (result == KPB_ERR_NOT_FOUND) return KPB_OK;
     if (result != KPB_OK) return result;
     directory = opendir(paths.sessions_dir);
     if (!directory) return errno == ENOENT ? KPB_OK : KPB_ERR_SYSTEM;
     while ((entry = readdir(directory))) {
-        kpb_status status;
         if (!valid_component(entry->d_name)) continue;
-        result = kpb_query_status(runtime_dir, entry->d_name, &status);
-        if (result == KPB_ERR_NOT_FOUND) {
+        if (count == capacity) {
+            size_t grown = capacity ? capacity * 2U : 32U;
+            list_slot *replacement = realloc(slots, grown * sizeof *slots);
+            if (!replacement) {
+                closedir(directory);
+                free(slots);
+                return KPB_ERR_SYSTEM;
+            }
+            slots = replacement;
+            capacity = grown;
+        }
+        memset(&slots[count], 0, sizeof slots[count]);
+        slots[count].fd = -1;
+        copy_string(slots[count].id, sizeof slots[count].id, entry->d_name);
+        count++;
+    }
+    closedir(directory);
+
+    list_query_all(runtime_dir, slots, count, options ? options->timeout_millis : 0);
+
+    for (index = 0; index < count; index++) {
+        list_slot *slot = &slots[index];
+        kpb_list_entry item;
+        if (slot->error == KPB_ERR_NOT_FOUND) {
             /* Nothing is listening in this directory.  If its metadata proves
              * the recorded broker is gone this is a corpse from an uncleanly
              * killed session, and this walk is the natural place to reap it -
@@ -2822,7 +3682,7 @@ kpb_list(const char *runtime_dir, kpb_list_callback callback, void *data) {
              * a respawn that has just recreated this directory can never
              * lose its fresh files to the walk. */
             session_paths stale;
-            if (build_paths(runtime_dir, entry->d_name, &stale) == KPB_OK) {
+            if (build_paths(runtime_dir, slot->id, &stale) == KPB_OK) {
                 int lock_fd = lock_sessions_dir(&stale);
                 if (lock_fd >= 0) {
                     if (session_is_stale(&stale)) reap_stale_session(&stale);
@@ -2831,9 +3691,168 @@ kpb_list(const char *runtime_dir, kpb_list_callback callback, void *data) {
             }
             continue;
         }
-        if (result != KPB_OK) continue;
-        if (callback(&status, data) != 0) break;
+        if (stopped) continue;
+        memset(&item, 0, sizeof item);
+        copy_string(item.session_id, sizeof item.session_id, slot->id);
+        item.error = slot->error;
+        item.reachable = slot->error == KPB_OK && slot->status != NULL;
+        if (item.reachable) item.status = *slot->status;
+        if (callback(&item, data) != 0) stopped = true;
+    }
+    for (index = 0; index < count; index++) {
+        if (slots[index].fd >= 0) close(slots[index].fd);
+        free(slots[index].buffer);
+        free(slots[index].status);
+    }
+    free(slots);
+    return KPB_OK;
+}
+
+typedef struct {
+    kpb_list_callback callback;
+    void *data;
+} list_adapter;
+
+static int
+adapt_list_entry(const kpb_list_entry *entry, void *opaque) {
+    list_adapter *adapter = opaque;
+    if (!entry->reachable) return 0;
+    return adapter->callback(&entry->status, adapter->data);
+}
+
+kpb_result
+kpb_list(const char *runtime_dir, kpb_list_callback callback, void *data) {
+    list_adapter adapter;
+    if (!callback) return KPB_ERR_INVALID;
+    adapter.callback = callback;
+    adapter.data = data;
+    return kpb_list_with_options(runtime_dir, NULL, adapt_list_entry, &adapter);
+}
+
+/* --- the reaped archive ------------------------------------------------ */
+
+static int
+compare_reaped_entries(const void *left_opaque, const void *right_opaque) {
+    const kpb_reaped_entry *left = left_opaque;
+    const kpb_reaped_entry *right = right_opaque;
+    if (left->started_millis != right->started_millis) {
+        return left->started_millis < right->started_millis ? -1 : 1;
+    }
+    return strcmp(left->session_id, right->session_id);
+}
+
+/* Collect the archive, oldest-started first.  *out is malloc'd. */
+static kpb_result
+collect_reaped(const char *runtime_dir, kpb_reaped_entry **out, size_t *out_count) {
+    session_paths paths;
+    kpb_reaped_entry *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *entry;
+    DIR *directory;
+    kpb_result result = kpb_check_runtime(runtime_dir);
+    *out = NULL;
+    *out_count = 0;
+    if (result != KPB_OK) return result;
+    result = build_paths(runtime_dir, NULL, &paths);
+    if (result != KPB_OK) return result;
+    result = check_directory(paths.reaped_dir);
+    if (result == KPB_ERR_NOT_FOUND) return KPB_OK;
+    if (result != KPB_OK) return result;
+    directory = opendir(paths.reaped_dir);
+    if (!directory) return errno == ENOENT ? KPB_OK : KPB_ERR_SYSTEM;
+    while ((entry = readdir(directory))) {
+        kpb_reaped_entry item;
+        struct stat journal;
+        struct stat meta;
+        char data[2048];
+        if (count == capacity) {
+            size_t grown = capacity ? capacity * 2U : 16U;
+            kpb_reaped_entry *replacement = realloc(entries, grown * sizeof *entries);
+            if (!replacement) {
+                closedir(directory);
+                free(entries);
+                return KPB_ERR_SYSTEM;
+            }
+            entries = replacement;
+            capacity = grown;
+        }
+        memset(&item, 0, sizeof item);
+        if (!parse_archive_name(entry->d_name, item.session_id, &item.started_millis)) continue;
+        if (join_path(item.journal_path, sizeof item.journal_path, paths.reaped_dir, entry->d_name) != 0 ||
+            lstat(item.journal_path, &journal) != 0 || !S_ISREG(journal.st_mode)) {
+            continue;
+        }
+        item.journal_bytes = (uint64_t)journal.st_size;
+        memcpy(item.meta_path, item.journal_path, sizeof item.meta_path);
+        if (meta_path_for(item.meta_path, sizeof item.meta_path) == 0 &&
+            lstat(item.meta_path, &meta) == 0 && S_ISREG(meta.st_mode)) {
+            ssize_t size = read_small_file(item.meta_path, data, sizeof data);
+            const char *line = data;
+            if (size > 0) {
+                while (line && *line) {
+                    if (strncmp(line, "reaped_millis=", 14) == 0) {
+                        item.reaped_millis = (uint64_t)strtoull(line + 14, NULL, 10);
+                    }
+                    line = strchr(line, '\n');
+                    if (line) line++;
+                }
+            }
+        } else {
+            item.meta_path[0] = '\0';
+        }
+        entries[count++] = item;
     }
     closedir(directory);
+    if (count > 1) qsort(entries, count, sizeof *entries, compare_reaped_entries);
+    *out = entries;
+    *out_count = count;
     return KPB_OK;
+}
+
+kpb_result
+kpb_list_reaped(const char *runtime_dir, kpb_reaped_callback callback, void *data) {
+    kpb_reaped_entry *entries;
+    size_t count;
+    size_t index;
+    kpb_result result;
+    if (!callback) return KPB_ERR_INVALID;
+    result = collect_reaped(runtime_dir, &entries, &count);
+    if (result != KPB_OK) return result;
+    for (index = 0; index < count; index++) {
+        if (callback(&entries[index], data) != 0) break;
+    }
+    free(entries);
+    return KPB_OK;
+}
+
+kpb_result
+kpb_reaped_path(
+    const char *runtime_dir,
+    const char *session_id,
+    char *output,
+    size_t capacity
+) {
+    kpb_reaped_entry *entries;
+    size_t count;
+    size_t index;
+    kpb_result result;
+    if (!output || capacity == 0) return KPB_ERR_INVALID;
+    output[0] = '\0';
+    if (kpb_validate_session_id(session_id) != KPB_OK) return KPB_ERR_INVALID;
+    result = collect_reaped(runtime_dir, &entries, &count);
+    if (result != KPB_OK) return result;
+    result = KPB_ERR_NOT_FOUND;
+    /* Sorted oldest-started first, so the newest is the last match. */
+    for (index = count; index > 0; index--) {
+        if (strcmp(entries[index - 1].session_id, session_id) != 0) continue;
+        if (copy_string(output, capacity, entries[index - 1].journal_path) == 0) {
+            result = KPB_OK;
+        } else {
+            result = KPB_ERR_BUFFER;
+        }
+        break;
+    }
+    free(entries);
+    return result;
 }

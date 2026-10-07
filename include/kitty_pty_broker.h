@@ -10,8 +10,8 @@ extern "C" {
 #endif
 
 #define KPB_VERSION_MAJOR 0
-#define KPB_VERSION_MINOR 3
-#define KPB_VERSION_PATCH 1
+#define KPB_VERSION_MINOR 4
+#define KPB_VERSION_PATCH 0
 
 /* Read-only observers may attach alongside the single read-write client. They
  * never claim the read-write slot, never reach the PTY, and are disconnected
@@ -30,6 +30,23 @@ extern "C" {
 #define KPB_IO_CHUNK (32U * 1024U)
 #define KPB_DEFAULT_JOURNAL_LIMIT (64ULL * 1024ULL * 1024ULL)
 #define KPB_DEFAULT_TRANSCRIPT_LIMIT (8ULL * 1024ULL * 1024ULL)
+
+/* Every client operation that waits on a broker is bounded.  A broker that is
+ * stopped, wedged, or swapped out never answers, and an unbounded wait turns
+ * that one session into a hang for everything that asks about it.  Timeouts
+ * are in milliseconds; a value <= 0 selects the default. */
+#define KPB_DEFAULT_TIMEOUT_MILLIS 2000
+/* The overall deadline of a whole list, shared by every session it queries. */
+#define KPB_DEFAULT_LIST_TIMEOUT_MILLIS 1000
+
+/* The longest socket path a Unix domain socket can bind, excluding the NUL. */
+#define KPB_SOCKET_PATH_LIMIT 107
+
+/* Bounds on RUNTIME/reaped/, the archive of journals from reaped sessions.
+ * Overridable through the environment of the process that does the reaping
+ * (KITTY_PTY_BROKER_REAPED_MAX_BYTES, KITTY_PTY_BROKER_REAPED_MAX_FILES). */
+#define KPB_DEFAULT_REAPED_MAX_BYTES (256ULL * 1024ULL * 1024ULL)
+#define KPB_DEFAULT_REAPED_MAX_FILES 64U
 
 /* The replay journal and the transcript are deliberately different things.
  * The journal is a bounded buffer whose only job is to repaint a reattaching
@@ -50,7 +67,12 @@ typedef enum {
     KPB_ERR_BUSY = 6,
     KPB_ERR_PROTOCOL = 7,
     KPB_ERR_BUFFER = 8,
-    KPB_ERR_CHILD = 9
+    KPB_ERR_CHILD = 9,
+    /* Appended after KPB_ERR_CHILD.  Neither is ever sent on the wire: a broker
+     * reports only the values above, and a client treats anything else it is
+     * handed as a protocol error. */
+    KPB_ERR_TIMEOUT = 10,
+    KPB_ERR_NAME_TOO_LONG = 11
 } kpb_result;
 
 typedef struct {
@@ -144,6 +166,43 @@ typedef struct {
 
 typedef int (*kpb_list_callback)(const kpb_status *status, void *data);
 
+/* One session found by kpb_list_with_options.  A session that is listening and
+ * answered is reachable.  A session whose status could not be had for any
+ * reason other than "nothing is listening" - it did not answer in time, the
+ * peer failed the owner check, it spoke garbage - is reported with
+ * reachable == 0 and the reason in `error`; `status` is then meaningless.  A
+ * directory with nothing listening is a corpse, not a session, and is never
+ * reported (it is reaped when its broker is provably gone). */
+typedef struct {
+    char session_id[KPB_SESSION_ID_MAX + 1];
+    int reachable;
+    kpb_result error;
+    kpb_status status;
+} kpb_list_entry;
+
+typedef struct {
+    /* The overall deadline for the whole listing, shared by all sessions,
+     * which are queried concurrently.  <= 0 selects
+     * KPB_DEFAULT_LIST_TIMEOUT_MILLIS. */
+    int timeout_millis;
+} kpb_list_options;
+
+typedef int (*kpb_list_entry_callback)(const kpb_list_entry *entry, void *data);
+
+/* A journal kept when its session was reaped (see kpb_list_reaped). */
+typedef struct {
+    char session_id[KPB_SESSION_ID_MAX + 1];
+    uint64_t started_millis;
+    /* 0 when the .meta file is absent or does not record it. */
+    uint64_t reaped_millis;
+    uint64_t journal_bytes;
+    char journal_path[KPB_PATH_MAX];
+    /* Empty when there is no .meta file. */
+    char meta_path[KPB_PATH_MAX];
+} kpb_reaped_entry;
+
+typedef int (*kpb_reaped_callback)(const kpb_reaped_entry *entry, void *data);
+
 void kpb_spawn_options_init(kpb_spawn_options *options);
 void kpb_attach_options_init(kpb_attach_options *options);
 const char *kpb_result_string(kpb_result result);
@@ -174,6 +233,29 @@ kpb_result kpb_attach_with_options(
     const kpb_attach_options *options,
     kpb_connection *connection,
     kpb_attach_result *result
+);
+/* The same attaches with an explicit bound on connecting and on the broker's
+ * first answer.  A plain version-1 attach has no reply frame, so the answer it
+ * waits for is the first frame of the replay, which a live broker sends
+ * immediately; nothing is consumed.  Returns KPB_ERR_TIMEOUT when it expires.
+ * kpb_attach and kpb_attach_with_options use KPB_DEFAULT_TIMEOUT_MILLIS. */
+kpb_result kpb_attach_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    unsigned short rows,
+    unsigned short columns,
+    unsigned short xpixel,
+    unsigned short ypixel,
+    kpb_connection *connection,
+    int timeout_millis
+);
+kpb_result kpb_attach_with_options_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    const kpb_attach_options *options,
+    kpb_connection *connection,
+    kpb_attach_result *result,
+    int timeout_millis
 );
 kpb_result kpb_observe(
     const char *runtime_dir,
@@ -214,10 +296,86 @@ kpb_result kpb_query_status(
     kpb_status *status
 );
 kpb_result kpb_terminate(const char *runtime_dir, const char *session_id);
+/* Bounded forms (KPB_ERR_TIMEOUT on expiry); the plain forms above use
+ * KPB_DEFAULT_TIMEOUT_MILLIS.  A terminate that times out after its request
+ * was sent may still be acted on by the broker later. */
+kpb_result kpb_query_status_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    kpb_status *status,
+    int timeout_millis
+);
+kpb_result kpb_terminate_timeout(
+    const char *runtime_dir,
+    const char *session_id,
+    int timeout_millis
+);
+
+/* Calls `callback` for every reachable session, in directory order, until it
+ * returns nonzero.  All sessions are queried concurrently under one overall
+ * deadline (KPB_DEFAULT_LIST_TIMEOUT_MILLIS), so any number of wedged brokers
+ * costs one deadline, not one each; sessions that do not answer in time are
+ * left out.  Returns KPB_ERR_NOT_FOUND when `runtime_dir` does not exist (a
+ * runtime that exists with no sessions is an empty listing) and
+ * KPB_ERR_SECURITY when it is a symlink, not a directory, or not owned by the
+ * caller.  Corpses whose broker is provably gone are reaped on the way. */
 kpb_result kpb_list(
     const char *runtime_dir,
     kpb_list_callback callback,
     void *data
+);
+/* As kpb_list, but options select the deadline and unreachable sessions are
+ * reported through the callback instead of being left out.  `options` may be
+ * NULL for the defaults. */
+kpb_result kpb_list_with_options(
+    const char *runtime_dir,
+    const kpb_list_options *options,
+    kpb_list_entry_callback callback,
+    void *data
+);
+
+/* KPB_OK when `runtime_dir` is an existing real directory owned by the
+ * caller; KPB_ERR_NOT_FOUND when it does not exist; KPB_ERR_SECURITY when it
+ * is a symlink, not a directory, or owned by someone else.  Read-only: unlike
+ * kpb_prepare_runtime it creates and changes nothing. */
+kpb_result kpb_check_runtime(const char *runtime_dir);
+
+/* The socket path a session would use, written to `output` (NUL-terminated,
+ * and left empty if it does not fit `capacity`).  Returns
+ * KPB_ERR_NAME_TOO_LONG when it exceeds KPB_SOCKET_PATH_LIMIT bytes, in which
+ * case no session can live there; the path is still written so a caller can
+ * say what it was.  Creates nothing. */
+kpb_result kpb_session_socket_path(
+    const char *runtime_dir,
+    const char *session_id,
+    char *output,
+    size_t capacity
+);
+
+/* The current directory of the session's command, read from /proc/CHILD/cwd.
+ * kpb_status.cwd is the directory the session STARTED in and never changes.
+ * Returns KPB_ERR_NOT_FOUND where /proc is not available, the process is gone,
+ * or it belongs to another user.  This runs in the caller, not the broker, and
+ * adds nothing to the wire. */
+kpb_result kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity);
+
+/* Journals of sessions whose broker died uncleanly.  Reaping such a session
+ * moves its journal to RUNTIME/reaped/ID.STARTED_MILLIS.journal beside an
+ * ID.STARTED_MILLIS.meta file instead of deleting it, and bounds that
+ * directory (KPB_DEFAULT_REAPED_MAX_BYTES, KPB_DEFAULT_REAPED_MAX_FILES; oldest
+ * evicted first).  kpb_list_reaped reports them oldest-started first; a missing
+ * reaped/ directory is an empty listing.  kpb_reaped_path writes the journal
+ * path of the newest archive for `session_id`, or returns KPB_ERR_NOT_FOUND. */
+kpb_result kpb_list_reaped(
+    const char *runtime_dir,
+    kpb_reaped_callback callback,
+    void *data
+);
+kpb_result kpb_reaped_path(
+    const char *runtime_dir,
+    const char *session_id,
+    char *output,
+    size_t capacity
 );
 
 #ifdef __cplusplus
