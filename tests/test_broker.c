@@ -5639,6 +5639,9 @@ test_interrupted_metadata_writes_are_reaped_in_one_listing(void) {
         {"only-provisional", false, NULL, "COMPLETE", NULL, true},
         /* the same, but the file is cut short: no newline, so it proves nothing and is left alone */
         {"truncated-provisional", false, NULL, "TRUNCATED", NULL, false},
+        /* newline-terminated and parseable as a pid, but missing the boot id and start time:
+         * not a whole record, so no proof */
+        {"prefix-only", false, NULL, "PREFIX", NULL, false},
         /* a stray entry: not ours to remove, so NOTHING is removed and the proof stays */
         {"unknown-entry", true, "version=1\nbroker_pid=1\n", "COMPLETE", "stray.txt", false},
     };
@@ -5665,10 +5668,16 @@ test_interrupted_metadata_writes_are_reaped_in_one_listing(void) {
         if (item->provisional) {
             CHECK(snprintf(path, sizeof path, "%s/metadata.provisional", directory) < (int)sizeof path);
             if (strcmp(item->provisional, "COMPLETE") == 0) {
+                char boot[64];
+                read_current_boot_id(boot);
                 CHECK(snprintf(
                     text, sizeof text,
-                    "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\n",
-                    item->id, (long)dead) < (int)sizeof text);
+                    "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\n"
+                    "boot_id=%s\nstart_ticks=1\n",
+                    item->id, (long)dead, boot) < (int)sizeof text);
+            } else if (strcmp(item->provisional, "PREFIX") == 0) {
+                /* newline-terminated and parseable as a pid, but not the whole record */
+                CHECK(snprintf(text, sizeof text, "broker_pid=%ld\n", (long)dead) < (int)sizeof text);
             } else {
                 /* cut mid-line: a different, shorter pid would parse out of it */
                 CHECK(snprintf(
@@ -5839,6 +5848,279 @@ test_a_connection_that_ends_without_a_reply_is_nothing_listening(void) {
     remove_tree(scratch);
 }
 
+
+/* --- fix round 6 -------------------------------------------------------------- */
+
+static void
+full_identity_text(char *out, size_t capacity, const char *id, pid_t pid, bool provisional) {
+    char boot[64];
+    read_current_boot_id(boot);
+    CHECK(snprintf(
+        out, capacity,
+        "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=%d\nstarted_millis=5\nboot_id=%s\nstart_ticks=%llu\n",
+        id, (long)pid, provisional ? -1 : 1, boot, read_start_ticks(pid)) < (int)capacity);
+}
+
+/* F-R5-1: a connection that ends without a reply is only a CANDIDATE for "the
+ * broker is gone".  A LIVE broker closes without a word too (a valid request that
+ * reaches it after its handshake budget has expired; a frame it refuses), and it
+ * must stay in the listing - as an unreachable row with a reason - while a dead
+ * one is still reaped in that very listing. */
+static void
+test_a_live_broker_that_ends_a_connection_without_a_reply_stays_listed(void) {
+    char scratch[64];
+    static const struct { const char *name; bool reset; } kinds[] = {
+        {"eof", false}, {"rst", true},
+    };
+    size_t index;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (index = 0; index < 2; index++) {
+        char live_id[32];
+        char directory[KPB_PATH_MAX];
+        char path[KPB_PATH_MAX];
+        char metadata[512];
+        list_tally tally;
+        kpb_list_options options = {.timeout_millis = 1000};
+        pid_t server;
+        CHECK(snprintf(live_id, sizeof live_id, "live-%s", kinds[index].name) < (int)sizeof live_id);
+
+        /* The recorded broker is alive - this very process, identity and all. */
+        if (kinds[index].reset) fake_broker_resets = true; else fake_broker_closes = true;
+        server = fake_broker(scratch, live_id, NULL, 0, NULL, 0, 0);
+        CHECK(snprintf(directory, sizeof directory, "%s/sessions/%s", scratch, live_id)
+              < (int)sizeof directory);
+        full_identity_text(metadata, sizeof metadata, live_id, getpid(), false);
+        CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+        write_text_file(path, metadata);
+        memset(&tally, 0, sizeof tally);
+        CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+        CHECK(tally.healthy == 0);
+        CHECK(tally.unreachable == 1);                       /* still listed ... */
+        CHECK(tally_has(tally.unreachable_ids, tally.unreachable, live_id));
+        CHECK(tally.last_error == (int)KPB_ERR_SYSTEM);      /* ... with a reason */
+        CHECK(exists(directory));                            /* ... and kept */
+        end_child(server);
+    }
+    remove_tree(scratch);
+}
+
+/* The TUI shows that live broker, rather than "0 SESSIONS". */
+static void
+test_the_tui_lists_a_live_broker_that_ended_its_connection_without_a_reply(void) {
+    char cli_path[KPB_PATH_MAX];
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    char metadata[512];
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    size_t used = 0;
+    int master;
+    int wait_status;
+    pid_t child;
+    pid_t server;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    fake_broker_closes = true;
+    server = fake_broker(scratch, "lively", NULL, 0, NULL, 0, 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/lively", scratch) < (int)sizeof directory);
+    full_identity_text(metadata, sizeof metadata, "lively", getpid(), false);
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    write_text_file(path, metadata);
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(cli_path, cli_path, "--runtime-dir", scratch, "--timeout", "0.5", "tui", (char *)NULL);
+        _exit(127);
+    }
+    used = read_pty_until(master, output, used, sizeof output, "lively");
+    used = read_pty_until(master, output, used, sizeof output, "unreachable");
+    CHECK(memmem(output, used, "0 SESSIONS", 10) == NULL);
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+    close(master);
+    end_child(server);
+    remove_tree(scratch);
+}
+
+/* F-R5-2: cleanup keeps whichever file licensed it until EVERYTHING else is gone.
+ * An unlink that fails (here, a directory sitting where a file belongs) must leave
+ * the proof, so a later listing can finish once the obstruction is cleared. */
+static void
+test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    static const char *const obstructed[] = {"metadata.tmp", "control.sock", "journal.bin"};
+    static const bool provisional_proof[] = {false, true};
+    char scratch[64];
+    size_t which;
+    size_t how;
+    int seen = 0;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (how = 0; how < 2; how++) {
+        for (which = 0; which < 3; which++) {
+            char id[48];
+            char directory[KPB_PATH_MAX];
+            char path[KPB_PATH_MAX];
+            char text[512];
+            kpb_spawn_options options;
+            pid_t dead = dead_pid();
+            int round;
+            CHECK(snprintf(id, sizeof id, "obs-%zu-%zu", how, which) < (int)sizeof id);
+            /* the identity names a dead broker */
+            CHECK(snprintf(
+                text, sizeof text,
+                "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\nboot_id=",
+                id, (long)dead) < (int)sizeof text);
+            {
+                char boot[64];
+                size_t used = strlen(text);
+                read_current_boot_id(boot);
+                CHECK(snprintf(text + used, sizeof text - used, "%s\nstart_ticks=1\n", boot)
+                      < (int)(sizeof text - used));
+            }
+            make_fake_session(
+                scratch, id, provisional_proof[how] ? NULL : text, "journal bytes", directory);
+            if (provisional_proof[how]) {
+                CHECK(snprintf(path, sizeof path, "%s/metadata.provisional", directory) < (int)sizeof path);
+                write_text_file(path, text);
+            }
+            CHECK(snprintf(path, sizeof path, "%s/control.sock", directory) < (int)sizeof path);
+            if (strcmp(obstructed[which], "control.sock") != 0) write_text_file(path, "");
+            CHECK(snprintf(path, sizeof path, "%s/%s", directory, obstructed[which]) < (int)sizeof path);
+            if (strcmp(obstructed[which], "journal.bin") == 0) CHECK(unlink(path) == 0);
+            CHECK(mkdir(path, 0700) == 0);   /* unlink of a directory fails */
+
+            /* The cleanup fails, repeatedly, and the proof is still there. */
+            for (round = 0; round < 3; round++) {
+                CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+                CHECK(exists(directory));
+                CHECK(snprintf(path, sizeof path, "%s/%s", directory,
+                               provisional_proof[how] ? "metadata.provisional" : "metadata")
+                      < (int)sizeof path);
+                CHECK(exists(path));
+            }
+            /* Once the obstruction is gone ONE listing finishes the job. */
+            CHECK(snprintf(path, sizeof path, "%s/%s", directory, obstructed[which]) < (int)sizeof path);
+            CHECK(rmdir(path) == 0);
+            CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+            CHECK(!exists(directory));
+            kpb_spawn_options_init(&options);
+            options.runtime_dir = scratch;
+            options.session_id = id;
+            options.cwd = "/tmp";
+            options.argv = command;
+            CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+            CHECK(kpb_terminate(scratch, id) == KPB_OK);
+            wait_until_gone(scratch, id);
+        }
+    }
+    remove_tree(scratch);
+}
+
+/* F-R5-3: an identity file that is not a regular file of ours is no proof, and
+ * must never be able to hold the sessions lock - a FIFO used to block the read. */
+static void
+test_a_fifo_where_identity_belongs_cannot_hang_list_run_or_the_tui(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    static const char *const names[] = {"metadata", "metadata.provisional"};
+    char cli_path[KPB_PATH_MAX];
+    char scratch[64];
+    size_t which;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (which = 0; which < 2; which++) {
+        char id[32];
+        char directory[KPB_PATH_MAX];
+        char path[KPB_PATH_MAX];
+        kpb_spawn_options options;
+        list_tally tally;
+        kpb_list_options list_options = {.timeout_millis = 300};
+        long started;
+        struct winsize size = {.ws_row = 24, .ws_col = 100};
+        unsigned char output[65536];
+        size_t used = 0;
+        int master;
+        int wait_status;
+        pid_t child;
+        CHECK(snprintf(id, sizeof id, "fifo-%zu", which) < (int)sizeof id);
+        make_fake_session(scratch, id, NULL, NULL, directory);
+        CHECK(snprintf(path, sizeof path, "%s/%s", directory, names[which]) < (int)sizeof path);
+        CHECK(mkfifo(path, 0600) == 0);
+
+        alarm(30);   /* a hang is a failure, not a stuck test run */
+        memset(&tally, 0, sizeof tally);
+        started = now_millis();
+        CHECK(kpb_list_with_options(scratch, &list_options, tally_entry, &tally) == KPB_OK);
+        CHECK(now_millis() - started < 1500);
+        CHECK(exists(directory));
+        kpb_spawn_options_init(&options);
+        options.runtime_dir = scratch;
+        options.session_id = id;
+        options.cwd = "/tmp";
+        options.argv = command;
+        started = now_millis();
+        CHECK(kpb_spawn_timeout(&options, NULL, 300) == KPB_ERR_EXISTS);
+        CHECK(now_millis() - started < 1500);
+
+        /* The TUI stays responsive: it draws, and q quits. */
+        child = forkpty(&master, NULL, NULL, &size);
+        CHECK(child >= 0);
+        if (child == 0) {
+            execl(cli_path, cli_path, "--runtime-dir", scratch, "--timeout", "0.3", "tui", (char *)NULL);
+            _exit(127);
+        }
+        used = read_pty_until(master, output, used, sizeof output, "KILIX TUI");
+        CHECK(write(master, "q", 1) == 1);
+        CHECK(waitpid(child, &wait_status, 0) == child);
+        CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+        close(master);
+        alarm(0);
+
+        CHECK(unlink(path) == 0);
+        CHECK(rmdir(directory) == 0);
+    }
+    remove_tree(scratch);
+}
+
+/* Identity files are bounded: a large file where metadata belongs is no proof. */
+static void
+test_an_oversized_identity_file_is_no_proof(void) {
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    char *big;
+    FILE *stream;
+    int seen = 0;
+    size_t padding = 6000;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    make_fake_session(scratch, "huge", NULL, NULL, directory);
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    stream = fopen(path, "w");
+    CHECK(stream != NULL);
+    CHECK(fprintf(stream, "version=1\nid=huge\nbroker_pid=%ld\n", (long)dead_pid()) > 0);
+    big = malloc(padding + 1);
+    CHECK(big != NULL);
+    memset(big, 'x', padding);
+    big[padding] = '\0';
+    CHECK(fprintf(stream, "junk=%s\n", big) > 0);
+    free(big);
+    CHECK(fclose(stream) == 0);
+    CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+    CHECK(exists(directory));   /* without the size bound the first lines would have proved it stale */
+    remove_tree(scratch);
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -5953,6 +6235,11 @@ main(int argc, char **argv) {
     RUN(test_interrupted_metadata_writes_are_reaped_in_one_listing);
     RUN(test_a_brokers_exit_removes_exactly_the_known_files);
     RUN(test_a_connection_that_ends_without_a_reply_is_nothing_listening);
+    RUN(test_a_live_broker_that_ends_a_connection_without_a_reply_stays_listed);
+    RUN(test_the_tui_lists_a_live_broker_that_ended_its_connection_without_a_reply);
+    RUN(test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes);
+    RUN(test_a_fifo_where_identity_belongs_cannot_hang_list_run_or_the_tui);
+    RUN(test_an_oversized_identity_file_is_no_proof);
     RUN(test_an_unreadable_boot_id_is_never_proof_of_death);
     RUN(test_an_unreadable_proc_stat_is_never_proof_of_death);
     RUN(test_concurrent_respawn_of_one_corpse_has_exactly_one_winner);
