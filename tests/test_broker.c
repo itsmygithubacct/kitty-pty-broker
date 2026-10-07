@@ -2511,6 +2511,45 @@ test_observer_replay_truncation_is_flagged(void) {
     wait_for_session_end("truncate");
 }
 
+typedef struct {
+    int healthy;
+    int unreachable;
+    int timed_out;
+    int last_error;
+    char reachable_ids[8][KPB_SESSION_ID_MAX + 1];
+    char unreachable_ids[8][KPB_SESSION_ID_MAX + 1];
+} list_tally;
+
+static int
+tally_entry(const kpb_list_entry *entry, void *data) {
+    list_tally *tally = data;
+    if (entry->reachable) {
+        CHECK(entry->error == KPB_OK);
+        CHECK(strcmp(entry->session_id, entry->status.session_id) == 0);
+        if (tally->healthy < 8) {
+            strcpy(tally->reachable_ids[tally->healthy], entry->session_id);
+        }
+        tally->healthy++;
+    } else {
+        if (tally->unreachable < 8) {
+            strcpy(tally->unreachable_ids[tally->unreachable], entry->session_id);
+        }
+        tally->unreachable++;
+        tally->last_error = (int)entry->error;
+        if (entry->error == KPB_ERR_TIMEOUT) tally->timed_out++;
+    }
+    return 0;
+}
+
+static bool
+tally_has(char ids[8][KPB_SESSION_ID_MAX + 1], int count, const char *id) {
+    int index;
+    for (index = 0; index < count && index < 8; index++) {
+        if (strcmp(ids[index], id) == 0) return true;
+    }
+    return false;
+}
+
 static int
 ignore_session(const kpb_status *status, void *data) {
     (void)status;
@@ -2559,20 +2598,26 @@ test_dead_session_directory_is_reaped(void) {
     CHECK(waitpid(status.broker_pid, NULL, 0) == status.broker_pid);
     (void)kill(status.child_pid, SIGKILL);
     CHECK(lstat(session_dir, &probe) == 0);
-    /* Reaping is best-effort and eventual - "the next listing reaps it" is the
-     * contract, not "the first listing always does": a listing that cannot reap
-     * (the sessions lock busy, a transient failure of one connect) leaves the
-     * corpse for the next.  So allow a few listings, and require that it IS
-     * reaped, and that it stays reaped. */
+    /* Reaping is best-effort when something TRANSIENT gets in its way: a
+     * listing whose connect to the corpse failed for a reason other than "nothing
+     * is listening" reports it as unreachable and, by contract, leaves it for the
+     * next listing.  That - and only that - is allowed to cost a second listing.
+     * A listing that saw "nothing listening" and still left the corpse behind is
+     * a bug, not a retry: the corpse must be gone after it.  (A residue the
+     * reaper cannot clear is not transient either; see
+     * test_interrupted_metadata_writes_are_reaped_in_one_listing.) */
     {
         int walks;
         for (walks = 0; walks < 5; walks++) {
-            CHECK(kpb_list(runtime_dir, ignore_session, NULL) == KPB_OK);
+            list_tally tally;
+            kpb_list_options options = {.timeout_millis = 1000};
+            memset(&tally, 0, sizeof tally);
+            CHECK(kpb_list_with_options(runtime_dir, &options, tally_entry, &tally) == KPB_OK);
             if (lstat(session_dir, &probe) != 0) break;
+            /* Still there: acceptable only if this listing reported it unreachable. */
+            CHECK(tally_has(tally.unreachable_ids, tally.unreachable, "corpse"));
+            fprintf(stderr, "note: a transient failure delayed reaping the corpse (listing %d, error %d: %s)\n", walks + 1, tally.last_error, kpb_result_string((kpb_result)tally.last_error));
             usleep(100000);
-        }
-        if (walks > 0) {
-            fprintf(stderr, "note: the corpse needed %d extra listing(s) to be reaped\n", walks);
         }
     }
     CHECK(lstat(session_dir, &probe) != 0 && errno == ENOENT);
@@ -2676,43 +2721,6 @@ make_scratch_runtime(char *buffer, size_t capacity) {
     CHECK(capacity > sizeof pattern);
     memcpy(buffer, pattern, sizeof pattern);
     CHECK(mkdtemp(buffer) != NULL);
-}
-
-typedef struct {
-    int healthy;
-    int unreachable;
-    int timed_out;
-    char reachable_ids[8][KPB_SESSION_ID_MAX + 1];
-    char unreachable_ids[8][KPB_SESSION_ID_MAX + 1];
-} list_tally;
-
-static int
-tally_entry(const kpb_list_entry *entry, void *data) {
-    list_tally *tally = data;
-    if (entry->reachable) {
-        CHECK(entry->error == KPB_OK);
-        CHECK(strcmp(entry->session_id, entry->status.session_id) == 0);
-        if (tally->healthy < 8) {
-            strcpy(tally->reachable_ids[tally->healthy], entry->session_id);
-        }
-        tally->healthy++;
-    } else {
-        if (tally->unreachable < 8) {
-            strcpy(tally->unreachable_ids[tally->unreachable], entry->session_id);
-        }
-        tally->unreachable++;
-        if (entry->error == KPB_ERR_TIMEOUT) tally->timed_out++;
-    }
-    return 0;
-}
-
-static bool
-tally_has(char ids[8][KPB_SESSION_ID_MAX + 1], int count, const char *id) {
-    int index;
-    for (index = 0; index < count && index < 8; index++) {
-        if (strcmp(ids[index], id) == 0) return true;
-    }
-    return false;
 }
 
 static pid_t
@@ -5392,6 +5400,419 @@ test_a_stalled_v2_frame_names_the_cursor_and_the_right_flag(void) {
     remove_tree(scratch);
 }
 
+
+/* --- fix round 5: generations and residue ---------------------------------- */
+
+typedef struct {
+    pid_t caller;
+    pid_t broker;
+} traced_spawn;
+
+/* Run kpb_spawn_timeout in a child that is traced for fork, and stop when it has
+ * forked its broker: the CALLER is held in the fork event stop - before it can
+ * publish anything - and the broker is held in its first instruction.  Returns
+ * false if tracing is refused here. */
+static bool
+traced_spawn_begin(
+    const char *scratch,
+    const char *id,
+    char *const *command,
+    traced_spawn *traced
+) {
+    kpb_spawn_options options;
+    int wait_status;
+    traced->broker = -1;
+    traced->caller = fork();
+    CHECK(traced->caller >= 0);
+    if (traced->caller == 0) {
+        raise(SIGSTOP);
+        kpb_spawn_options_init(&options);
+        options.runtime_dir = scratch;
+        options.session_id = id;
+        options.cwd = "/tmp";
+        options.argv = command;
+        _exit((int)kpb_spawn_timeout(&options, NULL, 100));
+    }
+    CHECK(waitpid(traced->caller, &wait_status, WUNTRACED) == traced->caller && WIFSTOPPED(wait_status));
+    if (ptrace(PTRACE_SEIZE, traced->caller, 0, PTRACE_O_TRACEFORK) != 0) {
+        printf("skip  %s (ptrace refused: %s)\n", current_test, strerror(errno));
+        (void)kill(traced->caller, SIGKILL);
+        (void)waitpid(traced->caller, NULL, 0);
+        return false;
+    }
+    (void)kill(traced->caller, SIGCONT);
+    alarm(60);
+    for (;;) {
+        unsigned long child_pid = 0;
+        CHECK(waitpid(traced->caller, &wait_status, __WALL) == traced->caller);
+        CHECK(WIFSTOPPED(wait_status));
+        if ((wait_status >> 16) == PTRACE_EVENT_FORK) {
+            CHECK(ptrace(PTRACE_GETEVENTMSG, traced->caller, 0, &child_pid) == 0);
+            traced->broker = (pid_t)child_pid;
+            /* Collect the broker's initial stop; it stays stopped. */
+            CHECK(waitpid(traced->broker, &wait_status, __WALL) == traced->broker);
+            alarm(0);
+            return true;   /* the caller stays in its event stop */
+        }
+        {
+            int signal_number = WSTOPSIG(wait_status);
+            CHECK(ptrace(PTRACE_CONT, traced->caller, 0,
+                (signal_number == SIGSTOP || signal_number == SIGTRAP) ? 0 : signal_number) == 0);
+        }
+    }
+}
+
+/* Let a held caller run on to its exit; returns its exit status. */
+static int
+traced_caller_finish(traced_spawn *traced) {
+    int wait_status;
+    alarm(60);
+    CHECK(ptrace(PTRACE_CONT, traced->caller, 0, 0) == 0);
+    for (;;) {
+        CHECK(waitpid(traced->caller, &wait_status, __WALL) == traced->caller);
+        if (WIFEXITED(wait_status)) {
+            alarm(0);
+            return WEXITSTATUS(wait_status);
+        }
+        if (WIFSIGNALED(wait_status)) {
+            alarm(0);
+            return 128 + WTERMSIG(wait_status);
+        }
+        {
+            int signal_number = WSTOPSIG(wait_status);
+            CHECK(ptrace(PTRACE_CONT, traced->caller, 0,
+                ((wait_status >> 16) || signal_number == SIGSTOP || signal_number == SIGTRAP)
+                    ? 0 : signal_number) == 0);
+        }
+    }
+}
+
+static void
+read_metadata_pid(const char *path, long *pid) {
+    char text[1024];
+    const char *line;
+    *pid = -1;
+    if (!exists(path)) return;
+    (void)read_text(path, text, sizeof text);
+    line = strstr(text, "broker_pid=");
+    if (line) *pid = strtol(line + 11, NULL, 10);
+}
+
+/* F-R1: a delayed caller must not publish its dead broker's identity into a
+ * NEWER directory of the same ID.  Schedule (the reviewer's, with no shim): the
+ * original caller is held after fork, before it publishes; its broker runs to
+ * completion and removes its directory; the ID is spawned again and that caller
+ * is also held; THEN the original caller is released.  Before the fix it linked
+ * its metadata into the replacement's directory, and once its broker was reaped a
+ * listing removed the live replacement. */
+static void
+test_a_delayed_caller_cannot_publish_into_a_replacement_directory(void) {
+    char *quick[] = {"/bin/true", NULL};
+    char *lasting[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char metadata_path[KPB_PATH_MAX];
+    char provisional_path[KPB_PATH_MAX];
+    traced_spawn original;
+    traced_spawn replacement;
+    long published = -1;
+    int seen = 0;
+    int tries;
+    int code;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/gen", scratch) < (int)sizeof directory);
+    CHECK(snprintf(metadata_path, sizeof metadata_path, "%s/metadata", directory) < (int)sizeof metadata_path);
+    CHECK(snprintf(provisional_path, sizeof provisional_path, "%s/metadata.provisional", directory)
+          < (int)sizeof provisional_path);
+
+    if (!traced_spawn_begin(scratch, "gen", quick, &original)) {
+        remove_tree(scratch);
+        return;
+    }
+    /* Its broker runs to completion; the caller is still held before publishing. */
+    CHECK(ptrace(PTRACE_DETACH, original.broker, 0, 0) == 0);
+    for (tries = 0; tries < 500 && exists(directory); tries++) usleep(20000);
+    CHECK(!exists(directory));
+
+    CHECK(traced_spawn_begin(scratch, "gen", lasting, &replacement));
+    CHECK(exists(directory));
+    /* Both callers are held; the replacement's broker is stopped at its first
+     * instruction.  Release the ORIGINAL one: it must publish nothing here. */
+    code = traced_caller_finish(&original);
+    CHECK(code == (int)KPB_OK || code == (int)KPB_ERR_CHILD || code == (int)KPB_ERR_TIMEOUT);
+    {
+        /* Wait for the original broker's pid to be gone, as a real listing would. */
+        int gone;
+        for (gone = 0; gone < 500 && kill(original.broker, 0) == 0; gone++) {
+            int status_ignored;
+            (void)waitpid(original.broker, &status_ignored, WNOHANG | __WALL);
+            usleep(10000);
+        }
+    }
+    CHECK(!exists(metadata_path));
+    CHECK(!exists(provisional_path));
+
+    /* A listing now finds a directory with nothing in it and a live broker: leave it. */
+    CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+    CHECK(exists(directory));
+    CHECK(kill(replacement.broker, 0) == 0);
+
+    /* The replacement's own caller then publishes ITS identity, to ITS directory. */
+    (void)ptrace(PTRACE_CONT, replacement.caller, 0, 0);
+    for (tries = 0; tries < 500 && !exists(metadata_path); tries++) usleep(10000);
+    read_metadata_pid(metadata_path, &published);
+    CHECK(published == (long)replacement.broker);
+    CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+    CHECK(exists(directory));
+    CHECK(kill(replacement.broker, 0) == 0);
+
+    /* Clean up: the replacement's caller gives up after its ready wait. */
+    {
+        int wait_status;
+        alarm(60);
+        for (;;) {
+            CHECK(waitpid(replacement.caller, &wait_status, __WALL) == replacement.caller);
+            if (WIFEXITED(wait_status) || WIFSIGNALED(wait_status)) break;
+            {
+                int signal_number = WSTOPSIG(wait_status);
+                CHECK(ptrace(PTRACE_CONT, replacement.caller, 0,
+                    ((wait_status >> 16) || signal_number == SIGSTOP || signal_number == SIGTRAP)
+                        ? 0 : signal_number) == 0);
+            }
+        }
+        alarm(0);
+    }
+    (void)ptrace(PTRACE_DETACH, replacement.broker, 0, 0);
+    (void)kill(replacement.broker, SIGKILL);
+    (void)waitpid(replacement.broker, NULL, __WALL);
+    remove_tree(scratch);
+}
+
+/* F-R2: what an interrupted write leaves behind must not block the ID. */
+static void
+write_text_file(const char *path, const char *text) {
+    FILE *stream = fopen(path, "w");
+    CHECK(stream != NULL);
+    CHECK(fputs(text, stream) >= 0);
+    CHECK(fclose(stream) == 0);
+}
+
+typedef struct {
+    const char *id;
+    bool canonical;          /* the broker's metadata exists */
+    const char *tmp;         /* contents of metadata.tmp, or NULL */
+    const char *provisional; /* contents of metadata.provisional, or NULL */
+    const char *unknown;     /* an entry of a name nobody wrote, or NULL */
+    bool reaped;             /* expected: gone after ONE clean listing */
+} residue_case;
+
+static void
+test_interrupted_metadata_writes_are_reaped_in_one_listing(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char scratch[64];
+    char text[512];
+    kpb_spawn_options options;
+    pid_t dead = dead_pid();
+    size_t index;
+    int seen = 0;
+    residue_case cases[] = {
+        /* broker held in the metadata fsync: provisional metadata + metadata.tmp, journal, socket */
+        {"fsync-held", true, "version=1\nid=x\nbroker_pid=1\n", NULL, NULL, true},
+        /* caller killed between writing its file and linking it, after the broker finished */
+        {"caller-killed", true, NULL, "COMPLETE", NULL, true},
+        /* both temporaries together */
+        {"both", true, "version=1\nbroker_pid=1\n", "COMPLETE", NULL, true},
+        /* the broker never wrote its own metadata and the caller was killed before linking: only the
+         * caller's complete file proves anything */
+        {"only-provisional", false, NULL, "COMPLETE", NULL, true},
+        /* the same, but the file is cut short: no newline, so it proves nothing and is left alone */
+        {"truncated-provisional", false, NULL, "TRUNCATED", NULL, false},
+        /* a stray entry: not ours to remove, so NOTHING is removed and the proof stays */
+        {"unknown-entry", true, "version=1\nbroker_pid=1\n", "COMPLETE", "stray.txt", false},
+    };
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    for (index = 0; index < sizeof cases / sizeof cases[0]; index++) {
+        const residue_case *item = &cases[index];
+        char directory[KPB_PATH_MAX];
+        char path[KPB_PATH_MAX];
+        char canonical[512];
+        int round;
+        CHECK(snprintf(
+            canonical, sizeof canonical,
+            "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=5\n",
+            item->id, (long)dead) < (int)sizeof canonical);
+        make_fake_session(scratch, item->id, item->canonical ? canonical : NULL, "journal bytes", directory);
+        CHECK(snprintf(path, sizeof path, "%s/control.sock", directory) < (int)sizeof path);
+        write_text_file(path, "");
+        if (item->tmp) {
+            CHECK(snprintf(path, sizeof path, "%s/metadata.tmp", directory) < (int)sizeof path);
+            write_text_file(path, item->tmp);
+        }
+        if (item->provisional) {
+            CHECK(snprintf(path, sizeof path, "%s/metadata.provisional", directory) < (int)sizeof path);
+            if (strcmp(item->provisional, "COMPLETE") == 0) {
+                CHECK(snprintf(
+                    text, sizeof text,
+                    "version=1\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\n",
+                    item->id, (long)dead) < (int)sizeof text);
+            } else {
+                /* cut mid-line: a different, shorter pid would parse out of it */
+                CHECK(snprintf(
+                    text, sizeof text, "version=1\nid=%s\nbroker_pid=%ld", item->id, (long)dead / 10 + 1)
+                    < (int)sizeof text);
+            }
+            write_text_file(path, text);
+        }
+        if (item->unknown) {
+            CHECK(snprintf(path, sizeof path, "%s/%s", directory, item->unknown) < (int)sizeof path);
+            write_text_file(path, "not ours");
+        }
+        /* ONE clean listing - not "eventually". */
+        CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+        CHECK(exists(directory) == !item->reaped);
+        if (item->reaped) {
+            /* ... and the ID is spawnable at once. */
+            kpb_spawn_options_init(&options);
+            options.runtime_dir = scratch;
+            options.session_id = item->id;
+            options.cwd = "/tmp";
+            options.argv = command;
+            CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+            CHECK(kpb_terminate(scratch, item->id) == KPB_OK);
+            wait_until_gone(scratch, item->id);
+        } else {
+            /* Left exactly as it was, however many times it is looked at. */
+            for (round = 0; round < 6; round++) CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+            CHECK(exists(directory));
+            CHECK(snprintf(path, sizeof path, "%s/journal.bin", directory) < (int)sizeof path);
+            CHECK(exists(path));
+            if (item->canonical) {
+                CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+                CHECK(exists(path));   /* the proof was not thrown away */
+            }
+            if (item->unknown) {
+                CHECK(snprintf(path, sizeof path, "%s/%s", directory, item->unknown) < (int)sizeof path);
+                CHECK(exists(path));
+            }
+            kpb_spawn_options_init(&options);
+            options.runtime_dir = scratch;
+            options.session_id = item->id;
+            options.cwd = "/tmp";
+            options.argv = command;
+            CHECK(kpb_spawn(&options, NULL) == KPB_ERR_EXISTS);
+        }
+    }
+    remove_tree(scratch);
+}
+
+/* The broker's own clean-up removes exactly the known names, and never the
+ * proof before the directory is gone. */
+static void
+test_a_brokers_exit_removes_exactly_the_known_files(void) {
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    kpb_spawn_options options;
+    int attempt;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.cwd = "/tmp";
+    options.argv = command;
+
+    /* Leftover temporaries: removed with the rest. */
+    options.session_id = "tidy";
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/tidy", scratch) < (int)sizeof directory);
+    CHECK(snprintf(path, sizeof path, "%s/metadata.provisional", directory) < (int)sizeof path);
+    write_text_file(path, "x\n");
+    CHECK(snprintf(path, sizeof path, "%s/metadata.tmp", directory) < (int)sizeof path);
+    write_text_file(path, "x\n");
+    CHECK(kpb_terminate(scratch, "tidy") == KPB_OK);
+    for (attempt = 0; attempt < 400 && exists(directory); attempt++) usleep(20000);
+    CHECK(!exists(directory));
+
+    /* An unknown entry: the directory and the metadata stay, the entry is untouched. */
+    options.session_id = "stray";
+    CHECK(kpb_spawn(&options, NULL) == KPB_OK);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/stray", scratch) < (int)sizeof directory);
+    CHECK(snprintf(path, sizeof path, "%s/stray.txt", directory) < (int)sizeof path);
+    write_text_file(path, "not ours");
+    CHECK(kpb_terminate(scratch, "stray") == KPB_OK);
+    for (attempt = 0; attempt < 400; attempt++) {
+        kpb_status status;
+        if (kpb_query_status(scratch, "stray", &status) == KPB_ERR_NOT_FOUND) break;
+        usleep(20000);
+    }
+    usleep(300000);
+    CHECK(exists(directory));
+    CHECK(exists(path));
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    CHECK(exists(path));
+    CHECK(snprintf(path, sizeof path, "%s/control.sock", directory) < (int)sizeof path);
+    CHECK(!exists(path));
+    remove_tree(scratch);
+}
+
+
+/* A connect that succeeds against a dead broker's still-open listening socket and
+ * is then reset before any reply is "nothing listening" - reaped in the same
+ * listing and not reported - while one that dies MID-reply is a failure that is
+ * reported and leaves the directory alone. */
+static void
+test_a_connection_that_ends_without_a_reply_is_nothing_listening(void) {
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    char metadata[256];
+    unsigned char header[12];
+    list_tally tally;
+    kpb_list_options options = {.timeout_millis = 1000};
+    pid_t server;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+
+    /* Accepts, reads the request, closes: nothing said. */
+    fake_broker_closes = true;
+    server = fake_broker(scratch, "silent", NULL, 0, NULL, 0, 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/silent", scratch) < (int)sizeof directory);
+    CHECK(snprintf(metadata, sizeof metadata,
+        "version=1\nid=silent\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\n",
+        (long)dead_pid()) < (int)sizeof metadata);
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    write_text_file(path, metadata);
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    CHECK(tally.healthy == 0 && tally.unreachable == 0);   /* not reported ... */
+    CHECK(!exists(directory));                             /* ... and reaped, in ONE listing */
+    end_child(server);
+
+    /* Says part of a reply, then closes: a failure, reported, directory kept. */
+    frame_header_bytes(header, KPB_FRAME_STATUS_REPLY, (uint32_t)sizeof(kpb_wire_status));
+    fake_broker_closes = true;
+    server = fake_broker(scratch, "cut", header, 6, NULL, 0, 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/cut", scratch) < (int)sizeof directory);
+    CHECK(snprintf(metadata, sizeof metadata,
+        "version=1\nid=cut\nbroker_pid=%ld\nchild_pid=1\nstarted_millis=1\n",
+        (long)dead_pid()) < (int)sizeof metadata);
+    CHECK(snprintf(path, sizeof path, "%s/metadata", directory) < (int)sizeof path);
+    write_text_file(path, metadata);
+    memset(&tally, 0, sizeof tally);
+    CHECK(kpb_list_with_options(scratch, &options, tally_entry, &tally) == KPB_OK);
+    CHECK(tally.unreachable == 1 && tally_has(tally.unreachable_ids, tally.unreachable, "cut"));
+    CHECK(exists(directory));
+    end_child(server);
+    remove_tree(scratch);
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -5502,6 +5923,10 @@ main(int argc, char **argv) {
     RUN(test_a_wedged_spawn_that_later_dies_does_not_block_its_id);
     RUN(test_a_live_directory_named_deleted_is_still_a_path);
     RUN(test_a_stalled_v2_frame_names_the_cursor_and_the_right_flag);
+    RUN(test_a_delayed_caller_cannot_publish_into_a_replacement_directory);
+    RUN(test_interrupted_metadata_writes_are_reaped_in_one_listing);
+    RUN(test_a_brokers_exit_removes_exactly_the_known_files);
+    RUN(test_a_connection_that_ends_without_a_reply_is_nothing_listening);
     RUN(test_an_unreadable_boot_id_is_never_proof_of_death);
     RUN(test_an_unreadable_proc_stat_is_never_proof_of_death);
     RUN(test_concurrent_respawn_of_one_corpse_has_exactly_one_winner);
