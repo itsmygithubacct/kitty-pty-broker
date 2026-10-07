@@ -509,13 +509,25 @@ read_whole_file(const char *path, unsigned char *buffer, size_t capacity) {
  * client: that also proves output is captured for an unattached pane. */
 static void
 wait_for_session_end(const char *session_id) {
+    char directory[KPB_PATH_MAX];
+    struct stat probe;
     int attempt;
     for (attempt = 0; attempt < 600; attempt++) {
         kpb_status status;
-        if (kpb_query_status(runtime_dir, session_id, &status) == KPB_ERR_NOT_FOUND) return;
+        if (kpb_query_status(runtime_dir, session_id, &status) == KPB_ERR_NOT_FOUND) break;
         usleep(20000);
     }
-    FAIL("session did not finish");
+    if (attempt == 600) FAIL("session did not finish");
+    /* Its socket is the FIRST thing a finishing broker removes; its directory is
+     * the last.  A test that treats "no socket" as "gone" races the broker's
+     * tail - the end-of-run rmdir of sessions/ found it still occupied. */
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/%s", runtime_dir, session_id)
+          < (int)sizeof directory);
+    for (attempt = 0; attempt < 600; attempt++) {
+        if (lstat(directory, &probe) != 0 && errno == ENOENT) return;
+        usleep(10000);
+    }
+    FAIL("session directory was not removed");
 }
 
 static size_t
@@ -2426,14 +2438,30 @@ test_observer_replay_truncation_is_flagged(void) {
     /* An unbounded journal, so the only trimming is the observer's. */
     spawn_session("truncate", command, 0);
     CHECK(kpb_attach(runtime_dir, "truncate", 30, 100, 0, 0, &client) == KPB_OK);
-    while (x_count < WRITER_CHILD_BYTES) {
-        kpb_event event;
-        size_t index;
-        wait_readable(client.fd);
-        CHECK(kpb_receive(&client, buffer, sizeof buffer, &event) == KPB_OK);
-        if (event.type != KPB_EVENT_OUTPUT) continue;
-        for (index = 0; index < event.size; index++) {
-            if (buffer[index] == 'x') x_count++;
+    /* Read until the child's LAST output, not merely the last 'x': it writes
+     * WRITER_DONE and a newline after the 4 MiB and only then blocks on read, so
+     * stopping at the final 'x' left those 12 bytes in flight - the journal was
+     * still growing when it was measured, and the observer's offset then
+     * disagreed with the status taken a moment earlier. */
+    {
+        unsigned char tail[11] = {0};
+        bool named = false;
+        bool done = false;
+        while (!(x_count >= WRITER_CHILD_BYTES && done)) {
+            kpb_event event;
+            size_t index;
+            wait_readable(client.fd);
+            CHECK(kpb_receive(&client, buffer, sizeof buffer, &event) == KPB_OK);
+            if (event.type != KPB_EVENT_OUTPUT) continue;
+            for (index = 0; index < event.size; index++) {
+                if (buffer[index] == 'x') x_count++;
+                memmove(tail, tail + 1, sizeof tail - 1);
+                tail[sizeof tail - 1] = buffer[index];
+                /* The pty turns the newline into CR LF, so the end of the child's
+                 * output is the newline that follows its name. */
+                if (named && buffer[index] == '\n') done = true;
+                if (memcmp(tail, "WRITER_DONE", sizeof tail) == 0) named = true;
+            }
         }
     }
     /* The child is now blocked on read, so the journal has stopped growing. */
@@ -2531,7 +2559,22 @@ test_dead_session_directory_is_reaped(void) {
     CHECK(waitpid(status.broker_pid, NULL, 0) == status.broker_pid);
     (void)kill(status.child_pid, SIGKILL);
     CHECK(lstat(session_dir, &probe) == 0);
-    CHECK(kpb_list(runtime_dir, ignore_session, NULL) == KPB_OK);
+    /* Reaping is best-effort and eventual - "the next listing reaps it" is the
+     * contract, not "the first listing always does": a listing that cannot reap
+     * (the sessions lock busy, a transient failure of one connect) leaves the
+     * corpse for the next.  So allow a few listings, and require that it IS
+     * reaped, and that it stays reaped. */
+    {
+        int walks;
+        for (walks = 0; walks < 5; walks++) {
+            CHECK(kpb_list(runtime_dir, ignore_session, NULL) == KPB_OK);
+            if (lstat(session_dir, &probe) != 0) break;
+            usleep(100000);
+        }
+        if (walks > 0) {
+            fprintf(stderr, "note: the corpse needed %d extra listing(s) to be reaped\n", walks);
+        }
+    }
     CHECK(lstat(session_dir, &probe) != 0 && errno == ENOENT);
 }
 
@@ -4545,31 +4588,30 @@ test_the_spawn_lock_wait_honours_the_timeout(void) {
     CHECK(run_cli(scratch, arguments, output, sizeof output, 10, &elapsed) == 1);
     alarm(0);
     CHECK(elapsed < 1800);
-    CHECK(strstr(output, "timed out") != NULL && strstr(output, "no session was started") != NULL);
+    CHECK(strstr(output, "timed out") != NULL);
+    /* It says what is known: the lock stayed busy or the broker did not answer
+     * in time, and a slow broker removes the session itself - not that nothing
+     * was started. */
+    CHECK(strstr(output, "if it is only slow it removes the session itself") != NULL);
+    CHECK(strstr(output, "no session was started") == NULL);
     end_child(holder);
     remove_tree(scratch);
 }
 
-/* D3: the wait for a new broker to report ready is bounded, and a timeout means
- * no session was left running.  The broker is held before it can report: the
- * caller of kpb_spawn is traced for fork, so the broker it forks is stopped in
- * its first instruction and stays stopped until the test lets it go. */
-static void
-test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void) {
-    char scratch[64];
+/* D3: the wait for a new broker to report ready is bounded.  The broker is held
+ * before it can report: the caller of kpb_spawn is traced for fork, so the broker
+ * it forks is stopped in its first instruction and stays stopped until the test
+ * lets it go.  Returns false (and says so) if tracing is not permitted here.
+ * On return the caller has given up and exited; *broker is the held broker. */
+static bool
+spawn_with_a_broker_held(const char *scratch, const char *id, pid_t *broker, long *elapsed) {
     char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
-    char directory[KPB_PATH_MAX];
     kpb_spawn_options options;
-    kpb_status status;
     pid_t caller;
-    pid_t broker = -1;
     int wait_status;
     long started;
-    int tries;
 
-    make_scratch_runtime(scratch, sizeof scratch);
-    CHECK(chmod(scratch, 0700) == 0);
-    CHECK(snprintf(directory, sizeof directory, "%s/sessions/slow", scratch) < (int)sizeof directory);
+    *broker = -1;
     caller = fork();
     CHECK(caller >= 0);
     if (caller == 0) {
@@ -4577,19 +4619,17 @@ test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void)
         raise(SIGSTOP);
         kpb_spawn_options_init(&options);
         options.runtime_dir = scratch;
-        options.session_id = "slow";
+        options.session_id = id;
         options.cwd = "/tmp";
         options.argv = command;
         _exit((int)kpb_spawn_timeout(&options, NULL, 100));
     }
     CHECK(waitpid(caller, &wait_status, WUNTRACED) == caller && WIFSTOPPED(wait_status));
     if (ptrace(PTRACE_SEIZE, caller, 0, PTRACE_O_TRACEFORK) != 0) {
-        /* Tracing is not permitted here: this one test cannot run. */
         printf("skip  %s (ptrace refused: %s)\n", current_test, strerror(errno));
         (void)kill(caller, SIGKILL);
         (void)waitpid(caller, NULL, 0);
-        remove_tree(scratch);
-        return;
+        return false;
     }
     (void)kill(caller, SIGCONT);
     alarm(60);
@@ -4604,7 +4644,7 @@ test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void)
                 if (event == PTRACE_EVENT_FORK) {
                     unsigned long child_pid = 0;
                     CHECK(ptrace(PTRACE_GETEVENTMSG, caller, 0, &child_pid) == 0);
-                    broker = (pid_t)child_pid;
+                    *broker = (pid_t)child_pid;
                     /* The broker stays stopped: it is NOT continued here. */
                     CHECK(ptrace(PTRACE_CONT, caller, 0, 0) == 0);
                 } else {
@@ -4618,14 +4658,34 @@ test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void)
         /* Anything else (the new broker's initial stop) is left as it is. */
     }
     alarm(0);
+    *elapsed = now_millis() - started;
     /* kpb_spawn_timeout waits at least KPB_SPAWN_READY_MILLIS for the broker. */
     CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == (int)KPB_ERR_TIMEOUT);
-    CHECK(now_millis() - started >= KPB_SPAWN_READY_MILLIS - 500);
-    CHECK(now_millis() - started < KPB_SPAWN_READY_MILLIS + 5000);
-    CHECK(broker > 0);
+    CHECK(*elapsed >= KPB_SPAWN_READY_MILLIS - 500);
+    CHECK(*elapsed < KPB_SPAWN_READY_MILLIS + 5000);
+    CHECK(*broker > 0);
+    return true;
+}
 
-    /* Nobody is waiting any more.  Let the broker go: its report fails and it
-     * tears itself down, taking the command with it. */
+/* A slow broker finds nobody waiting and removes the session itself. */
+static void
+test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void) {
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    kpb_status status;
+    pid_t broker;
+    long elapsed;
+    int tries;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/slow", scratch) < (int)sizeof directory);
+    if (!spawn_with_a_broker_held(scratch, "slow", &broker, &elapsed)) {
+        remove_tree(scratch);
+        return;
+    }
+    /* Let the broker go: its report fails and it tears itself down, taking the
+     * command with it. */
     CHECK(ptrace(PTRACE_DETACH, broker, 0, 0) == 0 || errno == ESRCH);
     (void)kill(broker, SIGCONT);
     for (tries = 0; tries < 400 && exists(directory); tries++) usleep(20000);
@@ -4634,6 +4694,61 @@ test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing(void)
     remove_tree(scratch);
 }
 
+/* F-N2: a broker that STAYS wedged and later dies must not leave a directory
+ * that blocks its ID for good.  The spawn leaves metadata naming the broker, so
+ * once it is gone the directory is stale like any other corpse. */
+static void
+test_a_wedged_spawn_that_later_dies_does_not_block_its_id(void) {
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char metadata_path[KPB_PATH_MAX];
+    char text[1024];
+    kpb_spawn_options options;
+    kpb_status status;
+    pid_t broker;
+    long elapsed;
+    int seen = 0;
+    char expected[64];
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    CHECK(snprintf(directory, sizeof directory, "%s/sessions/wedged", scratch) < (int)sizeof directory);
+    CHECK(snprintf(metadata_path, sizeof metadata_path, "%s/metadata", directory) < (int)sizeof metadata_path);
+    if (!spawn_with_a_broker_held(scratch, "wedged", &broker, &elapsed)) {
+        remove_tree(scratch);
+        return;
+    }
+    /* The caller has returned TIMEOUT; the broker is alive and wedged. */
+    CHECK(exists(directory));
+    CHECK(read_text(metadata_path, text, sizeof text) > 0);
+    CHECK(snprintf(expected, sizeof expected, "broker_pid=%ld\n", (long)broker) < (int)sizeof expected);
+    CHECK(strstr(text, expected) != NULL);
+    CHECK(strstr(text, "boot_id=") != NULL && strstr(text, "start_ticks=") != NULL);
+    /* While the broker lives, the ID is rightly taken, and a list leaves it be. */
+    CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+    CHECK(exists(directory));
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "wedged";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_ERR_EXISTS);
+
+    /* It never proceeds, and dies. */
+    CHECK(kill(broker, SIGKILL) == 0);
+    CHECK(waitpid(broker, NULL, __WALL) == broker || errno == ECHILD);
+    {
+        int tries;
+        for (tries = 0; tries < 200 && kill(broker, 0) == 0; tries++) usleep(10000);
+    }
+    CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+    CHECK(!exists(directory));
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(kpb_terminate(scratch, "wedged") == KPB_OK);
+    wait_until_gone(scratch, "wedged");
+    remove_tree(scratch);
+}
 
 /* --- identity, races, boundaries, archive edges ------------------------------ */
 
@@ -4890,6 +5005,13 @@ make_reaped_decoys(const char *scratch) {
     CHECK(symlink("/nonexistent", path) == 0);
     CHECK(snprintf(path, sizeof path, "%s/dir.6.journal", reaped) < (int)sizeof path);
     CHECK(mkdir(path, 0700) == 0);
+    /* Things that are not regular files but are named like an orphan .meta. */
+    CHECK(snprintf(path, sizeof path, "%s/lnk.7.meta", reaped) < (int)sizeof path);
+    CHECK(symlink("/nonexistent", path) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/fifo.8.meta", reaped) < (int)sizeof path);
+    CHECK(mkfifo(path, 0600) == 0);
+    CHECK(snprintf(path, sizeof path, "%s/dir.9.meta", reaped) < (int)sizeof path);
+    CHECK(mkdir(path, 0700) == 0);
 }
 
 static int
@@ -4965,6 +5087,7 @@ test_decoy_files_in_reaped_are_never_touched_by_eviction(void) {
     static const char *const names[] = {
         "notes.txt", "x.journal", ".journal", "a.b.journal", "weird name.8.journal",
         "z.12345678901234567890.journal", "keep.nodigits.meta", "lnk.5.journal", "dir.6.journal",
+        "lnk.7.meta", "fifo.8.meta", "dir.9.meta",
     };
     size_t index;
     int serial;
@@ -5050,14 +5173,23 @@ test_orphan_meta_files_are_counted_and_evicted(void) {
     CHECK(chmod(scratch, 0700) == 0);
     CHECK(snprintf(path, sizeof path, "%s/reaped", scratch) < (int)sizeof path);
     CHECK(mkdir(path, 0700) == 0);
+    /* Names and ages deliberately disagree: the orphan with the SMALLEST started
+     * number is the NEWEST by mtime, so an eviction order that ignored the age
+     * (or used the name instead) would remove the wrong ones. */
     for (serial = 1; serial <= 5; serial++) {
         FILE *stream;
-        CHECK(snprintf(path, sizeof path, "%s/reaped/o%d.%d.meta", scratch, serial, serial) < (int)sizeof path);
+        struct timespec times[2];
+        int started_number = 10 - serial;   /* o1.9 .. o5.5: older files have bigger numbers */
+        CHECK(snprintf(path, sizeof path, "%s/reaped/o%d.%d.meta", scratch, serial, started_number)
+              < (int)sizeof path);
         stream = fopen(path, "w");
         CHECK(stream != NULL);
         CHECK(fputs("orphan", stream) >= 0);
         CHECK(fclose(stream) == 0);
-        usleep(20000);
+        /* o1 is the oldest file, o5 the newest, whatever their names say. */
+        times[0].tv_sec = times[1].tv_sec = time(NULL) - 1000 + serial * 10;
+        times[0].tv_nsec = times[1].tv_nsec = 0;
+        CHECK(utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW) == 0);
     }
     set_reaped_limits(NULL, "2");
     reap_fake(scratch, "fresh", 99, "journal");
@@ -5073,10 +5205,13 @@ test_orphan_meta_files_are_counted_and_evicted(void) {
     CHECK(remaining == 3);   /* fresh.99.journal, fresh.99.meta, one newest orphan */
     CHECK(snprintf(path, sizeof path, "%s/reaped/fresh.99.journal", scratch) < (int)sizeof path);
     CHECK(exists(path));
-    CHECK(snprintf(path, sizeof path, "%s/reaped/o5.5.meta", scratch) < (int)sizeof path);
-    CHECK(exists(path));
-    CHECK(snprintf(path, sizeof path, "%s/reaped/o1.1.meta", scratch) < (int)sizeof path);
-    CHECK(!exists(path));
+    /* Oldest-first BY AGE: o1..o4 go, o5 (the newest file, though its started
+     * number is the smallest) stays. */
+    for (serial = 1; serial <= 5; serial++) {
+        CHECK(snprintf(path, sizeof path, "%s/reaped/o%d.%d.meta", scratch, serial, 10 - serial)
+              < (int)sizeof path);
+        CHECK(exists(path) == (serial == 5));
+    }
     set_reaped_limits(NULL, NULL);
     remove_tree(scratch);
 }
@@ -5154,6 +5289,107 @@ test_a_failed_observe_from_the_tui_stays_visible(void) {
     CHECK(waitpid(child, &wait_status, 0) == child);
     close(master);
     resume_and_end(broker, "tui-obsfail");
+}
+
+
+/* R15: the " (deleted)" suffix alone does not make a directory deleted: a live
+ * directory that is literally named that way is a path. */
+static void
+test_a_live_directory_named_deleted_is_still_a_path(void) {
+    char *command[] = {
+        "/bin/sh", "-c",
+        "d=$(mktemp -d /tmp/kpbcwd.XXXXXX) && mkdir \"$d/x (deleted)\" && cd \"$d/x (deleted)\" && sleep 3600",
+        NULL};
+    char scratch[64];
+    kpb_spawn_options options;
+    kpb_status status;
+    char now[KPB_PATH_MAX];
+    int deleted = 1;
+    int attempt;
+    kpb_result result = KPB_ERR_NOT_FOUND;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "literal";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    for (attempt = 0; attempt < 300; attempt++) {
+        result = kpb_read_cwd_now_ex(status.child_pid, now, sizeof now, &deleted);
+        if (result == KPB_OK && strstr(now, "x (deleted)") != NULL) break;
+        usleep(10000);
+    }
+    CHECK(result == KPB_OK);
+    CHECK(deleted == 0);
+    CHECK(strlen(now) > strlen(" (deleted)") &&
+          strcmp(now + strlen(now) - strlen("x (deleted)"), "x (deleted)") == 0);
+    CHECK(kpb_terminate(scratch, "literal") == KPB_OK);
+    wait_until_gone(scratch, "literal");
+    {   /* the pane made /tmp/kpbcwd.XXXXXX/x (deleted); remove exactly that tree */
+        char parent[KPB_PATH_MAX];
+        char *slash;
+        CHECK(strlen(now) < sizeof parent);
+        strcpy(parent, now);
+        slash = strrchr(parent, '/');
+        CHECK(slash != NULL);
+        *slash = '\0';
+        CHECK(strncmp(parent, "/tmp/kpbcwd.", 12) == 0);
+        remove_tree(parent);
+    }
+    remove_tree(scratch);
+}
+
+static uint64_t
+be64_value(uint64_t value) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap64(value);
+#else
+    return value;
+#endif
+}
+
+/* R20: a version-2 stream that stalls mid-frame says how to continue, with the
+ * right flag for the command: observe resumes with --from, attach with --resume. */
+static void
+test_a_stalled_v2_frame_names_the_cursor_and_the_right_flag(void) {
+    char scratch[64];
+    unsigned char lead[12 + sizeof(kpb_wire_attach_reply) + 12 + 6];
+    unsigned char output_header[12];
+    kpb_wire_attach_reply reply;
+    char output[1024];
+    const char *observe_arguments[] = {"--timeout", "1", "observe", "v2o", NULL};
+    const char *attach_arguments[] = {"--timeout", "1", "attach", "v2a", "--resume", "0:0", NULL};
+    pid_t server;
+    long elapsed;
+    int pass;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    memset(&reply, 0, sizeof reply);
+    reply.version = htons(2);
+    reply.journal_epoch = be64_value(7);
+    reply.journal_offset = be64_value(100);
+    reply.flags = htonl(KPB_REPLY_FLAG_COMPLETE);
+    frame_header_bytes(lead, KPB_FRAME_ATTACH_REPLY, (uint32_t)sizeof reply);
+    memcpy(lead + 12, &reply, sizeof reply);
+    frame_header_bytes(output_header, KPB_FRAME_OUTPUT, 5);
+    /* After the reply: the start of an OUTPUT frame (6 of its 12 header bytes). */
+    frame_header_bytes(lead + 12 + sizeof reply, KPB_FRAME_OUTPUT, 5);
+    (void)output_header;
+    for (pass = 0; pass < 2; pass++) {
+        const char *const *arguments = pass == 0 ? observe_arguments : attach_arguments;
+        server = fake_broker(scratch, pass == 0 ? "v2o" : "v2a", lead,
+                             12 + sizeof reply + 6, NULL, 0, 0);
+        CHECK(run_cli(scratch, arguments, output, sizeof output, 10, &elapsed) == 1);
+        CHECK(strstr(output, pass == 0
+            ? "observe v2o: the broker stopped in the middle of a frame (timed out); reattach with --from 7:100 to continue"
+            : "attach v2a: the broker stopped in the middle of a frame (timed out); reattach with --resume 7:100 to continue")
+            != NULL);
+        end_child(server);
+    }
+    remove_tree(scratch);
 }
 
 static void
@@ -5263,6 +5499,9 @@ main(int argc, char **argv) {
     RUN(test_cwd_now_of_a_removed_directory_is_null_and_flagged);
     RUN(test_the_spawn_lock_wait_honours_the_timeout);
     RUN(test_a_spawn_whose_broker_never_reports_ready_times_out_and_leaves_nothing);
+    RUN(test_a_wedged_spawn_that_later_dies_does_not_block_its_id);
+    RUN(test_a_live_directory_named_deleted_is_still_a_path);
+    RUN(test_a_stalled_v2_frame_names_the_cursor_and_the_right_flag);
     RUN(test_an_unreadable_boot_id_is_never_proof_of_death);
     RUN(test_an_unreadable_proc_stat_is_never_proof_of_death);
     RUN(test_concurrent_respawn_of_one_corpse_has_exactly_one_winner);
