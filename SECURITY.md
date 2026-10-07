@@ -335,17 +335,41 @@ licenses it is argued here.
   unlinked directory refuses new entries, so the descriptor alone settles it:
   device and inode need not be compared, because the descriptor names the
   directory itself, not whatever the path resolves to now.
-- *Residue.* A write interrupted in the metadata `fsync`, or a caller killed
-  between writing its file and linking it, leaves `metadata.tmp` or
-  `metadata.provisional`. Removal handles exactly those names (no globbing),
-  temporaries first and the canonical metadata - the proof - last, and only when
-  nothing unknown is in the directory; an unknown entry leaves the directory and
-  its proof untouched, and the ID blocked rather than a stranger's file removed.
-  When the canonical metadata is absent the caller's COMPLETE (newline-terminated)
-  provisional file is the proof, so a wedged broker whose caller was also killed
-  does not strand its ID either. A listing that finds a connection reset before any
-  reply is treated as "nothing listening": a broker killed just after it forked its
-  command leaves its listening socket open in the not-yet-run child for an instant.
+- *Residue, and the order of removal.* A write interrupted in the metadata
+  `fsync`, or a caller killed between writing its file and linking it, leaves
+  `metadata.tmp` or `metadata.provisional`. Removal handles exactly the five known
+  names (no globbing) and never discards the proof early: it takes the one file
+  that LICENSED the cleanup - the broker's `metadata`, or, when that is absent, the
+  caller's provisional copy - unlinks every other known name first and checks each
+  result, then looks at the directory and requires it to hold nothing but the proof
+  before unlinking the proof and removing the directory. Any failure on the way
+  (an `EIO`, a directory sitting where `metadata.tmp` belongs, an entry nobody
+  wrote) stops there with the proof and the directory intact, the listing shows the
+  session as unreachable, and a later listing finishes once the obstruction is
+  gone. The honest limit: the last two steps are two syscalls, and a process killed
+  between them leaves an empty directory with no record in it; nothing can close
+  that, because an empty directory is also what a spawn in flight looks like.
+- *The provisional proof is the whole record.* When the canonical metadata is
+  absent the caller's provisional file is accepted only if it is newline-terminated
+  AND carries the pid, the boot id and the start time; a file that merely parses as
+  `broker_pid=N` is no identity.
+- *Identity files cannot block, or be anything else.* Every file a decision rests
+  on - metadata, the provisional copy, an archive's `.meta` - is opened with
+  `O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC` and then checked on the DESCRIPTOR: a regular
+  file, owned by us, at most 4 KiB. Anything else is no proof and the directory is
+  retained. A FIFO at one of those names used to block the read, with the sessions
+  lock held, in `list`, in a respawn and in the TUI's first refresh (reproduced);
+  checking the path first would not have helped, because the path can change
+  between the check and the open.
+- *A connection that ends without a reply is a candidate, not a verdict.* A broker
+  killed just after it forked its command can leave its listening socket open in
+  the not-yet-run child, so a connect to a DEAD broker can succeed and then be
+  reset. But a LIVE broker closes without a word too - a valid request that
+  reached it after its handshake budget expired, a frame it refuses. So `list`
+  treats such a connection like any other unanswered one: it reaps the directory
+  if the stale proof holds, and otherwise keeps an unreachable row with a reason,
+  so a live session never vanishes from a listing (or from the TUI's "0 SESSIONS").
+  A connection that ends mid-reply is a failure either way.
 - *Archive, don't delete.* Before the directory goes, its journal is moved (an
   atomic rename within the runtime) to `reaped/ID.STARTED_MILLIS.journal`
   with a `.meta` beside it. Both are created `0600` in a `0700` directory,

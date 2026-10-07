@@ -167,6 +167,12 @@ answer on stdout, because callers rely on that. Reaping a corpse during `list`
 needs the sessions lock, which is only waited for until `list`'s own deadline: if
 another process holds it, `list` skips the reap and still lists, and a later
 listing reaps. A directory with nothing listening is not reported as a session.
+A broker that accepts the connection and ends it without a word is different: if
+its recorded process is gone the directory is reaped, and otherwise the session is
+reported as unreachable (`system`) and kept - a live broker is never dropped from
+the listing, or from the TUI, for refusing a request. A directory that is proven
+stale but cannot be cleared (an unknown entry in it, an unlink that fails) is
+reported the same way and left intact, proof included, for a later listing.
 It is reaped (below) only when its broker is *proven* gone; a directory whose
 metadata is missing or malformed, or whose broker is alive but has lost its
 socket, is neither reaped nor listed and stays where it is.
