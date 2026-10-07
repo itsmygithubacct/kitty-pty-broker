@@ -261,28 +261,28 @@ kpb --runtime-dir "$rt" kill nosuch --expect-started 1 >/dev/null 2>&1; [ $? -eq
 check "kill --expect-started on a missing session is the ordinary not-found failure" $?
 
 # F13: `attach` with stdin already at end of file (a pipe whose writer is gone)
-# must exit cleanly instead of spinning, and SIGTERM must end an attach even
-# while a descriptor is ready every time round (a flood of output).
+# must exit cleanly instead of spinning (a hung-up descriptor is ready at every
+# wait), and SIGTERM must still end a client whose descriptors are always ready.
 start eofsess sleep 300 >/dev/null
 t0=$(now_ms)
 : | timeout 5 env -i PATH="$PATH" "$cli" --runtime-dir "$rt" attach eofsess >/dev/null 2>&1; status=$?
 elapsed=$(( $(now_ms) - t0 ))
 [ "$status" -eq 0 ] && [ "$elapsed" -lt 2500 ]
 check "attach with stdin at EOF exits 0 promptly ($elapsed ms, exit $status)" $?
-start flood sh -c 'while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done' >/dev/null
-mkfifo "$scratch/hold"
-sleep 60 > "$scratch/hold" &
-holder_pid=$!
-printf '%s\\n' "$holder_pid" >> "$pidfile"
-env -i PATH="$PATH" "$cli" --runtime-dir "$rt" attach flood < "$scratch/hold" >/dev/null 2>&1 &
+# An `observe` whose stdin is /dev/zero has a descriptor that is ready at EVERY
+# wait (the keys are consumed and discarded), and ppoll does not deliver a pending
+# signal when it returns with a descriptor ready: without letting signals through
+# between waits, SIGTERM would sit pending forever.
+start flood yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >/dev/null
+env -i PATH="$PATH" "$cli" --runtime-dir "$rt" observe flood < /dev/zero >/dev/null 2>&1 &
 attach_pid=$!
-printf '%s\\n' "$attach_pid" >> "$pidfile"
+printf '%s\n' "$attach_pid" >> "$pidfile"
 sleep 1
 kill -TERM "$attach_pid" 2>/dev/null
 attempt=0
 while [ "$attempt" -lt 40 ] && kill -0 "$attach_pid" 2>/dev/null; do attempt=$((attempt + 1)); sleep 0.1; done
-! kill -0 "$attach_pid" 2>/dev/null; check "SIGTERM ends an attach to a pane that is flooding output" $?
-kill -KILL "$holder_pid" "$attach_pid" 2>/dev/null; wait "$holder_pid" "$attach_pid" 2>/dev/null
+! kill -0 "$attach_pid" 2>/dev/null; check "SIGTERM ends an observe whose descriptors are ready at every wait" $?
+kill -KILL "$attach_pid" 2>/dev/null; wait "$attach_pid" 2>/dev/null
 kpb --runtime-dir "$rt" kill flood >/dev/null 2>&1; kpb --runtime-dir "$rt" kill eofsess >/dev/null 2>&1
 
 # A process holding the sessions lock (here: stopped while holding it) must not
