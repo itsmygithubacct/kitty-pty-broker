@@ -3863,7 +3863,17 @@ list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
 }
 
 /* Take whatever the broker has sent so far; finish the slot when it is
- * complete or has failed. */
+ * complete or has failed.
+ *
+ * A connection that ends before ANY reply byte arrives is treated as "nothing is
+ * listening" (KPB_ERR_NOT_FOUND), not as a failure of the session: it means the
+ * listening socket went away while the request waited in its backlog.  That
+ * happens for real - a broker killed a moment after it forked its command leaves
+ * the listening socket open in the not-yet-run child for the instants until the
+ * child closes it (or dies), so a connect to the dead broker can succeed and then
+ * be reset.  Reporting that as unreachable (and not reaping) made a listing right
+ * after the kill leave the corpse for the next one.  A connection that ends
+ * MID-reply is still a failure. */
 static void
 list_receive(list_slot *slot) {
     for (;;) {
@@ -3875,11 +3885,15 @@ list_receive(list_slot *slot) {
         if (count < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            list_finish(slot, KPB_ERR_SYSTEM);
+            /* The connection was reset before a single byte came back: whoever
+             * held the listening socket let go of it while we were waiting. */
+            list_finish(
+                slot, errno == ECONNRESET && slot->received == 0 ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM);
             return;
         }
         if (count == 0) {
-            list_finish(slot, KPB_ERR_SYSTEM);
+            /* Ended with nothing said, the same. */
+            list_finish(slot, slot->received == 0 ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM);
             return;
         }
         slot->received += (size_t)count;
