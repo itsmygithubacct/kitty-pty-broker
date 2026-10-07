@@ -129,14 +129,21 @@ fail - while one that expired before the request could be sent (the broker is no
 accepting connections) says `timed out before the request was sent ... nothing
 was done` and exits 6, and is safe to retry. `run` waits for the sessions lock no
 longer than `--timeout`, and for the new broker to come up at least 10 seconds;
-if either runs out it says `no session was started` and exits 1.
+if either runs out it says so and exits 1. A spawn that times out on the lock created
+nothing. One that times out on the new broker means *the broker did not answer in
+time*, not that nothing was started: its command may already be running. If the
+broker is only slow it removes the session itself when it finds nobody waiting; if
+it stays wedged it remains until it dies, and the metadata the spawn left for it
+lets the directory be reaped then, so the ID is not blocked for good.
 
 When `attach` or `observe` ends for any reason other than the pane's own exit
 (the broker closed the connection, stopped in the middle of a frame, refused, the
 terminal went away) it exits 1 and says why, on one line:
 `kitty-pty-broker: attach ID: REASON`. Pressing `Ctrl-C`/`SIGTERM` ends an attach
 at once even while the pane is streaming output, and an `attach` whose standard
-input is already at end of file detaches cleanly.
+input reaches end of file once the replay is done detaches and exits 0 - input piped
+in before that is delivered first, and end of file seen earlier only defers the
+detach until the replay is done.
 
 ### `list`
 
@@ -358,6 +365,10 @@ for less than a full replay.
 - `attached` in the status reply still means the read-write slot is taken.
   Observers deliberately do not set it, because callers filter reusable panes on
   that flag. Observer count is not exposed.
+
+See `CHANGELOG.md` for what changed in the library, including the one behaviour change a caller
+can notice: a `kill` that times out while still connecting now reports `KPB_ERR_NOT_SENT`
+(exit 6) instead of `KPB_ERR_TIMEOUT`.
 
 ## Library contract
 

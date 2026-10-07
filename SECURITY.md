@@ -275,6 +275,16 @@ identity, decided atomically.**
   safe: the request waits in that one broker's backlog and is delivered to that
   one process, which compares it with its own identity when it finally reads it,
   so it ends the session only if it is the one named.
+- *The wall-clock limit, stated plainly.* The identity is the wall-clock millisecond of
+  the broker's start, so two sessions under one ID that began in the same
+  millisecond are indistinguishable to it. That needs the clock to be set back by
+  exactly the interval a session lived (the replaced one was observable, so it
+  lived at least a few milliseconds) or a frozen or stepped clock: reproduced with
+  a frozen-clock shim, the stale-identity kill then ends the replacement. Nothing
+  in a normally running system does this, and `boot_id` plus `start_ticks`, which
+  the status JSON also carries, do not depend on the wall clock - a caller that
+  cannot accept the limit can check them too before it asks. It is a limit, not a
+  hole the design closes.
 - *Not covered.* Nothing here stops a same-user process from sending the plain
   request; this is protection against mistakes and races between cooperating
   tools, not an access control.
