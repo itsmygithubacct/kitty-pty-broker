@@ -6091,6 +6091,46 @@ test_a_fifo_where_identity_belongs_cannot_hang_list_run_or_the_tui(void) {
     remove_tree(scratch);
 }
 
+
+/* The descriptor check, not just O_NONBLOCK, is what keeps a FIFO out: a FIFO with
+ * a writer that has put a complete, valid, STALE record into it reads like proof,
+ * and must be refused because it is not a regular file. */
+static void
+test_a_fifo_carrying_a_complete_record_is_still_no_proof(void) {
+    char scratch[64];
+    char directory[KPB_PATH_MAX];
+    char path[KPB_PATH_MAX];
+    char text[512];
+    int writer;
+    int seen = 0;
+    int round;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    make_fake_session(scratch, "pipe-proof", NULL, NULL, directory);
+    CHECK(snprintf(path, sizeof path, "%s/metadata.provisional", directory) < (int)sizeof path);
+    CHECK(mkfifo(path, 0600) == 0);
+    writer = open(path, O_RDWR | O_NONBLOCK);
+    CHECK(writer >= 0);
+    {
+        char boot[64];
+        read_current_boot_id(boot);
+        CHECK(snprintf(
+            text, sizeof text,
+            "version=1\nid=pipe-proof\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=5\n"
+            "boot_id=%s\nstart_ticks=1\n", (long)dead_pid(), boot) < (int)sizeof text);
+    }
+    CHECK(write(writer, text, strlen(text)) == (ssize_t)strlen(text));
+    alarm(20);
+    for (round = 0; round < 3; round++) {
+        CHECK(kpb_list(scratch, count_session, &seen) == KPB_OK);
+        CHECK(exists(directory));
+    }
+    alarm(0);
+    close(writer);
+    remove_tree(scratch);
+}
+
 /* Identity files are bounded: a large file where metadata belongs is no proof. */
 static void
 test_an_oversized_identity_file_is_no_proof(void) {
@@ -6239,6 +6279,7 @@ main(int argc, char **argv) {
     RUN(test_the_tui_lists_a_live_broker_that_ended_its_connection_without_a_reply);
     RUN(test_a_failed_unlink_during_cleanup_keeps_the_proof_and_a_retry_finishes);
     RUN(test_a_fifo_where_identity_belongs_cannot_hang_list_run_or_the_tui);
+    RUN(test_a_fifo_carrying_a_complete_record_is_still_no_proof);
     RUN(test_an_oversized_identity_file_is_no_proof);
     RUN(test_an_unreadable_boot_id_is_never_proof_of_death);
     RUN(test_an_unreadable_proc_stat_is_never_proof_of_death);
