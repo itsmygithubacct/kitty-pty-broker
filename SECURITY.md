@@ -323,6 +323,29 @@ licenses it is argued here.
   the lock is only ever waited for until the caller's own deadline (see "The
   sessions lock is not an exception" above) - `list` skips the reap, a spawn
   reports a timeout.
+- *Generations.* A session directory is one generation of its ID, and anything
+  that writes to it must write to THAT directory. The spawning caller leaves
+  provisional proof (pid, boot, start time) in the directory it created, but it
+  does so through a descriptor opened on that directory under the sessions lock,
+  with `openat`/`linkat`/`unlinkat`, not through the ID's path. A caller delayed
+  until its broker is gone and the ID respawned would otherwise have linked a dead
+  broker's identity into the NEW directory, where a listing then proves it stale
+  and reaps a live session (reproduced 5 of 5 before the change; reviewer's
+  schedule, plus a regression test that holds both callers with ptrace). An
+  unlinked directory refuses new entries, so the descriptor alone settles it:
+  device and inode need not be compared, because the descriptor names the
+  directory itself, not whatever the path resolves to now.
+- *Residue.* A write interrupted in the metadata `fsync`, or a caller killed
+  between writing its file and linking it, leaves `metadata.tmp` or
+  `metadata.provisional`. Removal handles exactly those names (no globbing),
+  temporaries first and the canonical metadata - the proof - last, and only when
+  nothing unknown is in the directory; an unknown entry leaves the directory and
+  its proof untouched, and the ID blocked rather than a stranger's file removed.
+  When the canonical metadata is absent the caller's COMPLETE (newline-terminated)
+  provisional file is the proof, so a wedged broker whose caller was also killed
+  does not strand its ID either. A listing that finds a connection reset before any
+  reply is treated as "nothing listening": a broker killed just after it forked its
+  command leaves its listening socket open in the not-yet-run child for an instant.
 - *Archive, don't delete.* Before the directory goes, its journal is moved (an
   atomic rename within the runtime) to `reaped/ID.STARTED_MILLIS.journal`
   with a `.meta` beside it. Both are created `0600` in a `0700` directory,

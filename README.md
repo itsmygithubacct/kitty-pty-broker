@@ -136,6 +136,16 @@ broker is only slow it removes the session itself when it finds nobody waiting; 
 it stays wedged it remains until it dies, and the metadata the spawn left for it
 lets the directory be reaped then, so the ID is not blocked for good.
 
+That metadata is bound to the directory generation the spawn itself created: the
+caller keeps a descriptor of the session directory it made (opened under the
+sessions lock) and publishes through it, never through the ID's path, so a caller
+that is delayed past its broker's end - and past a respawn of the same ID - cannot
+put its dead broker's identity into the newer session's directory. When a broker or
+the reaper removes a session directory it removes exactly the known files
+(`metadata.tmp`, `metadata.provisional`, `control.sock`, `journal.bin`) and the
+canonical `metadata` last, only if nothing else is in the directory; an unknown
+entry leaves the directory entirely alone.
+
 When `attach` or `observe` ends for any reason other than the pane's own exit
 (the broker closed the connection, stopped in the middle of a frame, refused, the
 terminal went away) it exits 1 and says why, on one line:
