@@ -641,6 +641,8 @@ kpb_result_string(kpb_result result) {
         case KPB_ERR_CHILD: return "child could not start";
         case KPB_ERR_TIMEOUT: return "timed out";
         case KPB_ERR_NAME_TOO_LONG: return "socket path too long";
+        case KPB_ERR_MISMATCH: return "session identity does not match";
+        case KPB_ERR_UNSUPPORTED: return "broker cannot check identity";
     }
     return "unknown error";
 }
@@ -1812,6 +1814,23 @@ handle_new_connection(server_state *server) {
         return;
     }
     if (type == KPB_FRAME_TERMINATE && payload_size == 0) {
+        (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
+        close(fd);
+        request_termination(server);
+        return;
+    }
+    /* Identity-bound terminate.  This process owns exactly one session, so the
+     * comparison and the decision to act happen here, in one step, with nothing
+     * in between that could be replaced - which is what a status query followed
+     * by an unconditional TERMINATE cannot give a caller. */
+    if (type == KPB_FRAME_TERMINATE && payload_size == sizeof(kpb_wire_terminate)) {
+        kpb_wire_terminate request;
+        memcpy(&request, payload, sizeof request);
+        if (be64_to_host(request.expected_started_millis) != server->started_millis) {
+            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH);
+            close(fd);
+            return;
+        }
         (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
         close(fd);
         request_termination(server);
@@ -3408,6 +3427,47 @@ kpb_terminate_timeout(
     }
     close(fd);
     return result;
+}
+
+kpb_result
+kpb_terminate_expect(
+    const char *runtime_dir,
+    const char *session_id,
+    uint64_t expected_started_millis,
+    int timeout_millis
+) {
+    unsigned char payload[128];
+    kpb_wire_terminate request;
+    struct timespec deadline;
+    uint16_t type = 0;
+    uint32_t payload_size = 0;
+    int fd;
+    kpb_result result;
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
+    if (result != KPB_OK) return result;
+    request.expected_started_millis = host_to_be64(expected_started_millis);
+    result = send_frame(fd, KPB_FRAME_TERMINATE, &request, sizeof request);
+    if (result == KPB_OK) {
+        result = receive_frame_bounded(
+            fd, &type, payload, sizeof payload, &payload_size, &deadline);
+    }
+    close(fd);
+    if (result != KPB_OK) return result;
+    if (type == KPB_FRAME_ACK && payload_size == 0) return KPB_OK;
+    if (type == KPB_FRAME_ERROR) {
+        /* Exact text, exact length: anything else is not an answer this
+         * function understands, and is a protocol error rather than a guess. */
+        if (payload_size == strlen(KPB_ERROR_IDENTITY_MISMATCH) &&
+            memcmp(payload, KPB_ERROR_IDENTITY_MISMATCH, payload_size) == 0) {
+            return KPB_ERR_MISMATCH;
+        }
+        if (payload_size == strlen(KPB_ERROR_INVALID) &&
+            memcmp(payload, KPB_ERROR_INVALID, payload_size) == 0) {
+            return KPB_ERR_UNSUPPORTED;
+        }
+    }
+    return KPB_ERR_PROTOCOL;
 }
 
 kpb_result

@@ -72,6 +72,7 @@ benchmark: $(BENCHMARK)
 
 compatibility:
 	./tests/mixed_version.sh
+	./tests/terminate_compat.sh
 
 $(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \

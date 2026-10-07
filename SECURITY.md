@@ -219,6 +219,61 @@ and `list`, in the library and in the CLI; four stopped brokers cost one
 deadline; a held, even stopped, sessions lock with `list` and with a spawn; a
 peer that sends one byte of the first frame, or half of a later one, and stops.
 
+## Killing the session you saw, and not its replacement
+
+`kill` is destructive and addressed by a name, and a name can be reused. A stable
+`run --id` pane is respawned under the same ID precisely when its broker is gone,
+and the stale-proof reaper (below) makes that respawn possible. So "look, then
+kill" - a status query, a decision, an unconditional `TERMINATE` on a new
+connection - can kill a session the caller never saw. This was reproduced against
+the previous build with a real replacement: the replacement died. It matters
+because the caller is often not a person at a terminal but a program acting on a
+listing it fetched earlier.
+
+The claim: **a terminate that carries an identity ends only the session with that
+identity, decided atomically.**
+
+- *Where the check lives.* Not in the caller (a status query followed by a kill
+  is two requests, and anything can happen between them) and not in the library
+  (same two requests). In the broker: each broker process owns exactly one
+  session and holds its `started_millis` in memory; the `TERMINATE` payload is
+  compared against it inside the one handler that decides to act. There is no
+  window between the comparison and the action in which the session could be
+  replaced, because the process that would be replaced is the one deciding.
+- *Why `started_millis` and not more.* A replacement is a new broker process, so
+  it has a new `started_millis`, a wall-clock millisecond stamp taken when the
+  broker starts. For a replacement to carry the same value it would have to start
+  in the same millisecond as the session it replaces - impossible for a session
+  that was alive for the caller to look at and then ended - or the wall clock
+  would have to be set back by exactly the elapsed interval. `start_ticks` and
+  `boot_id` would add protection against the clock case only, and they identify
+  the process rather than the session; the status JSON still exposes them for
+  callers that want to record more. The wire carries one 8-byte value so that an
+  old broker's refusal is unambiguous.
+- *Compatibility without a silent downgrade.* The identity-bound request is
+  discriminated by payload size (8 bytes against the empty request every deployed
+  client sends), so the frame version is unchanged and an empty `TERMINATE`
+  behaves exactly as before. A broker from an earlier build answers the 8-byte
+  form with `invalid request` and does nothing, which the library reports as
+  `KPB_ERR_UNSUPPORTED`; it never falls back to an unconditional kill, because
+  that fallback is exactly the unsafe operation. A caller that must kill such a
+  broker anyway has to say so, with the plain request.
+- *What a timeout means here.* As for any request, a timed-out identity-bound
+  terminate may still be acted on later, when a stopped broker resumes. That is
+  safe: the request waits in that one broker's backlog and is delivered to that
+  one process, which compares it with its own identity when it finally reads it,
+  so it ends the session only if it is the one named.
+- *Not covered.* Nothing here stops a same-user process from sending the plain
+  request; this is protection against mistakes and races between cooperating
+  tools, not an access control.
+
+Asserted by test: a real broker replaced under the same ID refuses the stale
+identity (and `0`, and off-by-one) and survives, the exact identity ends it; the
+exact refusal text on the wire, wrong sizes refused without effect, the empty
+form unchanged; an old broker's `invalid request` becomes `UNSUPPORTED` with no
+second connection; against builds `8cf3eb3` and the pre-protocol-2 build, in both
+directions; the TUI's confirmation bound to what was on screen.
+
 ## Reaping a dead session's directory
 
 `list` and a respawn delete session directories, which is destructive, so what

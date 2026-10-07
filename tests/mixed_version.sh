@@ -125,6 +125,42 @@ if start_session "$old_cli" "$rt_old" pane; then
             *)                  report fail "new client observe against an old broker: unclear error ($err)" ;;
         esac
     fi
+
+    # Identity-bound kill against a broker that predates it.  The old broker
+    # answers the 8-byte TERMINATE payload with its existing "invalid request"
+    # error and does nothing; the client must report that as "cannot verify"
+    # (exit 5) and must NOT fall back to an unconditional kill.
+    started=$("$new_cli" --runtime-dir "$rt_old" status pane --json | sed -n 's/.*"started_millis":\([0-9]*\).*/\1/p')
+    if command -v python3 >/dev/null 2>&1; then
+        raw=$(python3 - "$rt_old/sessions/pane/control.sock" <<'PY2'
+import socket, struct, sys
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
+s.sendall(struct.pack(">IHHI", 0x4b504231, 1, 6, 8) + struct.pack(">Q", 1))
+h = s.recv(12); n = struct.unpack(">I", h[8:12])[0]
+print("type=%d text=%s" % (struct.unpack(">H", h[6:8])[0], s.recv(n).decode()))
+PY2
+)
+        printf 'old broker answers an 8-byte TERMINATE with: %s\n' "$raw"
+        case "$raw" in
+            "type=10 text=invalid request") report pass "old broker answers the new payload with invalid request" ;;
+            *)                              report fail "old broker answer was: $raw" ;;
+        esac
+    fi
+    err=$(timeout 5 "$new_cli" --runtime-dir "$rt_old" kill pane --expect-started "$started" 2>&1 >/dev/null)
+    status=$?
+    sleep 0.5
+    if [ "$status" -eq 5 ] && "$new_cli" --runtime-dir "$rt_old" status pane >/dev/null 2>&1; then
+        report pass "new client: identity-bound kill of an old broker is unsupported (exit 5) and the session survives"
+    else
+        report fail "new client: identity-bound kill of an old broker (exit $status: $err)"
+    fi
+    timeout 5 "$new_cli" --runtime-dir "$rt_old" kill pane >/dev/null 2>&1
+    sleep 0.5
+    if ! "$new_cli" --runtime-dir "$rt_old" status pane >/dev/null 2>&1; then
+        report pass "new client: plain kill still ends an old broker's session"
+    else
+        report fail "new client: plain kill did not end an old broker's session"
+    fi
 else
     report fail "could not start a session under the old broker"
 fi
@@ -149,6 +185,15 @@ if start_session "$new_cli" "$rt_new" pane; then
         *MIXED_OK:*) report pass "old client is undisturbed by an observer" ;;
         *)           report fail "old client is undisturbed by an observer (got: $out)" ;;
     esac
+
+    # And the unchanged empty-payload kill from an old client still works.
+    timeout 5 "$old_cli" --runtime-dir "$rt_new" kill pane >/dev/null 2>&1
+    sleep 0.5
+    if ! "$new_cli" --runtime-dir "$rt_new" status pane >/dev/null 2>&1; then
+        report pass "old client's kill ends a new broker's session"
+    else
+        report fail "old client's kill did not end a new broker's session"
+    fi
 else
     report fail "could not start a session under the new broker"
 fi

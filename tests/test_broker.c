@@ -3919,6 +3919,236 @@ test_a_stalled_partial_frame_times_out_but_an_idle_stream_does_not(void) {
     remove_tree(scratch);
 }
 
+
+/* --- fix round 2: identity-bound terminate -------------------------------- */
+
+static void
+wait_until_gone(const char *runtime, const char *session_id) {
+    int attempt;
+    for (attempt = 0; attempt < 400; attempt++) {
+        kpb_status status;
+        if (kpb_query_status(runtime, session_id, &status) == KPB_ERR_NOT_FOUND) return;
+        usleep(20000);
+    }
+    FAIL("session did not end");
+}
+
+/* The finding: a caller checks `started_millis` with a status query and then
+ * sends a terminate on a NEW connection.  A session replaced under the same ID
+ * in between is killed.  The broker compares its own identity, atomically. */
+static void
+test_a_terminate_bound_to_an_identity_spares_a_replacement(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    kpb_spawn_options options;
+    kpb_status first;
+    kpb_status second;
+    kpb_status again;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "swap";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &first) == KPB_OK);
+    CHECK(kpb_query_status(scratch, "swap", &first) == KPB_OK);
+
+    /* The caller looked; now the session is replaced under the same ID. */
+    CHECK(kpb_terminate(scratch, "swap") == KPB_OK);
+    wait_until_gone(scratch, "swap");
+    usleep(20000);
+    CHECK(kpb_spawn(&options, &second) == KPB_OK);
+    CHECK(kpb_query_status(scratch, "swap", &second) == KPB_OK);
+    CHECK(second.started_millis != first.started_millis);
+    CHECK(second.broker_pid != first.broker_pid);
+
+    /* The stale identity is refused and nothing happens. */
+    CHECK(kpb_terminate_expect(scratch, "swap", first.started_millis, 1000) == KPB_ERR_MISMATCH);
+    CHECK(kpb_terminate_expect(scratch, "swap", 0, 1000) == KPB_ERR_MISMATCH);
+    CHECK(kpb_terminate_expect(scratch, "swap", second.started_millis + 1, 1000) == KPB_ERR_MISMATCH);
+    usleep(300000);
+    CHECK(kpb_query_status(scratch, "swap", &again) == KPB_OK);
+    CHECK(again.broker_pid == second.broker_pid && again.started_millis == second.started_millis);
+
+    /* The exact identity ends it. */
+    CHECK(kpb_terminate_expect(scratch, "swap", second.started_millis, 1000) == KPB_OK);
+    wait_until_gone(scratch, "swap");
+    remove_tree(scratch);
+}
+
+/* Wire level: the empty TERMINATE every deployed client sends is unchanged,
+ * and payloads that are neither empty nor exactly 8 bytes are refused without
+ * touching the session. */
+static void
+test_terminate_payloads_on_the_wire(void) {
+    char scratch[64];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    kpb_spawn_options options;
+    kpb_status status;
+    kpb_frame_header header;
+    unsigned char payload[128];
+    uint64_t wrong;
+    unsigned char sixteen[16] = {0};
+    int fd;
+    size_t length;
+
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = scratch;
+    options.session_id = "wire";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &status) == KPB_OK);
+    CHECK(kpb_query_status(scratch, "wire", &status) == KPB_OK);
+    {
+        /* raw_connect uses the shared runtime; connect by hand to the scratch one. */
+        char socket_path[KPB_PATH_MAX];
+        struct sockaddr_un address;
+        int attempt;
+        CHECK(snprintf(socket_path, sizeof socket_path, "%s/sessions/wire/control.sock", scratch)
+              < (int)sizeof socket_path);
+        for (attempt = 0; attempt < 4; attempt++) {
+            fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            CHECK(fd >= 0);
+            memset(&address, 0, sizeof address);
+            address.sun_family = AF_UNIX;
+            strcpy(address.sun_path, socket_path);
+            CHECK(connect(fd, (struct sockaddr *)&address, sizeof address) == 0);
+            if (attempt == 0) {
+                /* 8 bytes, wrong value: the exact refusal text. */
+                wrong = status.started_millis + 7;
+                {
+                    unsigned char be[8];
+                    int index;
+                    for (index = 0; index < 8; index++) {
+                        be[index] = (unsigned char)(wrong >> (56 - 8 * index));
+                    }
+                    raw_send_frame(fd, KPB_FRAME_TERMINATE, be, 8);
+                }
+            } else if (attempt == 1) {
+                raw_send_frame(fd, KPB_FRAME_TERMINATE, sixteen, 4);   /* wrong size */
+            } else if (attempt == 2) {
+                raw_send_frame(fd, KPB_FRAME_TERMINATE, sixteen, 16);  /* wrong size */
+            } else {
+                raw_send_frame(fd, KPB_FRAME_TERMINATE, NULL, 0);      /* unchanged: ack */
+            }
+            CHECK(raw_read_exactly(fd, &header, sizeof header));
+            length = ntohl(header.payload_size);
+            CHECK(length < sizeof payload);
+            if (length) CHECK(raw_read_exactly(fd, payload, length));
+            if (attempt == 0) {
+                CHECK(ntohs(header.type) == KPB_FRAME_ERROR);
+                CHECK(length == strlen("identity mismatch") &&
+                      memcmp(payload, "identity mismatch", length) == 0);
+            } else if (attempt < 3) {
+                CHECK(ntohs(header.type) == KPB_FRAME_ERROR);
+                CHECK(length == strlen("invalid request") &&
+                      memcmp(payload, "invalid request", length) == 0);
+            } else {
+                CHECK(ntohs(header.type) == KPB_FRAME_ACK && length == 0);
+            }
+            close(fd);
+            if (attempt < 3) {
+                /* Refusals leave the session alone. */
+                usleep(150000);
+                CHECK(kpb_query_status(scratch, "wire", &status) == KPB_OK);
+            }
+        }
+    }
+    wait_until_gone(scratch, "wire");
+    remove_tree(scratch);
+}
+
+/* A broker that predates this feature answers the 8-byte payload with
+ * "invalid request".  That is mapped to its own result, so a caller can tell
+ * "refused: it is somebody else" from "this broker cannot bind", and the library
+ * never falls back to an unconditional kill: the stand-in accepts exactly one
+ * connection, so a second (fallback) attempt would time out, not map. */
+static void
+fake_refusal(const char *runtime, const char *session_id, const char *text, kpb_result expected) {
+    unsigned char frame[12 + 64];
+    size_t length = strlen(text);
+    pid_t server;
+    long started;
+    frame_header_bytes(frame, KPB_FRAME_ERROR, (uint32_t)length);
+    memcpy(frame + 12, text, length);
+    server = fake_broker(runtime, session_id, frame, 12 + length, NULL, 0, 0);
+    started = now_millis();
+    CHECK(kpb_terminate_expect(runtime, session_id, 1234, 1500) == expected);
+    CHECK(now_millis() - started < 1000);
+    end_child(server);
+}
+
+static void
+test_an_old_brokers_refusal_is_unsupported_not_a_fallback(void) {
+    char scratch[64];
+    make_scratch_runtime(scratch, sizeof scratch);
+    CHECK(chmod(scratch, 0700) == 0);
+    fake_refusal(scratch, "old", "invalid request", KPB_ERR_UNSUPPORTED);
+    fake_refusal(scratch, "new", "identity mismatch", KPB_ERR_MISMATCH);
+    fake_refusal(scratch, "odd", "something else", KPB_ERR_PROTOCOL);
+    fake_refusal(scratch, "unauth", "unauthorized peer", KPB_ERR_PROTOCOL);
+    remove_tree(scratch);
+}
+
+
+/* The TUI's y must end the session the user was SHOWN when they pressed x, not
+ * whatever has taken the ID since: the list refreshes while the prompt is up. */
+static void
+test_tui_kill_is_bound_to_the_session_that_was_shown(void) {
+    char cli_path[KPB_PATH_MAX];
+    char *command[] = {"/bin/sh", "-c", "sleep 3600", NULL};
+    struct winsize size = {.ws_row = 24, .ws_col = 100};
+    unsigned char output[65536];
+    kpb_spawn_options options;
+    kpb_status first;
+    kpb_status second;
+    size_t used = 0;
+    int master;
+    int wait_status;
+    pid_t child;
+
+    cli_path_beside_test(cli_path, sizeof cli_path);
+    kpb_spawn_options_init(&options);
+    options.runtime_dir = runtime_dir;
+    options.session_id = "tui-swap";
+    options.cwd = "/tmp";
+    options.argv = command;
+    CHECK(kpb_spawn(&options, &first) == KPB_OK);
+    CHECK(kpb_query_status(runtime_dir, "tui-swap", &first) == KPB_OK);
+    child = forkpty(&master, NULL, NULL, &size);
+    CHECK(child >= 0);
+    if (child == 0) {
+        execl(cli_path, cli_path, "--runtime-dir", runtime_dir, "tui", (char *)NULL);
+        _exit(127);
+    }
+    used = read_pty_until(master, output, used, sizeof output, "tui-swap");
+    CHECK(write(master, "x", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "Terminate tui-swap");
+
+    /* While the prompt is up the session is replaced under the same ID. */
+    CHECK(kpb_terminate(runtime_dir, "tui-swap") == KPB_OK);
+    wait_until_gone(runtime_dir, "tui-swap");
+    usleep(20000);
+    CHECK(kpb_spawn(&options, &second) == KPB_OK);
+    CHECK(kpb_query_status(runtime_dir, "tui-swap", &second) == KPB_OK);
+    CHECK(second.started_millis != first.started_millis);
+
+    CHECK(write(master, "y", 1) == 1);
+    used = read_pty_until(master, output, used, sizeof output, "different session");
+    usleep(200000);
+    CHECK(kpb_query_status(runtime_dir, "tui-swap", &first) == KPB_OK);
+    CHECK(first.broker_pid == second.broker_pid);
+    CHECK(write(master, "q", 1) == 1);
+    CHECK(waitpid(child, &wait_status, 0) == child);
+    CHECK(WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0);
+    close(master);
+    terminate_and_reap("tui-swap");
+}
+
 static void
 test_transcript_absent_by_default(void) {
     char *command[] = {"/bin/sh", "-c", "printf 'no-transcript\\n'", NULL};
@@ -4015,6 +4245,10 @@ main(int argc, char **argv) {
     RUN(test_spawn_does_not_wait_forever_for_the_sessions_lock);
     RUN(test_a_partial_first_frame_does_not_complete_the_v1_attach_handshake);
     RUN(test_a_stalled_partial_frame_times_out_but_an_idle_stream_does_not);
+    RUN(test_a_terminate_bound_to_an_identity_spares_a_replacement);
+    RUN(test_terminate_payloads_on_the_wire);
+    RUN(test_an_old_brokers_refusal_is_unsupported_not_a_fallback);
+    RUN(test_tui_kill_is_bound_to_the_session_that_was_shown);
     {
         char sessions[4096];
         snprintf(sessions, sizeof sessions, "%s/sessions", runtime_dir);

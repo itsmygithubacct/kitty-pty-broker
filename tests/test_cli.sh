@@ -222,6 +222,44 @@ err=$(kpb --runtime-dir "$rt" reaped path nobody 2>&1 >/dev/null); status=$?
 check "reaped path for an unknown id fails" $?
 [ "$(stat -c %a "$rt/reaped")" = 700 ] && [ "$(stat -c %a "$journal")" = 600 ]; check "reaped/ is 0700 and journals 0600" $?
 
+# `kill ID --expect-started MILLIS` ends the session only if it is the one that
+# was seen: a session replaced under the same id is refused (exit 3) and survives.
+wait_gone() { # wait_gone ID
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        kpb --runtime-dir "$rt" status "$1" >/dev/null 2>&1 || return 0
+        attempt=$((attempt + 1)); sleep 0.1
+    done
+    return 1
+}
+start swap sleep 300 >/dev/null
+started_a=$(kpb --runtime-dir "$rt" status swap --json | json_field started_millis)
+kpb --runtime-dir "$rt" kill swap >/dev/null 2>&1; wait_gone swap
+sleep 0.05
+start swap sleep 300 >/dev/null
+started_b=$(kpb --runtime-dir "$rt" status swap --json | json_field started_millis)
+[ -n "$started_a" ] && [ -n "$started_b" ] && [ "$started_a" != "$started_b" ]
+check "a session replaced under the same id has a different started_millis" $?
+err=$(kpb --runtime-dir "$rt" kill swap --expect-started "$started_a" 2>&1 >/dev/null); status=$?
+[ "$status" -eq 3 ] && printf '%s' "$err" | grep -q 'refused: swap is not the session that started at' &&
+    printf '%s' "$err" | grep -q 'nothing was done'
+check "kill --expect-started with a stale identity is refused (exit 3)" $?
+sleep 0.3
+kpb --runtime-dir "$rt" status swap >/dev/null 2>&1; check "...and the replacement survives" $?
+kpb --runtime-dir "$rt" kill swap --expect-started 0 >/dev/null 2>&1; [ $? -eq 3 ]
+check "0 is an identity, not 'no expectation'" $?
+kpb --runtime-dir "$rt" kill swap --expect-started "$started_b" >/dev/null 2>&1; status=$?
+[ "$status" -eq 0 ] && wait_gone swap; check "kill --expect-started with the exact identity ends it" $?
+start swap sleep 300 >/dev/null
+kpb --runtime-dir "$rt" kill swap >/dev/null 2>&1; [ $? -eq 0 ] && wait_gone swap
+check "plain kill is unchanged" $?
+for bad in "--expect-started" "--expect-started abc" "--expect-started -1" "--expect-started 1 extra" "--expect-started 1x" "--bogus 1"; do
+    # shellcheck disable=SC2086
+    kpb --runtime-dir "$rt" kill swap $bad >/dev/null 2>&1; [ $? -eq 2 ] || fail "kill swap $bad should be a usage error"
+done
+kpb --runtime-dir "$rt" kill nosuch --expect-started 1 >/dev/null 2>&1; [ $? -eq 1 ]
+check "kill --expect-started on a missing session is the ordinary not-found failure" $?
+
 # A process holding the sessions lock (here: stopped while holding it) must not
 # hang `list`: reaping is skipped when the lock cannot be taken in time.
 if command -v flock >/dev/null 2>&1; then

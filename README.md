@@ -56,6 +56,7 @@ kitty-pty-broker list --json
 kitty-pty-broker list --all
 kitty-pty-broker status work --json
 kitty-pty-broker kill work
+kitty-pty-broker kill work --expect-started 1791346481952
 kitty-pty-broker reaped
 kitty-pty-broker reaped path work
 kitty-pty-broker tui
@@ -230,6 +231,8 @@ raw terminal output: replay it in a terminal, not on your own.
 | 0 | success (`list` with unreachable sessions is still 0) |
 | 1 | failure: missing or unsafe runtime, session not found, timeout, refused spawn, ... |
 | 2 | usage error |
+| 3 | `kill --expect-started`: refused, the id now names a different session; nothing was done |
+| 5 | `kill --expect-started`: the broker predates the check and cannot verify; nothing was done |
 
 `run` and `attach` return the pane command's own exit status once it exits
 (`128+N` if it died from signal `N`), and 1 if they could not attach.
@@ -253,6 +256,8 @@ discriminated structurally rather than by a version field:
 | `ATTACH` | 8 bytes | version 1 attach, exactly as before |
 | `ATTACH` | 32 bytes | version 2 attach |
 | `OBSERVE` | 32 bytes | version 2 read-only attach |
+| `TERMINATE` | 0 bytes | end the session, as before |
+| `TERMINATE` | 8 bytes | end the session **only if** its `started_millis` equals this big-endian value |
 
 The broker emits an `ATTACH_REPLY` **if and only if** the request was 32 bytes,
 so a version 1 peer can never receive a frame type it does not parse. A broker
@@ -265,6 +270,36 @@ The reply carries the selected version, the journal epoch, the stream offset of
 the first byte that follows, and flags for resumed, complete, and truncated. A
 client adopts that offset as a cursor and advances it by the size of every
 output payload it then receives.
+
+### Identity-bound terminate
+
+A caller that looks at a session and then kills it - `list`, decide, `kill ID` -
+has a race it cannot close from outside: between the look and the kill the
+session can be replaced under the same ID (a stable `run --id` pane is respawned
+exactly that way), and the unconditional `kill` ends the replacement. Reproduced
+on the previous build: start `swap`, note its `started_millis`, kill it, start
+`swap` again, `kill swap` - the new session dies. A second status query before
+the kill only narrows the window.
+
+So the request carries the identity. `TERMINATE` with an 8-byte payload - the
+`started_millis` from the status the caller saw - is honoured only if it equals
+the broker's own; otherwise the broker answers `identity mismatch` and does
+nothing. Each broker process owns exactly one session, so the comparison and the
+decision to act are one step inside it, with nothing in between to replace. The
+empty `TERMINATE` keeps today's behaviour exactly, and the frame version stays 1
+(the two forms differ by payload size alone, like `ATTACH` v1 and v2).
+
+A broker from a build that predates this answers the 8-byte form with its
+existing `invalid request` and does nothing - verified against `8cf3eb3` and the
+pre-protocol-2 build (`make compatibility`). The library maps the two answers to
+distinct results, `KPB_ERR_MISMATCH` and `KPB_ERR_UNSUPPORTED`, and **never**
+retries unconditionally: whether to take the risk of a plain kill against a
+broker that cannot check is the caller's decision, not the library's.
+
+On the CLI, `kill ID --expect-started MILLIS` exits 3 on a mismatch and 5 when
+the broker cannot check; plain `kill ID` is unchanged. The TUI binds its `x`/`y`
+confirmation the same way, to the session that was on screen when `x` was
+pressed.
 
 ### Resume
 
@@ -312,7 +347,7 @@ The public API is in `include/kitty_pty_broker.h`. It supports:
   each bounded by a deadline (`KPB_DEFAULT_TIMEOUT_MILLIS`, 2 s; `list`
   1 s overall across all sessions) with `*_timeout` forms taking an explicit
   bound and `kpb_list_with_options` reporting unreachable sessions;
-- `kpb_check_runtime`, `kpb_session_socket_path`, `kpb_read_cwd_now`,
+- `kpb_terminate_expect` (identity-bound terminate), `kpb_check_runtime`, `kpb_session_socket_path`, `kpb_read_cwd_now`,
   `kpb_read_boot_id`/`kpb_read_start_ticks`, and the reaped archive
   (`kpb_list_reaped`, `kpb_reaped_path`), all additive;
 - read-only observation and resumable replay through `kpb_observe` and

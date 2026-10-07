@@ -76,7 +76,13 @@ typedef enum {
      * reports only the values above, and a client treats anything else it is
      * handed as a protocol error. */
     KPB_ERR_TIMEOUT = 10,
-    KPB_ERR_NAME_TOO_LONG = 11
+    KPB_ERR_NAME_TOO_LONG = 11,
+    /* Results of kpb_terminate_expect only, and also never in a wire result
+     * code.  MISMATCH: the broker answered and is a different session than the
+     * one the caller meant; nothing was done.  UNSUPPORTED: the broker predates
+     * identity-bound terminate and could not check; nothing was done. */
+    KPB_ERR_MISMATCH = 12,
+    KPB_ERR_UNSUPPORTED = 13
 } kpb_result;
 
 typedef struct {
@@ -319,6 +325,29 @@ kpb_result kpb_query_status_timeout(
 kpb_result kpb_terminate_timeout(
     const char *runtime_dir,
     const char *session_id,
+    int timeout_millis
+);
+/* Terminate the session only if it is the one the caller saw.  A status query
+ * followed by an unconditional kpb_terminate cannot make that guarantee: the
+ * session can be replaced under the same ID between the two, and the
+ * replacement is the one that dies.  This sends the status's `started_millis`
+ * WITH the request, and the broker - which owns exactly one session - compares
+ * it with its own and acts only on a match, in one step.
+ *
+ *   KPB_OK            the identity matched; the broker is ending the session
+ *   KPB_ERR_MISMATCH  a different session now answers to that ID; nothing was done
+ *   KPB_ERR_UNSUPPORTED  the broker is from a build that predates this request
+ *                     and answered "invalid request"; nothing was done.  The
+ *                     library does NOT retry unconditionally - that decision,
+ *                     and the risk, belong to the caller (kpb_terminate).
+ *   KPB_ERR_TIMEOUT   as for kpb_terminate_timeout: the request may still be
+ *                     acted on, and if it is, it is still identity-checked.
+ *
+ * `expected_started_millis` is compared as given: 0 is not "no expectation". */
+kpb_result kpb_terminate_expect(
+    const char *runtime_dir,
+    const char *session_id,
+    uint64_t expected_started_millis,
     int timeout_millis
 );
 

@@ -72,6 +72,7 @@ enum kpb_frame_type {
 #define KPB_ERROR_READ_ONLY "observer connections are read-only"
 #define KPB_ERROR_OBSERVER_FULL "observer capacity reached"
 #define KPB_ERROR_NEEDS_V2 "observe requires protocol 2"
+#define KPB_ERROR_IDENTITY_MISMATCH "identity mismatch"
 
 typedef struct {
     uint32_t magic;
@@ -115,6 +116,16 @@ typedef struct {
     uint16_t version;         /* 22  selected session version  */
 } kpb_wire_attach_reply;
 
+/* An identity-bound TERMINATE.  Discriminated from the empty TERMINATE every
+ * deployed client sends by payload size alone, the way ATTACH v1 and v2 are:
+ * the frame version stays 1, an empty TERMINATE behaves exactly as before, and
+ * a broker that predates this answers the 8-byte form with its existing
+ * "invalid request" error and does nothing. */
+typedef struct {
+    uint64_t expected_started_millis;  /* big-endian; compared with the broker's own */
+} kpb_wire_terminate;
+
+_Static_assert(sizeof(kpb_wire_terminate) == 8, "identity-bound terminate must be 8 bytes");
 _Static_assert(sizeof(kpb_frame_header) == 12, "frame header must be 12 bytes");
 _Static_assert(sizeof(kpb_wire_attach) == 32, "v2 attach must be 32 bytes");
 _Static_assert(

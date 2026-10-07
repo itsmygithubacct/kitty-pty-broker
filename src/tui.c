@@ -639,6 +639,12 @@ kpb_tui_run(
     char message[TUI_MESSAGE_MAX] = "";
     char confirmation_id[KPB_SESSION_ID_MAX + 1] = "";
     bool confirming = false;
+    /* The identity of the session the user was shown when they pressed x, so
+     * the kill that follows confirmation can only ever end THAT session: the
+     * list refreshes while the prompt is up, and a session can be replaced
+     * under the same ID in between. */
+    bool confirmation_bound = false;
+    uint64_t confirmation_started = 0;
     bool redraw = true;
     int result = KPB_TUI_QUIT;
     kpb_result broker_result;
@@ -735,8 +741,12 @@ kpb_tui_run(
                     sizeof terminated
                 );
                 terminated[sizeof terminated - 1U] = '\0';
-                broker_result = kpb_terminate_timeout(
-                    runtime_dir, terminated, timeout_millis);
+                /* An unreachable entry has no identity to bind to; its kill is
+                 * the plain request, which is all the user can mean by it. */
+                broker_result = confirmation_bound
+                    ? kpb_terminate_expect(
+                          runtime_dir, terminated, confirmation_started, timeout_millis)
+                    : kpb_terminate_timeout(runtime_dir, terminated, timeout_millis);
                 if (broker_result == KPB_OK) {
                     snprintf(
                         message,
@@ -751,6 +761,21 @@ kpb_tui_run(
                         "%.64s did not answer; it may still act on the request.",
                         terminated
                     );
+                } else if (broker_result == KPB_ERR_MISMATCH) {
+                    snprintf(
+                        message,
+                        sizeof message,
+                        "%.64s is now a different session (it was replaced); nothing was done.",
+                        terminated
+                    );
+                } else if (broker_result == KPB_ERR_UNSUPPORTED) {
+                    snprintf(
+                        message,
+                        sizeof message,
+                        "%.64s is from an older build and cannot verify it is the one you "
+                        "chose; nothing was done (kitty-pty-broker kill ID ends it).",
+                        terminated
+                    );
                 } else {
                     snprintf(
                         message,
@@ -762,6 +787,7 @@ kpb_tui_run(
                 }
                 (void)refresh_sessions(runtime_dir, timeout_millis, &list, &selected);
                 confirming = false;
+                confirmation_bound = false;
                 confirmation_id[0] = '\0';
             } else if (
                 input[0] == 'n' || input[0] == 'N' ||
@@ -813,6 +839,9 @@ kpb_tui_run(
                     sizeof confirmation_id
                 );
                 confirmation_id[sizeof confirmation_id - 1U] = '\0';
+                confirmation_bound = list.items[selected].reachable != 0;
+                confirmation_started = confirmation_bound
+                    ? list.items[selected].status.started_millis : 0;
             } else {
                 snprintf(message, sizeof message, "There is no session to terminate.");
             }

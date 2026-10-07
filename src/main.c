@@ -541,7 +541,7 @@ usage(FILE *stream) {
         "  kitty-pty-broker [GLOBAL OPTIONS] observe ID [--from EPOCH:OFFSET]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] list [--json] [--all]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] status ID [--json]\n"
-        "  kitty-pty-broker [GLOBAL OPTIONS] kill ID\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] kill ID [--expect-started MILLIS]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] reaped [--json]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] reaped path ID\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] tui\n"
@@ -556,7 +556,11 @@ usage(FILE *stream) {
         "            --all also lists sessions that did not answer, as unreachable\n"
         "  status    one session's record; JSON also has cwd_now (the command's directory now;\n"
         "            cwd is where it started), boot_id and start_ticks (null if unavailable)\n"
-        "  kill      ask a session to end (SIGTERM, then SIGKILL after a grace period)\n"
+        "  kill      ask a session to end (SIGTERM, then SIGKILL after a grace period).\n"
+        "            With --expect-started MILLIS (a status's started_millis) the broker ends\n"
+        "            only the session that started then, atomically: exit 3 if the id now\n"
+        "            names a different session, 5 if the broker is too old to check; either\n"
+        "            way nothing was done\n"
         "  reaped    journals kept from sessions whose broker died; `reaped path ID` prints\n"
         "            the newest journal for ID\n"
         "  tui       interactive session manager (Enter attach, o observe, x end, q quit)\n"
@@ -572,7 +576,8 @@ usage(FILE *stream) {
         "                      once, so the bound is shared, not per session\n"
         "\n"
         "exit status: 0 success; 1 failure (including a missing or unsafe runtime directory);\n"
-        "2 usage error. run and attach exit with the pane command's status once it exits.\n",
+        "2 usage error; 3 and 5 are refusals of kill --expect-started (above). run and attach\n"
+        "exit with the pane command's status once it exits.\n",
         stream
     );
 }
@@ -866,12 +871,44 @@ main(int argc, char **argv) {
     }
     if (strcmp(command, "kill") == 0) {
         kpb_result result;
-        if (index + 1 != argc) {
+        const char *session_id;
+        bool bound = false;
+        uint64_t expected = 0;
+        if (index >= argc) {
             usage(stderr);
             return 2;
         }
+        session_id = argv[index++];
+        if (index < argc) {
+            const char *end;
+            if (strcmp(argv[index], "--expect-started") != 0 || index + 2 != argc ||
+                parse_u64_prefix(argv[index + 1], &expected, &end) != 0 || *end != '\0') {
+                usage(stderr);
+                return 2;
+            }
+            bound = true;
+        }
         if (require_runtime(runtime_dir) != 0) return 1;
-        result = kpb_terminate_timeout(runtime_dir, argv[index], timeout_millis);
+        if (bound) {
+            result = kpb_terminate_expect(runtime_dir, session_id, expected, timeout_millis);
+            if (result == KPB_ERR_MISMATCH) {
+                fprintf(
+                    stderr,
+                    "kitty-pty-broker: kill session: refused: %s is not the session that "
+                    "started at %llu (it was replaced); nothing was done\n",
+                    session_id, (unsigned long long)expected);
+                return 3;
+            }
+            if (result == KPB_ERR_UNSUPPORTED) {
+                fprintf(
+                    stderr,
+                    "kitty-pty-broker: kill session: this broker predates identity-checked "
+                    "kill and cannot verify %s; nothing was done\n", session_id);
+                return 5;
+            }
+        } else {
+            result = kpb_terminate_timeout(runtime_dir, session_id, timeout_millis);
+        }
         if (result == KPB_ERR_TIMEOUT) {
             fprintf(
                 stderr,
@@ -879,7 +916,7 @@ main(int argc, char **argv) {
                 "the broker may still act on the request\n");
             return 1;
         }
-        return report_session_result("kill session", runtime_dir, argv[index], result);
+        return report_session_result("kill session", runtime_dir, session_id, result);
     }
     if (strcmp(command, "status") == 0) {
         kpb_status status;
