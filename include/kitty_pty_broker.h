@@ -239,15 +239,21 @@ kpb_result kpb_prepare_runtime(const char *runtime_dir);
  * for its own lifecycle are restored to their conventional defaults. */
 /* May return KPB_ERR_TIMEOUT: the sessions lock could not be had within
  * KPB_DEFAULT_TIMEOUT_MILLIS, or the new broker did not report ready (see
- * kpb_spawn_timeout).  Either way no session was started. */
+ * kpb_spawn_timeout).  The first creates nothing; for the second see there. */
 kpb_result kpb_spawn(const kpb_spawn_options *options, kpb_status *status);
 /* As kpb_spawn, with an explicit bound (<= 0: KPB_DEFAULT_TIMEOUT_MILLIS) on
  * waiting for the sessions-directory lock.  Both forms can return
  * KPB_ERR_TIMEOUT: either the lock could not be had in time (nothing was
  * created), or the new broker did not report ready within the larger of that
- * bound and KPB_SPAWN_READY_MILLIS.  In the second case nobody is waiting any
- * more, so the broker tears itself down instead of coming up unobserved - a
- * timeout means no session was started. */
+ * bound and KPB_SPAWN_READY_MILLIS.
+ *
+ * The second case means "the new broker did not answer in time" - NOT "nothing
+ * was started".  The broker's command may already be running.  If the broker is
+ * only slow, it finds nobody waiting when it finally reports, kills its command
+ * and removes the session itself.  If it stays wedged (stopped, or stuck on a
+ * filesystem) it, its command and its directory stay until it dies; the spawn
+ * has left metadata naming it, so once it is gone the directory is reaped like
+ * any other corpse and the ID is free again. */
 kpb_result kpb_spawn_timeout(
     const kpb_spawn_options *options,
     kpb_status *status,

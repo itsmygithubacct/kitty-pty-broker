@@ -2890,6 +2890,58 @@ lock_sessions_dir_until(const session_paths *paths, const struct timespec *deadl
     }
 }
 
+/* Metadata for a broker that has been forked and has not yet said it is up.
+ *
+ * The broker writes its own, complete metadata late - after the pane's command is
+ * running and after an fsync - and until it does, a session directory has none,
+ * and a directory without metadata is never stale: it may be a spawn in flight.
+ * If the broker then wedges and is killed, the directory would block its ID for
+ * good.  So the CALLER, which alone knows the broker's pid the moment fork
+ * returns, leaves the proof the reaper needs: pid, boot and start time.
+ *
+ * It is linked into place, not renamed, so it can never replace the broker's own
+ * file if the broker was quick (link fails with EEXIST), and the broker's own
+ * rename replaces this one.  Best-effort: failing to write it only means the old,
+ * more conservative behaviour. */
+static void
+write_provisional_metadata(const session_paths *paths, pid_t broker_pid) {
+    char temporary[KPB_PATH_MAX];
+    char data[1024];
+    char boot_id[64];
+    uint64_t ticks;
+    int count;
+    int fd;
+    if (snprintf(temporary, sizeof temporary, "%s.provisional", paths->metadata_path) >= (int)sizeof temporary) {
+        return;
+    }
+    count = snprintf(
+        data, sizeof data,
+        "version=%u\nid=%s\nbroker_pid=%ld\nchild_pid=-1\nstarted_millis=%llu\n",
+        KPB_PROTOCOL_VERSION, paths->session_id, (long)broker_pid,
+        (unsigned long long)realtime_millis());
+    if (count < 0 || (size_t)count >= sizeof data) return;
+    if (current_boot_id(boot_id) == 0) {
+        int more = snprintf(data + count, sizeof data - (size_t)count, "boot_id=%s\n", boot_id);
+        if (more > 0 && (size_t)more < sizeof data - (size_t)count) count += more;
+    }
+    if (process_start_ticks((long)broker_pid, &ticks) == 0) {
+        int more = snprintf(
+            data + count, sizeof data - (size_t)count, "start_ticks=%llu\n", (unsigned long long)ticks);
+        if (more > 0 && (size_t)more < sizeof data - (size_t)count) count += more;
+    }
+    fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    if (write_all_fd(fd, data, (size_t)count) < 0) {
+        close(fd);
+        (void)unlink(temporary);
+        return;
+    }
+    close(fd);
+    /* EEXIST (the broker's own file is already there) is the expected loss. */
+    if (link(temporary, paths->metadata_path) != 0) errno = 0;
+    (void)unlink(temporary);
+}
+
 kpb_result
 kpb_spawn(const kpb_spawn_options *options, kpb_status *status) {
     return kpb_spawn_timeout(options, status, 0);
@@ -2994,11 +3046,16 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
         _exit(code);
     }
     close(ready_pipe[1]);
+    write_provisional_metadata(&paths, pid);
     /* Bounded: the new broker is another process, and a start that wedges
      * (a filesystem that stops answering, a stopped process) must not hang the
-     * caller.  When this gives up the read end closes, the broker's report fails,
-     * and its own failure path kills the command and removes the session - so a
-     * timeout here means no session was left running. */
+     * caller.  When this gives up the read end closes; a broker that is merely
+     * slow then fails to report, and its own failure path kills the command and
+     * removes the session.  A broker that stays wedged does not: it, its command
+     * (if it got that far) and its directory remain until it dies, and the
+     * provisional metadata above is what lets the reaper clear the directory
+     * then.  So a timeout means "the new broker did not answer in time", not
+     * "nothing was started". */
     deadline_in(
         &ready_deadline,
         timeout_millis > KPB_SPAWN_READY_MILLIS ? (long)timeout_millis : (long)KPB_SPAWN_READY_MILLIS);
