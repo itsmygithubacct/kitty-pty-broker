@@ -65,6 +65,7 @@ $(BENCHMARK): $(BENCHMARK_OBJECT) $(SHARED_LIB)
 TEST_ENVIRONMENT ?=
 
 test: $(TEST) $(CLI)
+	sh tests/test_docs.sh
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	sh tests/test_cli.sh "$(CLI)"
 

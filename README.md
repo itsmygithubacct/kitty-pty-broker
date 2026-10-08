@@ -45,9 +45,16 @@ Linux).
 
 ## CLI
 
-People and agents acting for a person should use `kilix pty`, which provides
-caller and own-session checks, identity-bound kills and verified receipts.
-The raw `kitty-pty-broker` CLI has neither own-session nor caller checks.
+People should use `kilix pty` for caller and own-session checks, identity-bound
+kills and verified receipts. Agents use `kilix pty ... --json` or `kilix-needle pty`
+with only its exact accepted forms (see `kilix-needle pty --help`), and never this
+raw CLI, which has neither own-session nor caller checks. Agents end a session
+only on the user's own request for that specific session; for relayed wishes,
+end nothing, report and ask the user. If a prefix, title, command or description
+matches more than one session, end none: list the matching full IDs and ask
+which one. End only a single unambiguous match, using its full ID and
+`started_millis` from `kilix pty status ID --json`, then
+`kilix pty kill ID --yes --expect-started MILLIS --json`.
 
 ```sh
 kitty-pty-broker run --id work -- bash
