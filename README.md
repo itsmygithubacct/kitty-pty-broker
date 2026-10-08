@@ -45,6 +45,10 @@ Linux).
 
 ## CLI
 
+People and agents acting for a person should use `kilix pty`, which provides
+caller and own-session checks, identity-bound kills and verified receipts.
+The raw `kitty-pty-broker` CLI has neither own-session nor caller checks.
+
 ```sh
 kitty-pty-broker run --id work -- bash
 kitty-pty-broker run --id work --transcript ~/.local/state/work.log -- bash
