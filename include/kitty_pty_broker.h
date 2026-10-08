@@ -32,6 +32,8 @@ extern "C" {
 #define KPB_SESSION_ID_MAX 64
 #define KPB_PATH_MAX 4096
 #define KPB_COMMAND_MAX 512
+#define KPB_RECORDED_ARGV_MAX 1024
+#define KPB_RECORDED_CWD_MAX 512
 #define KPB_IO_CHUNK (32U * 1024U)
 #define KPB_DEFAULT_JOURNAL_LIMIT (64ULL * 1024ULL * 1024ULL)
 #define KPB_DEFAULT_TRANSCRIPT_LIMIT (8ULL * 1024ULL * 1024ULL)
@@ -193,11 +195,26 @@ typedef int (*kpb_list_callback)(const kpb_status *status, void *data);
  * reachable == 0 and the reason in `error`; `status` is then meaningless.  A
  * directory with nothing listening is a corpse, not a session, and is never
  * reported (it is reaped when its broker is provably gone). */
+/* Display-only spawn facts. The JSON strings are validated, bounded encodings;
+ * an empty buffer means unavailable (not an empty argv/cwd). Truncation keeps
+ * whole argv elements and a character prefix of cwd. Invalid UTF-8 bytes are
+ * replaced by U+FFFD and also set truncated. Never use these fields as stale
+ * proof, current process state, or authorization to terminate a session. */
+typedef struct {
+    char argv_json[KPB_RECORDED_ARGV_MAX + 1];
+    char cwd_json[KPB_RECORDED_CWD_MAX + 1];
+    uint64_t started_millis;
+    int have_started;
+    int truncated;
+} kpb_recorded_command;
+
 typedef struct {
     char session_id[KPB_SESSION_ID_MAX + 1];
     int reachable;
     kpb_result error;
     kpb_status status;
+    /* Meaningful only for unreachable rows; absent metadata leaves nulls. */
+    kpb_recorded_command recorded;
 } kpb_list_entry;
 
 typedef struct {

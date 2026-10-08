@@ -116,6 +116,25 @@ RUNTIME/                         0700, owned by you
         ID.STARTED_MILLIS.meta
 ```
 
+The broker also writes `argv_json` (a one-line JSON array, at most 1024 encoded
+bytes), `cwd_json` (a JSON string, at most 512 encoded bytes), and
+`argv_truncated=0|1` in that same metadata file. The file stays below the
+4096-byte identity-read bound; readers never read beyond that bound even if the
+file grows after its descriptor check. No extra cleanup names are introduced.
+Oversized argv retains a prefix of whole elements; oversized cwd retains a
+prefix of whole characters. Either sets `argv_truncated=1`. Valid UTF-8 is kept;
+each invalid byte becomes `\ufffd` and also sets the flag (lossy display).
+
+`list --json --all` adds a display-only `recorded` object to unreachable rows:
+`{"argv":["sh","-c","sleep 90"],"cwd":"/srv/work","started_millis":123,"truncated":false}`.
+These are spawn facts, not the live command or cwd and not a stale-session proof.
+Missing fields in older metadata become null (`truncated` defaults to false);
+an older record's `started_millis` is retained when present. Malformed or
+oversized JSON fields become null and mark the display truncated. Rejected or
+missing identity files supply only nulls. Reachable rows and `status` keep their
+existing fields and wire format. Older readers ignore the new metadata lines;
+the pid + boot_id + start_ticks stale proof is unchanged.
+
 `control.sock`'s full path must fit a Unix socket address, 107 bytes. A longer
 one is refused up front, before anything is created:
 `kitty-pty-broker: socket path too long (N bytes, limit 107): PATH`. Use a short

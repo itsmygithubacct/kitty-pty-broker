@@ -510,6 +510,14 @@ print_list_entry(const kpb_list_entry *entry, void *opaque) {
             json_string(entry->session_id);
             fputs(",\"reachable\":false,\"error\":", stdout);
             json_string(reason_token(entry->error));
+            fputs(",\"recorded\":{\"argv\":", stdout);
+            fputs(entry->recorded.argv_json[0] ? entry->recorded.argv_json : "null", stdout);
+            fputs(",\"cwd\":", stdout);
+            fputs(entry->recorded.cwd_json[0] ? entry->recorded.cwd_json : "null", stdout);
+            fputs(",\"started_millis\":", stdout);
+            if (entry->recorded.have_started) printf("%llu", (unsigned long long)entry->recorded.started_millis);
+            else fputs("null", stdout);
+            printf(",\"truncated\":%s}", entry->recorded.truncated ? "true" : "false");
             putchar('}');
         } else {
             printf(
@@ -652,6 +660,7 @@ usage(FILE *stream) {
         "  observe   attach read-only; keys are not forwarded, Ctrl-] leaves\n"
         "  list      one line per reachable session; --json for a JSON array;\n"
         "            --all also lists sessions that did not answer, as unreachable\n"
+        "            JSON unreachable rows include recorded spawn argv/cwd (null if unavailable)\n"
         "  status    one session's record; JSON also has cwd_now (the command's directory now;\n"
         "            cwd is where it started), boot_id and start_ticks (null if unavailable)\n"
         "  kill      ask a session to end (SIGTERM, then SIGKILL after a grace period).\n"

@@ -19,6 +19,7 @@ STATIC_LIB := $(BUILD_DIR)/libkitty-pty-broker.a
 SHARED_LIB := $(BUILD_DIR)/libkitty-pty-broker.so
 CLI := $(BUILD_DIR)/kitty-pty-broker
 TEST := $(BUILD_DIR)/test-broker
+RECORDED_TEST := $(BUILD_DIR)/test-recorded
 BENCHMARK := $(BUILD_DIR)/benchmark-broker
 FUZZ := $(BUILD_DIR)/fuzz-protocol
 FUZZ_PARSERS := $(BUILD_DIR)/fuzz-parsers
@@ -59,14 +60,19 @@ $(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB)
 $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(TEST_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
+$(RECORDED_TEST): tests/test_recorded.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_recorded.c -o "$@" $(LDLIBS)
+
 $(BENCHMARK): $(BENCHMARK_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(BENCHMARK_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
 TEST_ENVIRONMENT ?=
 
-test: $(TEST) $(CLI)
+test: $(TEST) $(RECORDED_TEST) $(CLI)
 	sh tests/test_docs.sh
 	$(TEST_ENVIRONMENT) "$(TEST)"
+	$(TEST_ENVIRONMENT) "$(RECORDED_TEST)"
+	$(TEST_ENVIRONMENT) python3 tests/test_recorded.py "$(CLI)"
 	sh tests/test_cli.sh "$(CLI)"
 
 benchmark: $(BENCHMARK)
@@ -75,6 +81,7 @@ benchmark: $(BENCHMARK)
 compatibility:
 	./tests/mixed_version.sh
 	./tests/terminate_compat.sh
+	python3 tests/test_recorded_compat.py
 
 $(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \

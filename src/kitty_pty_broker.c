@@ -122,6 +122,7 @@ typedef struct {
     char session_id[KPB_SESSION_ID_MAX + 1];
     char cwd[KPB_PATH_MAX];
     char command[KPB_COMMAND_MAX];
+    kpb_recorded_command recorded;
     int listener_fd;
     int pty_fd;
     int journal_fd;
@@ -769,6 +770,9 @@ read_identity_file(const char *path, char *buffer, size_t capacity) {
         errno = EINVAL;
         return -1;
     }
+    /* Even if the file grows after fstat, no identity reader may read more
+     * than the bound. The extra byte is only for the terminating NUL. */
+    if (capacity > KPB_IDENTITY_FILE_MAX + 1U) capacity = KPB_IDENTITY_FILE_MAX + 1U;
     return read_open_file(fd, buffer, capacity);
 }
 
@@ -827,9 +831,95 @@ process_start_ticks(long pid, uint64_t *ticks) {
 }
 
 static int
+utf8_character_size(const unsigned char *s) {
+    int size;
+    int index;
+    if (*s < 0x80) return *s ? 1 : 0;
+    if (*s >= 0xc2 && *s <= 0xdf) size = 2;
+    else if (*s >= 0xe0 && *s <= 0xef) size = 3;
+    else if (*s >= 0xf0 && *s <= 0xf4) size = 4;
+    else return 0;
+    for (index = 1; index < size; index++) {
+        if (s[index] < 0x80 || s[index] > 0xbf) return 0;
+    }
+    if ((*s == 0xe0 && s[1] < 0xa0) || (*s == 0xed && s[1] > 0x9f) ||
+        (*s == 0xf0 && s[1] < 0x90) || (*s == 0xf4 && s[1] > 0x8f)) return 0;
+    return size;
+}
+
+/* Always returns a complete JSON string, even when its source does not fit.
+ * Work is bounded by capacity, including for a multi-megabyte argument. */
+static bool
+encode_recorded_string(char *output, size_t capacity, const char *value, int *truncated) {
+    const unsigned char *cursor = (const unsigned char *)value;
+    size_t used = 1;
+    output[0] = '"';
+    while (*cursor) {
+        char escaped[7];
+        const char *bytes = (const char *)cursor;
+        size_t length;
+        int step = utf8_character_size(cursor);
+        if (!step) {
+            bytes = "\\ufffd";
+            length = 6;
+            step = 1;
+            *truncated = 1;
+        } else if (*cursor == '"' || *cursor == '\\') {
+            escaped[0] = '\\';
+            escaped[1] = (char)*cursor;
+            bytes = escaped;
+            length = 2;
+        } else if (*cursor < 0x20 || *cursor == 0x7f) {
+            (void)snprintf(escaped, sizeof escaped, "\\u%04x", *cursor);
+            bytes = escaped;
+            length = 6;
+        } else {
+            length = (size_t)step;
+        }
+        /* Reserve the closing quote and the NUL, never cut an escape/UTF-8. */
+        if (used + length + 2 > capacity) {
+            *truncated = 1;
+            output[used++] = '"';
+            output[used] = '\0';
+            return false;
+        }
+        memcpy(output + used, bytes, length);
+        used += length;
+        cursor += step;
+    }
+    output[used++] = '"';
+    output[used] = '\0';
+    return true;
+}
+
+static void
+record_start_command(kpb_recorded_command *recorded, char *const *argv, const char *cwd) {
+    size_t index;
+    size_t used = 1;
+    memset(recorded, 0, sizeof *recorded);
+    recorded->argv_json[0] = '[';
+    for (index = 0; argv && argv[index]; index++) {
+        char argument[KPB_RECORDED_ARGV_MAX + 1];
+        bool complete = encode_recorded_string(argument, sizeof argument, argv[index], &recorded->truncated);
+        size_t length = strlen(argument);
+        /* A prefix of WHOLE argv elements, never a partial argument. */
+        if (!complete || used + (index ? 1 : 0) + length + 2 > sizeof recorded->argv_json) {
+            recorded->truncated = 1;
+            break;
+        }
+        if (index) recorded->argv_json[used++] = ',';
+        memcpy(recorded->argv_json + used, argument, length);
+        used += length;
+    }
+    recorded->argv_json[used++] = ']';
+    recorded->argv_json[used] = '\0';
+    (void)encode_recorded_string(recorded->cwd_json, sizeof recorded->cwd_json, cwd, &recorded->truncated);
+}
+
+static int
 write_metadata(server_state *server) {
     char temporary[KPB_PATH_MAX];
-    char data[2048];
+    char data[KPB_IDENTITY_FILE_MAX + 1];
     char boot_id[64];
     uint64_t ticks;
     int fd;
@@ -872,6 +962,15 @@ write_metadata(server_state *server) {
         }
         count += more;
     }
+    more = snprintf(
+        data + count, sizeof data - (size_t)count,
+        "argv_json=%s\ncwd_json=%s\nargv_truncated=%d\n",
+        server->recorded.argv_json, server->recorded.cwd_json, server->recorded.truncated);
+    if (more < 0 || (size_t)more >= sizeof data - (size_t)count) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    count += more;
     fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) return -1;
     if (write_all_fd(fd, data, (size_t)count) < 0 || fsync(fd) != 0) {
@@ -2522,6 +2621,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     copy_string(server.session_id, sizeof server.session_id, session_id);
     copy_string(server.cwd, sizeof server.cwd, options->cwd);
     build_command(server.command, options->argv);
+    record_start_command(&server.recorded, options->argv, options->cwd);
     if (build_paths(options->runtime_dir, session_id, &server.paths) != KPB_OK) goto fail;
     if (setsid() < 0) goto fail;
     if (configure_server_signals() != 0) goto fail;
@@ -2682,6 +2782,127 @@ parse_metadata(const char *data, metadata_info *info) {
         if (line) line++;
     }
     return info->pid > 0;
+}
+
+static bool
+json_hex4(const char *cursor, unsigned *value) {
+    int index;
+    *value = 0;
+    for (index = 0; index < 4; index++) {
+        unsigned digit;
+        char c = cursor[index];
+        if (c >= '0' && c <= '9') digit = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (unsigned)(c - 'a') + 10;
+        else if (c >= 'A' && c <= 'F') digit = (unsigned)(c - 'A') + 10;
+        else return false;
+        *value = *value * 16 + digit;
+    }
+    return true;
+}
+
+/* Validate before emitting stored JSON verbatim. Metadata is not trusted to
+ * contain JSON, nor to contain the promised type. No recursive/nested values. */
+static const char *
+recorded_json_string_end(const char *cursor) {
+    if (*cursor++ != '"') return NULL;
+    while (*cursor && *cursor != '"') {
+        if ((unsigned char)*cursor < 0x20) return NULL;
+        if (*cursor == '\\') {
+            char escape = *++cursor;
+            if (!escape) return NULL;
+            if (escape == 'u') {
+                unsigned value;
+                if (!json_hex4(cursor + 1, &value)) return NULL;
+                cursor += 5;
+                if (value >= 0xd800 && value <= 0xdbff) {
+                    if (cursor[0] != '\\' || cursor[1] != 'u' ||
+                        !json_hex4(cursor + 2, &value) || value < 0xdc00 || value > 0xdfff) return NULL;
+                    cursor += 6;
+                } else if (value >= 0xdc00 && value <= 0xdfff) return NULL;
+                continue;
+            }
+            if (!strchr("\"\\/bfnrt", escape)) return NULL;
+            cursor++;
+        } else {
+            int size = utf8_character_size((const unsigned char *)cursor);
+            if (!size) return NULL;
+            cursor += size;
+        }
+    }
+    return *cursor == '"' ? cursor + 1 : NULL;
+}
+
+static const char *
+recorded_json_space(const char *cursor) {
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r') cursor++;
+    return cursor;
+}
+
+static bool
+valid_recorded_json(const char *value, bool array) {
+    const char *cursor = recorded_json_space(value);
+    if (!array) {
+        cursor = recorded_json_string_end(cursor);
+        return cursor && !*recorded_json_space(cursor);
+    }
+    if (*cursor++ != '[') return false;
+    cursor = recorded_json_space(cursor);
+    if (*cursor != ']') {
+        for (;;) {
+            cursor = recorded_json_string_end(cursor);
+            if (!cursor) return false;
+            cursor = recorded_json_space(cursor);
+            if (*cursor == ']') break;
+            if (*cursor++ != ',') return false;
+            cursor = recorded_json_space(cursor);
+        }
+    }
+    return !*recorded_json_space(cursor + 1);
+}
+
+/* Independent of parse_metadata: descriptive data never supplies, alters, or
+ * weakens the pid + boot_id + start_ticks stale proof. */
+static void
+parse_recorded_metadata(const char *data, kpb_recorded_command *recorded) {
+    const char *line = data;
+    memset(recorded, 0, sizeof *recorded);
+    while (line && *line) {
+        size_t length = strcspn(line, "\n");
+        size_t prefix = 0;
+        size_t limit = 0;
+        char *output = NULL;
+        if (strncmp(line, "argv_json=", 10) == 0) {
+            prefix = 10;
+            limit = KPB_RECORDED_ARGV_MAX;
+            output = recorded->argv_json;
+        } else if (strncmp(line, "cwd_json=", 9) == 0) {
+            prefix = 9;
+            limit = KPB_RECORDED_CWD_MAX;
+            output = recorded->cwd_json;
+        } else if (strncmp(line, "started_millis=", 15) == 0) {
+            char *end = NULL;
+            unsigned long long value;
+            errno = 0;
+            value = strtoull(line + 15, &end, 10);
+            if (!errno && end == line + length && line[15] >= '0' && line[15] <= '9') {
+                recorded->started_millis = (uint64_t)value;
+                recorded->have_started = 1;
+            }
+        } else if (length == 16 && strncmp(line, "argv_truncated=1", 16) == 0) {
+            recorded->truncated = 1;
+        }
+        if (output) {
+            output[0] = '\0';
+            if (length - prefix <= limit) {
+                memcpy(output, line + prefix, length - prefix);
+                output[length - prefix] = '\0';
+                if (!valid_recorded_json(output, prefix == 10)) output[0] = '\0';
+            }
+            if (!output[0]) recorded->truncated = 1;
+        }
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
 }
 
 /* The session's identity record: the broker's metadata, or - when that is not
@@ -4192,6 +4413,14 @@ kpb_list_with_options(
         item.error = slot->error;
         item.reachable = slot->error == KPB_OK && slot->status != NULL;
         if (item.reachable) item.status = *slot->status;
+        else {
+            session_paths recorded_paths;
+            char metadata[KPB_IDENTITY_FILE_MAX + 1];
+            if (build_paths(runtime_dir, slot->id, &recorded_paths) == KPB_OK &&
+                read_session_metadata(&recorded_paths, metadata, sizeof metadata, NULL) > 0) {
+                parse_recorded_metadata(metadata, &item.recorded);
+            }
+        }
         if (callback(&item, data) != 0) stopped = true;
     }
     for (index = 0; index < count; index++) {

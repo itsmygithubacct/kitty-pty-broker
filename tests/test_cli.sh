@@ -150,7 +150,16 @@ out=$(kpb --runtime-dir "$rt" --timeout 0.5 list --json 2>/dev/null)
 ! printf '%s' "$out" | grep -q wedged && printf '%s' "$out" | grep -q '"id":"healthy"' && ! printf '%s' "$out" | grep -q reachable
 check "plain list --json omits unreachable sessions and the reachable field" $?
 out=$(kpb --runtime-dir "$rt" --timeout 0.5 list --json --all 2>/dev/null)
-printf '%s' "$out" | grep -q '{"id":"wedged","reachable":false,"error":"timeout"}' &&
+printf '%s' "$out" | python3 -c '
+import json, os, sys
+rows = json.load(sys.stdin)
+row = next(row for row in rows if row["id"] == "wedged")
+assert row["reachable"] is False and row["error"] == "timeout"
+recorded = row["recorded"]
+assert recorded["argv"] == ["sleep", "300"] and recorded["cwd"] == os.getcwd()
+assert isinstance(recorded["started_millis"], int) and recorded["started_millis"] > 0
+assert recorded["truncated"] is False
+' &&
     printf '%s' "$out" | grep -q '"id":"healthy".*"reachable":true}'
 check "list --all --json carries reachable and error" $?
 t0=$(now_ms)

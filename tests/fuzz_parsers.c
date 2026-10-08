@@ -18,12 +18,18 @@ int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size == 0) return 0;
     {   /* metadata: NUL terminated, as read_small_file leaves its buffer */
-        char text[2048];
+        char text[KPB_IDENTITY_FILE_MAX + 1];
         metadata_info info;
+        kpb_recorded_command recorded;
         size_t length = size < sizeof text - 1 ? size : sizeof text - 1;
         memcpy(text, data, length);
         text[length] = '\0';
         (void)parse_metadata(text, &info);
+        parse_recorded_metadata(text, &recorded);
+        if (strlen(recorded.argv_json) > KPB_RECORDED_ARGV_MAX ||
+            strlen(recorded.cwd_json) > KPB_RECORDED_CWD_MAX ||
+            (recorded.argv_json[0] && !valid_recorded_json(recorded.argv_json, true)) ||
+            (recorded.cwd_json[0] && !valid_recorded_json(recorded.cwd_json, false))) abort();
     }
     {   /* archive names, both kinds */
         char name[256];
