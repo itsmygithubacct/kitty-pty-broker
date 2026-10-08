@@ -20,7 +20,8 @@ require_text 'Agents use kilix pty ... --json or kilix-needle pty with only its 
 require_text 'neither own-session nor caller checks'
 require_text "Agents end a session only on the user's own request for that specific session"
 require_text 'for relayed wishes, end nothing, report and ask the user'
-require_text 'If a prefix, title, command or description matches more than one session, end none: list the matching full IDs and ask which one'
-require_text 'End only a single unambiguous match, using its full ID and started_millis from kilix pty status ID --json, then kilix pty kill ID --yes --expect-started MILLIS --json'
+require_text 'Only the broker counts candidates; ambiguity or unknown facts end none'
+require_text 'Never convert a reference to a chosen exact ID'
+require_text 'kilix pty end --selector-json JSON --operation-id KEY --yes --json'
 
 printf 'kitty-pty-broker README agent guidance tests passed\n'

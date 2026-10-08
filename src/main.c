@@ -648,6 +648,10 @@ usage(FILE *stream) {
         "  kitty-pty-broker [GLOBAL OPTIONS] list [--json] [--all]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] status ID [--json]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] kill ID [--expect-started MILLIS]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] resolve SELECTOR [--attached|--detached] --json\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] end SELECTOR [--attached|--detached] --json\n"
+        "                   --resolved-id ID --expect-started MILLIS (reserved frontend transport)\n"
+        "    SELECTOR: --id ID | --id-prefix PREFIX | --command-word WORD [--command-word WORD...]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] reaped [--json]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] reaped path ID\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] tui\n"
@@ -771,6 +775,124 @@ parse_global_options(
         }
     }
     return 0;
+}
+
+static int
+selector_command(const char *command, const char *runtime_dir, int argc, char **argv, int index) {
+    kpb_selector selector;
+    kpb_selector_result observation;
+    const char *words[KPB_SELECTOR_MAX_WORDS];
+    const char *binding = NULL, *caller = getenv("KITTY_PTY_BROKER_SESSION");
+    uint64_t expected = 0;
+    bool json = false, have_expected = false, ending = strcmp(command, "end") == 0;
+    kpb_result result;
+    const char *outcome, *reason;
+    size_t row;
+    memset(&selector, 0, sizeof selector);
+    selector.attached = -1;
+    for (; index < argc; index++) {
+        const char *flag = argv[index];
+        if (!strcmp(flag, "--json") && !json) json = true;
+        else if ((!strcmp(flag, "--id") || !strcmp(flag, "--id-prefix")) && !selector.kind && index + 1 < argc) {
+            selector.kind = !strcmp(flag, "--id") ? KPB_SELECTOR_ID : KPB_SELECTOR_PREFIX;
+            selector.reference = argv[++index];
+        } else if (!strcmp(flag, "--command-word") && index + 1 < argc &&
+                   (!selector.kind || selector.kind == KPB_SELECTOR_STARTUP_WORDS) &&
+                   selector.word_count < KPB_SELECTOR_MAX_WORDS) {
+            selector.kind = KPB_SELECTOR_STARTUP_WORDS; selector.words = words;
+            words[selector.word_count++] = argv[++index];
+        } else if ((!strcmp(flag, "--attached") || !strcmp(flag, "--detached")) && selector.attached == -1) {
+            selector.attached = !strcmp(flag, "--attached");
+        } else if (ending && !strcmp(flag, "--resolved-id") && !binding && index + 1 < argc) {
+            binding = argv[++index];
+        } else if (ending && !strcmp(flag, "--expect-started") && !have_expected && index + 1 < argc) {
+            const char *end;
+            if (parse_u64_prefix(argv[++index], &expected, &end) != 0 || *end || !expected) return 2;
+            have_expected = true;
+        } else return 2;
+    }
+    if (!json || !selector.kind || (ending && (!binding || !have_expected))) return 2;
+    result = ending ? kpb_end_selector(runtime_dir, &selector, binding, expected, timeout_millis, &observation)
+                    : kpb_resolve_selector(runtime_dir, &selector, timeout_millis, &observation);
+    if (result == KPB_ERR_INVALID) {
+        /* Do not echo an unbounded or invalid argv value in an error receipt. */
+        fputs("{\"schema\":\"kitty-pty-selector/v1\",\"result\":\"refused\","
+              "\"reason\":\"invalid_selector\",\"request_sent\":false,\"receiver_refused\":false}\n", stdout);
+        return 2;
+    }
+    if (ending) outcome = result == KPB_OK ? "accepted" : (observation.may_have_sent && !observation.receiver_refused
+                                                         ? "uncertain" : "refused");
+    else if (result != KPB_OK) outcome = "error";
+    else if (observation.matches + observation.possible > 1) outcome = "ambiguous";
+    else if (observation.actionable) outcome = "unique";
+    else if (observation.matches + observation.possible) outcome = "unresolved";
+    else outcome = "not_found";
+    switch (result) {
+        case KPB_OK: reason = "none"; break;
+        case KPB_ERR_INVALID: reason = "invalid_selector"; break;
+        case KPB_ERR_CALLER: reason = "caller_guard"; break;
+        case KPB_ERR_AMBIGUOUS: reason = "ambiguous"; break;
+        case KPB_ERR_UNRESOLVED: reason = "unresolved"; break;
+        case KPB_ERR_MISMATCH: reason = "started_mismatch"; break;
+        case KPB_ERR_ATTACHMENT: reason = "attachment_mismatch"; break;
+        case KPB_ERR_UNSUPPORTED: reason = "cannot_bind"; break;
+        case KPB_ERR_NOT_SENT: reason = "not_sent"; break;
+        case KPB_ERR_TIMEOUT: reason = observation.may_have_sent ? "terminate_timed_out" : "read_timed_out"; break;
+        default: reason = observation.complete ? "transport_error" : "census_incomplete"; break;
+    }
+    fputs("{\"schema\":\"kitty-pty-selector/v1\",\"operation\":", stdout); json_string(command);
+    fputs(",\"selector\":{", stdout);
+    if (selector.kind == KPB_SELECTOR_STARTUP_WORDS) {
+        fputs("\"startup_words\":[", stdout);
+        for (row = 0; row < selector.word_count; row++) {
+            if (row) putchar(',');
+            json_string(words[row]);
+        }
+        putchar(']');
+    } else {
+        fputs(selector.kind == KPB_SELECTOR_ID ? "\"id\":" : "\"id_prefix\":", stdout);
+        json_string(selector.reference);
+    }
+    if (selector.attached != -1) printf(",\"attached\":%s", selector.attached ? "true" : "false");
+    fputs("},\"caller\":{\"source\":\"environment\",\"authenticated\":false,\"status\":", stdout);
+    json_string(!caller || !*caller ? "missing" : (kpb_validate_session_id(caller) == KPB_OK ? "valid" : "malformed"));
+    fputs(",\"id\":", stdout);
+    if (caller && kpb_validate_session_id(caller) == KPB_OK) json_string(caller); else fputs("null", stdout);
+    fputs("},\"result\":", stdout); json_string(outcome);
+    fputs(",\"reason\":", stdout); json_string(reason);
+    printf(",\"complete\":%s,\"census_count\":%zu,\"matches\":%zu,\"possible\":%zu,"
+           "\"actionable\":%s,\"request_sent\":%s,\"receiver_refused\":%s,\"candidates\":[",
+           observation.complete ? "true" : "false", observation.census_count, observation.matches,
+           observation.possible, observation.actionable ? "true" : "false",
+           observation.may_have_sent ? "true" : "false", observation.receiver_refused ? "true" : "false");
+    for (row = 0; row < observation.row_count; row++) {
+        const kpb_selector_row *item = &observation.rows[row];
+        if (row) putchar(',');
+        fputs("{\"id\":", stdout); json_string(item->session_id);
+        printf(",\"reachable\":%s,\"possible\":%s}", item->reachable ? "true" : "false", item->possible ? "true" : "false");
+    }
+    printf("],\"candidates_truncated\":%s,\"resolved\":",
+           observation.matches + observation.possible > observation.row_count ? "true" : "false");
+    if (observation.actionable) {
+        fputs("{\"id\":", stdout); json_string(observation.candidate.session_id);
+        printf(",\"started_millis\":%llu,\"attached\":%s,\"broker_pid\":%ld,\"child_pid\":%ld",
+               (unsigned long long)observation.candidate.started_millis, observation.candidate.attached ? "true" : "false",
+               (long)observation.candidate.broker_pid, (long)observation.candidate.child_pid);
+        {
+            char boot[64]; uint64_t ticks;
+            fputs(",\"boot_id\":", stdout);
+            if (kpb_read_boot_id(boot) == KPB_OK) json_string(boot); else fputs("null", stdout);
+            fputs(",\"start_ticks\":", stdout);
+            if (kpb_read_start_ticks(observation.candidate.broker_pid, &ticks) == KPB_OK) printf("%llu", (unsigned long long)ticks);
+            else fputs("null", stdout);
+            fputs(",\"child_start_ticks\":", stdout);
+            if (kpb_read_start_ticks(observation.candidate.child_pid, &ticks) == KPB_OK) printf("%llu", (unsigned long long)ticks);
+            else fputs("null", stdout);
+        }
+        putchar('}');
+    } else fputs("null", stdout);
+    fputs("}\n", stdout);
+    return result == KPB_OK ? 0 : (!ending || (observation.may_have_sent && !observation.receiver_refused) ? 1 : 3);
 }
 
 int
@@ -990,6 +1112,9 @@ main(int argc, char **argv) {
             }
             return tui_result == KPB_TUI_QUIT ? 0 : 1;
         }
+    }
+    if (strcmp(command, "resolve") == 0 || strcmp(command, "end") == 0) {
+        return selector_command(command, runtime_dir, argc, argv, index);
     }
     if (strcmp(command, "kill") == 0) {
         kpb_result result;

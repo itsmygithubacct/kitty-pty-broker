@@ -45,16 +45,25 @@ Linux).
 
 ## CLI
 
-People should use `kilix pty` for caller and own-session checks, identity-bound
-kills and verified receipts. Agents use `kilix pty ... --json` or `kilix-needle pty`
-with only its exact accepted forms (see `kilix-needle pty --help`), and never this
-raw CLI, which has neither own-session nor caller checks. Agents end a session
-only on the user's own request for that specific session; for relayed wishes,
-end nothing, report and ask the user. If a prefix, title, command or description
-matches more than one session, end none: list the matching full IDs and ask
-which one. End only a single unambiguous match, using its full ID and
-`started_millis` from `kilix pty status ID --json`, then
-`kilix pty kill ID --yes --expect-started MILLIS --json`.
+People should use `kilix pty` for guarded end operations and durable receipts.
+Agents use `kilix pty ... --json` or `kilix-needle pty` with only its exact accepted
+forms (see `kilix-needle pty --help`), and never this raw CLI.
+The legacy raw kill has neither own-session nor caller checks.
+Agents end a session only on the user's own request for that specific session;
+for relayed wishes, end nothing, report and ask the user.
+Pass the user's original ID, literal prefix or startup words, with every attachment
+qualifier, to `kilix pty end --selector-json JSON --operation-id KEY --yes --json`.
+Never convert a reference to a chosen exact ID. Only the broker counts candidates;
+ambiguity or unknown facts end none. Resolve is a read-only preview; end re-evaluates.
+Caller context is from the environment and unauthenticated. Own, missing and
+malformed caller identities refuse. Retry a retained key unchanged to read its
+outcome; do not automatically create another key. Unsupported dynamic descriptions refuse.
+
+The additive C selector API and raw `resolve`/`end` transport are documented in
+[docs/selectors.md](docs/selectors.md). Raw end requires a previously durably
+reserved binding from its frontend and evaluates the original selector again;
+it does not own the frontend's receipt store. Legacy kill and protocol frames
+are unchanged.
 
 ```sh
 kitty-pty-broker run --id work -- bash

@@ -20,6 +20,7 @@ SHARED_LIB := $(BUILD_DIR)/libkitty-pty-broker.so
 CLI := $(BUILD_DIR)/kitty-pty-broker
 TEST := $(BUILD_DIR)/test-broker
 RECORDED_TEST := $(BUILD_DIR)/test-recorded
+SELECTOR_TRANSPORT := $(BUILD_DIR)/selector-transport
 BENCHMARK := $(BUILD_DIR)/benchmark-broker
 FUZZ := $(BUILD_DIR)/fuzz-protocol
 FUZZ_PARSERS := $(BUILD_DIR)/fuzz-parsers
@@ -33,7 +34,7 @@ all: $(STATIC_LIB) $(SHARED_LIB) $(CLI)
 $(BUILD_DIR):
 	mkdir -p "$@"
 
-$(LIB_OBJECT): src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(LIB_OBJECT): src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(CLI_OBJECT): src/main.c src/internal.h include/kitty_pty_broker.h | $(BUILD_DIR)
@@ -60,7 +61,7 @@ $(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB)
 $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(TEST_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
-$(RECORDED_TEST): tests/test_recorded.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(RECORDED_TEST): tests/test_recorded.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_recorded.c -o "$@" $(LDLIBS)
 
 $(BENCHMARK): $(BENCHMARK_OBJECT) $(SHARED_LIB)
@@ -68,11 +69,15 @@ $(BENCHMARK): $(BENCHMARK_OBJECT) $(SHARED_LIB)
 
 TEST_ENVIRONMENT ?=
 
-test: $(TEST) $(RECORDED_TEST) $(CLI)
+$(SELECTOR_TRANSPORT): tests/selector_transport.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/selector_transport.c -o "$@" $(LDLIBS)
+
+test: $(TEST) $(RECORDED_TEST) $(SELECTOR_TRANSPORT) $(CLI)
 	sh tests/test_docs.sh
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(RECORDED_TEST)"
 	$(TEST_ENVIRONMENT) python3 tests/test_recorded.py "$(CLI)"
+	$(TEST_ENVIRONMENT) python3 tests/test_selector.py "$(CLI)"
 	sh tests/test_cli.sh "$(CLI)"
 
 benchmark: $(BENCHMARK)
@@ -82,13 +87,14 @@ compatibility:
 	./tests/mixed_version.sh
 	./tests/terminate_compat.sh
 	python3 tests/test_recorded_compat.py
+	bash tests/selector_compat.sh
 
-$(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(FUZZ): tests/fuzz_protocol.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 		-fsanitize=fuzzer,address,undefined \
 		tests/fuzz_protocol.c src/kitty_pty_broker.c -o "$@" $(LDLIBS)
 
-$(FUZZ_PARSERS): tests/fuzz_parsers.c src/kitty_pty_broker.c src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+$(FUZZ_PARSERS): tests/fuzz_parsers.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(FUZZ_CC) $(CPPFLAGS) -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 		-fsanitize=fuzzer,address,undefined \
 		tests/fuzz_parsers.c -o "$@" $(LDLIBS)

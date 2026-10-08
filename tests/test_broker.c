@@ -4120,7 +4120,8 @@ test_terminate_payloads_on_the_wire(void) {
             } else if (attempt == 1) {
                 raw_send_frame(fd, KPB_FRAME_TERMINATE, sixteen, 4);   /* wrong size */
             } else if (attempt == 2) {
-                raw_send_frame(fd, KPB_FRAME_TERMINATE, sixteen, 16);  /* wrong size */
+                sixteen[15] = 1; /* new conditional size, invalid reserved word */
+                raw_send_frame(fd, KPB_FRAME_TERMINATE, sixteen, 16);
             } else {
                 raw_send_frame(fd, KPB_FRAME_TERMINATE, NULL, 0);      /* unchanged: ack */
             }

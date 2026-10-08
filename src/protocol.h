@@ -73,6 +73,7 @@ enum kpb_frame_type {
 #define KPB_ERROR_OBSERVER_FULL "observer capacity reached"
 #define KPB_ERROR_NEEDS_V2 "observe requires protocol 2"
 #define KPB_ERROR_IDENTITY_MISMATCH "identity mismatch"
+#define KPB_ERROR_ATTACHMENT_MISMATCH "attachment mismatch"
 
 typedef struct {
     uint32_t magic;
@@ -126,6 +127,14 @@ typedef struct {
 } kpb_wire_terminate;
 
 _Static_assert(sizeof(kpb_wire_terminate) == 8, "identity-bound terminate must be 8 bytes");
+/* Narrow receiver-time attachment condition. An older receiver rejects the
+ * distinct size. No unconditional fallback, nonce, lock or ABA protocol. */
+typedef struct {
+    uint64_t expected_started_millis;
+    uint32_t expected_attached;  /* big endian, exactly 0 or 1 */
+    uint32_t reserved;           /* zero */
+} kpb_wire_terminate_condition;
+_Static_assert(sizeof(kpb_wire_terminate_condition) == 16, "conditional terminate must be 16 bytes");
 _Static_assert(sizeof(kpb_frame_header) == 12, "frame header must be 12 bytes");
 _Static_assert(sizeof(kpb_wire_attach) == 32, "v2 attach must be 32 bytes");
 _Static_assert(

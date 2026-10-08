@@ -94,7 +94,12 @@ typedef enum {
      * while still CONNECTING, so the request was never sent and nothing was or
      * will be done.  Contrast KPB_ERR_TIMEOUT, which for those calls means the
      * request WAS sent and may still be acted on. */
-    KPB_ERR_NOT_SENT = 14
+    KPB_ERR_NOT_SENT = 14,
+    /* Selector operations only. Appended, never sent as wire result codes. */
+    KPB_ERR_ATTACHMENT = 15,
+    KPB_ERR_AMBIGUOUS = 16,
+    KPB_ERR_UNRESOLVED = 17,
+    KPB_ERR_CALLER = 18
 } kpb_result;
 
 typedef struct {
@@ -225,6 +230,51 @@ typedef struct {
 } kpb_list_options;
 
 typedef int (*kpb_list_entry_callback)(const kpb_list_entry *entry, void *data);
+
+/* Literal selectors. Exactly one discriminator; attachment is conjunctive.
+ * Startup words are a contiguous sequence in original argv joined with spaces,
+ * split on ASCII whitespace. No shell parsing, case folding or process inference.
+ * The census is read-only, bounded and conservatively includes nonresponders.
+ * It is a sampled observation, NOT a globally atomic inventory. */
+#define KPB_SELECTOR_MAX_WORDS 64
+#define KPB_SELECTOR_MAX_BYTES 4096
+#define KPB_SELECTOR_CENSUS_MAX 1024
+#define KPB_SELECTOR_ROWS_MAX 32
+typedef enum {
+    KPB_SELECTOR_ID = 1, KPB_SELECTOR_PREFIX = 2, KPB_SELECTOR_STARTUP_WORDS = 3
+} kpb_selector_kind;
+typedef struct {
+    kpb_selector_kind kind;
+    const char *reference;           /* ID or prefix, NULL for startup words */
+    const char *const *words;
+    size_t word_count;
+    int attached;                    /* -1 unspecified, 0 detached, 1 attached */
+} kpb_selector;
+typedef struct {
+    char session_id[KPB_SESSION_ID_MAX + 1];
+    int reachable;
+    int possible;                   /* insufficient facts, could match */
+} kpb_selector_row;
+typedef struct {
+    size_t census_count, matches, possible, row_count;
+    int complete;
+    kpb_selector_row rows[KPB_SELECTOR_ROWS_MAX];
+    kpb_status candidate;           /* only when one match and no possibilities */
+    int actionable;                /* unique AND reachable, never inferred from metadata */
+    int may_have_sent, receiver_refused;
+} kpb_selector_result;
+
+kpb_result kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector,
+                               int timeout_millis, kpb_selector_result *result);
+/* Transport for a DURABLY RESERVED selector end (Kilix owns the retry record).
+ * Re-evaluates, checks the captured binding and caller environment, revalidates,
+ * then sends exactly one identity-bound termination, attachment-bound if supplied.
+ * A resolve preview alone is not authorization. No caller override or fallback.
+ * may_have_sent and receiver_refused distinguish a negative ACK from no send.
+ * Timestamp collisions and changes outside sampled observations remain limits. */
+kpb_result kpb_end_selector(const char *runtime_dir, const kpb_selector *selector,
+                           const char *resolved_id, uint64_t expected_started_millis,
+                           int timeout_millis, kpb_selector_result *result);
 
 /* A journal kept when its session was reaped (see kpb_list_reaped). */
 typedef struct {

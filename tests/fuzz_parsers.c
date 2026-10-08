@@ -26,6 +26,14 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         text[length] = '\0';
         (void)parse_metadata(text, &info);
         parse_recorded_metadata(text, &recorded);
+        {
+            char startup[KPB_RECORDED_ARGV_MAX + 1];
+            const char *word[] = {"literal"};
+            kpb_selector selector = {KPB_SELECTOR_STARTUP_WORDS, NULL, word, 1, -1};
+            (void)selector_startup_text(text, startup);
+            (void)selector_word_match(&selector, text);
+            (void)valid_selector(&selector);
+        }
         if (strlen(recorded.argv_json) > KPB_RECORDED_ARGV_MAX ||
             strlen(recorded.cwd_json) > KPB_RECORDED_CWD_MAX ||
             (recorded.argv_json[0] && !valid_recorded_json(recorded.argv_json, true)) ||

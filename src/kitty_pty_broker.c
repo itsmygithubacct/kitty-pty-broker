@@ -652,6 +652,10 @@ kpb_result_string(kpb_result result) {
         case KPB_ERR_MISMATCH: return "session identity does not match";
         case KPB_ERR_UNSUPPORTED: return "broker cannot check identity";
         case KPB_ERR_NOT_SENT: return "timed out before the request was sent";
+        case KPB_ERR_ATTACHMENT: return "attachment condition does not match";
+        case KPB_ERR_AMBIGUOUS: return "selector is ambiguous";
+        case KPB_ERR_UNRESOLVED: return "selector cannot be resolved conservatively";
+        case KPB_ERR_CALLER: return "caller is missing, malformed or is the target";
     }
     return "unknown error";
 }
@@ -1978,6 +1982,24 @@ handle_new_connection(server_state *server) {
         (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
         close(fd);
         request_termination(server);
+        return;
+    }
+    if (type == KPB_FRAME_TERMINATE && payload_size == sizeof(kpb_wire_terminate_condition)) {
+        kpb_wire_terminate_condition request;
+        memcpy(&request, payload, sizeof request);
+        if (ntohl(request.expected_attached) > 1 || request.reserved != 0) {
+            (void)send_error(fd, KPB_ERROR_INVALID);
+        } else if (be64_to_host(request.expected_started_millis) != server->started_millis) {
+            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH);
+        } else if ((server->client_fd >= 0) != (ntohl(request.expected_attached) == 1)) {
+            (void)send_error(fd, KPB_ERROR_ATTACHMENT_MISMATCH);
+        } else {
+            (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
+            close(fd);
+            request_termination(server);
+            return;
+        }
+        close(fd);
         return;
     }
     /* The v1 branch is checked first and its body is unchanged.  That ordering
@@ -4431,6 +4453,8 @@ kpb_list_with_options(
     free(slots);
     return KPB_OK;
 }
+
+#include "selector.inc"
 
 typedef struct {
     kpb_list_callback callback;
