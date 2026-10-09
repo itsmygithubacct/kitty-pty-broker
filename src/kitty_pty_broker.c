@@ -40,8 +40,13 @@
 #define MSG_NOSIGNAL 0
 #endif
 
-#ifndef MSG_DONTWAIT
+#ifdef MSG_DONTWAIT
+/* Some libc headers expose this as an enum with a self-referential macro;
+ * testing its numeric value in #if would incorrectly choose the fallback. */
+#define KPB_HAVE_MSG_DONTWAIT 1
+#else
 #define MSG_DONTWAIT 0
+#define KPB_HAVE_MSG_DONTWAIT 0
 #endif
 
 typedef struct {
@@ -312,22 +317,41 @@ build_paths(const char *runtime_dir, const char *session_id, session_paths *path
  * the tv_nsec carry at each call site is how one of them ends up wrong. */
 static void
 deadline_in(struct timespec *out, long millis) {
-    clock_gettime(CLOCK_MONOTONIC, out);
-    out->tv_sec += millis / 1000L;
+    uintmax_t seconds, maximum = UINTMAX_MAX >>
+        ((sizeof(uintmax_t) - sizeof(time_t)) * CHAR_BIT + ((time_t)-1 < 0));
+    if (millis < 0 || clock_gettime(CLOCK_MONOTONIC, out) != 0 ||
+        out->tv_sec < 0 || out->tv_nsec < 0 || out->tv_nsec >= 1000000000L) goto expired;
+    seconds = (uintmax_t)millis / 1000U;
     out->tv_nsec += (millis % 1000L) * 1000000L;
-    if (out->tv_nsec >= 1000000000L) {
-        out->tv_nsec -= 1000000000L;
-        out->tv_sec += 1;
-    }
+    if (out->tv_nsec >= 1000000000L) { out->tv_nsec -= 1000000000L; seconds++; }
+    if (seconds > maximum - (uintmax_t)out->tv_sec) goto expired;
+    out->tv_sec += (time_t)seconds;
+    return;
+expired:
+    /* A failed clock or an unrepresentable deadline cannot grant a new budget. */
+    out->tv_sec = 0;
+    out->tv_nsec = 0;
 }
 
 /* Milliseconds left before `deadline`, <= 0 once it has passed. */
 static long
 millis_until(const struct timespec *deadline) {
     struct timespec moment;
-    clock_gettime(CLOCK_MONOTONIC, &moment);
-    return (long)(deadline->tv_sec - moment.tv_sec) * 1000L +
-           (deadline->tv_nsec - moment.tv_nsec) / 1000000L;
+    uintmax_t seconds, millis;
+    long nanos;
+    if (clock_gettime(CLOCK_MONOTONIC, &moment) != 0 ||
+        moment.tv_sec < 0 || moment.tv_nsec < 0 || moment.tv_nsec >= 1000000000L ||
+        deadline->tv_sec < moment.tv_sec || deadline->tv_nsec < 0 ||
+        deadline->tv_nsec >= 1000000000L ||
+        (deadline->tv_sec == moment.tv_sec && deadline->tv_nsec <= moment.tv_nsec)) return 0;
+    seconds = (uintmax_t)deadline->tv_sec - (uintmax_t)moment.tv_sec;
+    nanos = deadline->tv_nsec - moment.tv_nsec;
+    if (nanos < 0) { seconds--; nanos += 1000000000L; }
+    /* poll takes an int. Round a positive fraction up, then recheck the exact
+     * clock after readiness; never overflow into poll's unbounded -1. */
+    if (seconds > (uintmax_t)INT_MAX / 1000U) return INT_MAX;
+    millis = seconds * 1000U + (uintmax_t)(nanos + 999999L) / 1000000U;
+    return millis > INT_MAX ? INT_MAX : (long)millis;
 }
 
 /* read_all_fd under a wall-clock deadline.
@@ -368,7 +392,13 @@ read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadlin
             errno = ETIMEDOUT;
             return -1;
         }
-        count = read(fd, cursor + received, size - received);
+        if (millis_until(deadline) <= 0) { errno = ETIMEDOUT; return -1; }
+#if KPB_HAVE_MSG_DONTWAIT
+        count = recv(fd, cursor + received, size - received, MSG_DONTWAIT);
+        /* Spawn's ready pipe has one reader and is not a socket. */
+        if (count < 0 && errno == ENOTSOCK)
+#endif
+            count = read(fd, cursor + received, size - received);
         if (count < 0) {
             /* EAGAIN is possible here despite the poll above: the attached
              * client's socket is non-blocking, and a wakeup can be spurious.
@@ -382,17 +412,33 @@ read_all_bounded(int fd, void *data, size_t size, const struct timespec *deadlin
         }
         received += (size_t)count;
     }
+    if (millis_until(deadline) <= 0) { errno = ETIMEDOUT; return -1; }
     return (ssize_t)received;
 }
 
+/* Per-call nonblocking I/O leaves shared open-description flags alone. On a
+ * platform without MSG_DONTWAIT, only an already nonblocking descriptor is
+ * suitable: readiness followed by a blocking send is not a deadline. */
+static ssize_t
+sendmsg_nonblocking(int fd, const struct msghdr *message) {
+#if !KPB_HAVE_MSG_DONTWAIT
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (!(flags & O_NONBLOCK)) { errno = ENOTSUP; return -1; }
+#endif
+    return sendmsg(fd, message, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
 static kpb_result
-send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
+send_frame_until(int fd, uint16_t type, const void *payload, uint32_t payload_size,
+                 const struct timespec *deadline, bool *may_have_sent) {
     kpb_frame_header header;
     struct iovec vectors[2];
     struct msghdr message;
     size_t vector = 0;
     size_t vector_count = payload_size ? 2U : 1U;
-    if (payload_size > KPB_PROTOCOL_MAX_PAYLOAD) return KPB_ERR_INVALID;
+    if (may_have_sent) *may_have_sent = false;
+    if (!deadline || payload_size > KPB_PROTOCOL_MAX_PAYLOAD || (!payload && payload_size)) return KPB_ERR_INVALID;
     header.magic = htonl(KPB_PROTOCOL_MAGIC);
     header.version = htons(KPB_PROTOCOL_VERSION);
     header.type = htons(type);
@@ -404,18 +450,34 @@ send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
     while (vector < vector_count) {
         ssize_t count;
         size_t consumed;
+        long remaining = millis_until(deadline);
+        if (remaining <= 0) { errno = ETIMEDOUT; return KPB_ERR_TIMEOUT; }
         memset(&message, 0, sizeof message);
         message.msg_iov = vectors + vector;
         message.msg_iovlen = vector_count - vector;
-        count = sendmsg(fd, &message, MSG_NOSIGNAL);
+        count = sendmsg_nonblocking(fd, &message);
         if (count < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd waiting = {.fd = fd, .events = POLLOUT, .revents = 0};
+                int ready;
+                remaining = millis_until(deadline);
+                if (remaining <= 0) { errno = ETIMEDOUT; return KPB_ERR_TIMEOUT; }
+                ready = poll(&waiting, 1, (int)remaining);
+                if (ready < 0) { if (errno == EINTR) continue; return KPB_ERR_SYSTEM; }
+                if (ready == 0) { errno = ETIMEDOUT; return KPB_ERR_TIMEOUT; }
+                if (waiting.revents & POLLNVAL) { errno = EBADF; return KPB_ERR_SYSTEM; }
+                /* Even POLLOUT can be followed by EAGAIN. Retry nonblocking,
+                 * under the same deadline, including spurious readiness. */
+                continue;
+            }
             return KPB_ERR_SYSTEM;
         }
         if (count == 0) {
             errno = EPIPE;
             return KPB_ERR_SYSTEM;
         }
+        if (may_have_sent) *may_have_sent = true;
         consumed = (size_t)count;
         while (vector < vector_count && consumed >= vectors[vector].iov_len) {
             consumed -= vectors[vector].iov_len;
@@ -427,15 +489,23 @@ send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
             vectors[vector].iov_len -= consumed;
         }
     }
+    if (millis_until(deadline) <= 0) { errno = ETIMEDOUT; return KPB_ERR_TIMEOUT; }
     return KPB_OK;
+}
+
+static kpb_result
+send_frame(int fd, uint16_t type, const void *payload, uint32_t payload_size) {
+    struct timespec deadline;
+    deadline_in(&deadline, KPB_DEFAULT_TIMEOUT_MILLIS);
+    return send_frame_until(fd, type, payload, payload_size, &deadline, NULL);
 }
 
 /* Error payloads always derive their length here.  Hand-typed lengths that
  * disagree with the literal are an over-read, and the existing four were only
  * correct by inspection. */
 static kpb_result
-send_error(int fd, const char *message) {
-    return send_frame(fd, KPB_FRAME_ERROR, message, (uint32_t)strlen(message));
+send_error(int fd, const char *message, const struct timespec *deadline) {
+    return send_frame_until(fd, KPB_FRAME_ERROR, message, (uint32_t)strlen(message), deadline, NULL);
 }
 
 static kpb_result
@@ -480,7 +550,8 @@ receive_frame_bounded(
 
 static bool peer_is_owner(int fd);
 
-/* Connect under `deadline`.  The socket is non-blocking only for the connect:
+/* Connect under `deadline`. The private socket stays nonblocking throughout
+ * the request/reply; attach restores blocking mode only before exporting it.
  * a stopped broker never accept()s, and once its backlog is full a blocking
  * connect() waits for room that never comes, which is precisely the hang the
  * deadline exists to prevent.  A non-blocking connect to a full backlog reports
@@ -495,9 +566,9 @@ connect_session_until(
     session_paths paths;
     struct sockaddr_un address;
     int fd;
-    int flags;
     kpb_result result = build_paths(runtime_dir, session_id, &paths);
     if (result != KPB_OK) return result;
+    if (millis_until(deadline) <= 0) return KPB_ERR_TIMEOUT;
     fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return KPB_ERR_SYSTEM;
     memset(&address, 0, sizeof address);
@@ -505,28 +576,47 @@ connect_session_until(
     copy_string(address.sun_path, sizeof address.sun_path, paths.socket_path);
     for (;;) {
         int saved;
+        if (millis_until(deadline) <= 0) { close(fd); return KPB_ERR_TIMEOUT; }
         if (connect(fd, (struct sockaddr *)&address, sizeof address) == 0) break;
         saved = errno;
+        if (saved == EISCONN) break;
         if (saved == EINTR) continue;
-        if (saved == EAGAIN) {
+        if (saved == EAGAIN || saved == EWOULDBLOCK) {
             long remaining = millis_until(deadline);
             if (remaining <= 0) {
                 close(fd);
                 return KPB_ERR_TIMEOUT;
             }
-            (void)poll(NULL, 0, remaining < 10 ? (int)remaining : 10);
+            if (poll(NULL, 0, remaining < 10 ? (int)remaining : 10) < 0 && errno != EINTR) {
+                saved = errno; close(fd); errno = saved; return KPB_ERR_SYSTEM;
+            }
             continue;
+        }
+        if (saved == EINPROGRESS || saved == EALREADY) {
+            struct pollfd waiting = {.fd = fd, .events = POLLOUT, .revents = 0};
+            int ready, error;
+            socklen_t length = sizeof error;
+            long remaining = millis_until(deadline);
+            if (remaining <= 0) { close(fd); return KPB_ERR_TIMEOUT; }
+            ready = poll(&waiting, 1, (int)remaining);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready == 0) { close(fd); return KPB_ERR_TIMEOUT; }
+            if (ready < 0) { saved = errno; close(fd); errno = saved; return KPB_ERR_SYSTEM; }
+            if (millis_until(deadline) <= 0) { close(fd); return KPB_ERR_TIMEOUT; }
+            if (waiting.revents & POLLNVAL) { close(fd); errno = EBADF; return KPB_ERR_SYSTEM; }
+            if (!(waiting.revents & (POLLOUT | POLLHUP | POLLERR))) continue;
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0) {
+                if (errno == EINTR) continue;
+                saved = errno;
+            } else if (length != sizeof error) {
+                saved = EIO;
+            } else if (error == 0) break;
+            else if (error == EINPROGRESS || error == EALREADY) continue;
+            else saved = error;
         }
         close(fd);
         errno = saved;
         return saved == ENOENT || saved == ECONNREFUSED ? KPB_ERR_NOT_FOUND : KPB_ERR_SYSTEM;
-    }
-    flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return KPB_ERR_SYSTEM;
     }
     /* The server validates clients; the client must validate the server too.
      * Otherwise an explicitly supplied public runtime path could feed terminal
@@ -535,6 +625,7 @@ connect_session_until(
         close(fd);
         return KPB_ERR_SECURITY;
     }
+    if (millis_until(deadline) <= 0) { close(fd); return KPB_ERR_TIMEOUT; }
     *fd_out = fd;
     return KPB_OK;
 }
@@ -1792,9 +1883,10 @@ set_nonblocking(int fd) {
 }
 
 static void
-handle_v1_attach(server_state *server, int fd, const unsigned char *payload) {
+handle_v1_attach(server_state *server, int fd, const unsigned char *payload,
+                 const struct timespec *deadline) {
     if (server->client_fd >= 0) {
-        (void)send_error(fd, KPB_ERROR_ATTACHED);
+        (void)send_error(fd, KPB_ERROR_ATTACHED, deadline);
         close(fd);
         return;
     }
@@ -1814,12 +1906,12 @@ handle_v1_attach(server_state *server, int fd, const unsigned char *payload) {
 }
 
 static void
-refuse_v2(int fd, kpb_result code) {
+refuse_v2(int fd, kpb_result code, const struct timespec *deadline) {
     kpb_wire_attach_reply reply;
     memset(&reply, 0, sizeof reply);
     reply.result = htons((uint16_t)code);
     reply.version = htons((uint16_t)KPB_PROTOCOL_VERSION_MAX);
-    (void)send_frame(fd, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply);
+    (void)send_frame_until(fd, KPB_FRAME_ATTACH_REPLY, &reply, sizeof reply, deadline, NULL);
     close(fd);
 }
 
@@ -1830,7 +1922,8 @@ handle_v2_handshake(
     server_state *server,
     int fd,
     uint16_t type,
-    const kpb_wire_attach *request
+    const kpb_wire_attach *request,
+    const struct timespec *deadline
 ) {
     kpb_wire_attach_reply reply;
     replay_plan plan;
@@ -1846,15 +1939,15 @@ handle_v2_handshake(
      * itself.  The refusal still reports the true ceiling so the peer can
      * retry correctly. */
     if (selected < 2) {
-        refuse_v2(fd, KPB_ERR_PROTOCOL);
+        refuse_v2(fd, KPB_ERR_PROTOCOL, deadline);
         return;
     }
     if (mode != (observing ? KPB_WIRE_MODE_OBSERVE : KPB_WIRE_MODE_CONTROL)) {
-        refuse_v2(fd, KPB_ERR_PROTOCOL);
+        refuse_v2(fd, KPB_ERR_PROTOCOL, deadline);
         return;
     }
     if (request_flags & ~KPB_ATTACH_FLAG_RESUME) {
-        refuse_v2(fd, KPB_ERR_PROTOCOL);
+        refuse_v2(fd, KPB_ERR_PROTOCOL, deadline);
         return;
     }
 
@@ -1871,11 +1964,11 @@ handle_v2_handshake(
 
     if (!observing) {
         if (server->client_fd >= 0) {
-            refuse_v2(fd, KPB_ERR_BUSY);
+            refuse_v2(fd, KPB_ERR_BUSY, deadline);
             return;
         }
         if (set_nonblocking(fd) != 0) {
-            refuse_v2(fd, KPB_ERR_SYSTEM);
+            refuse_v2(fd, KPB_ERR_SYSTEM, deadline);
             return;
         }
         server->client_fd = fd;
@@ -1903,11 +1996,11 @@ handle_v2_handshake(
             if (server->observers[slot].fd < 0) break;
         }
         if (slot == KPB_OBSERVER_MAX) {
-            refuse_v2(fd, KPB_ERR_BUSY);
+            refuse_v2(fd, KPB_ERR_BUSY, deadline);
             return;
         }
         if (set_nonblocking(fd) != 0) {
-            refuse_v2(fd, KPB_ERR_SYSTEM);
+            refuse_v2(fd, KPB_ERR_SYSTEM, deadline);
             return;
         }
         observer = &server->observers[slot];
@@ -1933,10 +2026,11 @@ handle_new_connection(server_state *server) {
     struct timespec deadline;
     uint32_t payload_size = 0;
     uint16_t type = 0;
-    int fd = accept4(server->listener_fd, NULL, NULL, SOCK_CLOEXEC);
+    int fd = accept4(server->listener_fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
     if (fd < 0) return;
+    deadline_in(&deadline, 500);
     if (!peer_is_owner(fd)) {
-        (void)send_error(fd, KPB_ERROR_UNAUTHORIZED);
+        (void)send_error(fd, KPB_ERROR_UNAUTHORIZED, &deadline);
         close(fd);
         return;
     }
@@ -1948,7 +2042,6 @@ handle_new_connection(server_state *server) {
      * the broker, which is what the old unbounded read allowed; it can still
      * slow it, which a non-blocking handshake driven from the loop would fix
      * and this does not. */
-    deadline_in(&deadline, 500);
     if (receive_frame_bounded(
             fd, &type, payload, sizeof payload, &payload_size, &deadline) != KPB_OK) {
         close(fd);
@@ -1957,12 +2050,12 @@ handle_new_connection(server_state *server) {
     if (type == KPB_FRAME_STATUS && payload_size == 0) {
         kpb_wire_status status;
         status_to_wire(server, &status);
-        (void)send_frame(fd, KPB_FRAME_STATUS_REPLY, &status, sizeof status);
+        (void)send_frame_until(fd, KPB_FRAME_STATUS_REPLY, &status, sizeof status, &deadline, NULL);
         close(fd);
         return;
     }
     if (type == KPB_FRAME_TERMINATE && payload_size == 0) {
-        (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
+        (void)send_frame_until(fd, KPB_FRAME_ACK, NULL, 0, &deadline, NULL);
         close(fd);
         request_termination(server);
         return;
@@ -1975,11 +2068,11 @@ handle_new_connection(server_state *server) {
         kpb_wire_terminate request;
         memcpy(&request, payload, sizeof request);
         if (be64_to_host(request.expected_started_millis) != server->started_millis) {
-            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH);
+            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH, &deadline);
             close(fd);
             return;
         }
-        (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
+        (void)send_frame_until(fd, KPB_FRAME_ACK, NULL, 0, &deadline, NULL);
         close(fd);
         request_termination(server);
         return;
@@ -1988,13 +2081,13 @@ handle_new_connection(server_state *server) {
         kpb_wire_terminate_condition request;
         memcpy(&request, payload, sizeof request);
         if (ntohl(request.expected_attached) > 1 || request.reserved != 0) {
-            (void)send_error(fd, KPB_ERROR_INVALID);
+            (void)send_error(fd, KPB_ERROR_INVALID, &deadline);
         } else if (be64_to_host(request.expected_started_millis) != server->started_millis) {
-            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH);
+            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH, &deadline);
         } else if ((server->client_fd >= 0) != (ntohl(request.expected_attached) == 1)) {
-            (void)send_error(fd, KPB_ERROR_ATTACHMENT_MISMATCH);
+            (void)send_error(fd, KPB_ERROR_ATTACHMENT_MISMATCH, &deadline);
         } else {
-            (void)send_frame(fd, KPB_FRAME_ACK, NULL, 0);
+            (void)send_frame_until(fd, KPB_FRAME_ACK, NULL, 0, &deadline, NULL);
             close(fd);
             request_termination(server);
             return;
@@ -2006,22 +2099,22 @@ handle_new_connection(server_state *server) {
      * IS the compatibility guarantee: a peer that presented an 8-byte attach
      * can never reach code that emits a frame type it does not parse. */
     if (type == KPB_FRAME_ATTACH && payload_size == sizeof(kpb_wire_winsize)) {
-        handle_v1_attach(server, fd, payload);
+        handle_v1_attach(server, fd, payload, &deadline);
         return;
     }
     if ((type == KPB_FRAME_ATTACH || type == KPB_FRAME_OBSERVE) &&
         payload_size == sizeof(kpb_wire_attach)) {
         kpb_wire_attach request;
         memcpy(&request, payload, sizeof request);
-        handle_v2_handshake(server, fd, type, &request);
+        handle_v2_handshake(server, fd, type, &request, &deadline);
         return;
     }
     if (type == KPB_FRAME_OBSERVE) {
-        (void)send_error(fd, KPB_ERROR_NEEDS_V2);
+        (void)send_error(fd, KPB_ERROR_NEEDS_V2, &deadline);
         close(fd);
         return;
     }
-    (void)send_error(fd, KPB_ERROR_INVALID);
+    (void)send_error(fd, KPB_ERROR_INVALID, &deadline);
     close(fd);
 }
 
@@ -3515,6 +3608,30 @@ kpb_spawn_timeout(const kpb_spawn_options *options, kpb_status *status, int time
     return KPB_OK;
 }
 
+/* Only for a newly owned socket, before it is exposed through a connection.
+ * Without per-call nonblocking writes it must retain nonblocking mode, so
+ * subsequent input/resize/detach can still make healthy bounded transfers.
+ * Never change an existing caller descriptor's shared open-description flags. */
+static kpb_result
+attach_export(int fd, const char *session_id, kpb_connection *connection,
+              const struct timespec *deadline) {
+    int flags;
+    if (millis_until(deadline) <= 0) { close(fd); return KPB_ERR_TIMEOUT; }
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) { int saved = errno; close(fd); errno = saved; return KPB_ERR_SYSTEM; }
+#if KPB_HAVE_MSG_DONTWAIT
+    if (fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) != 0) {
+        int saved = errno;
+        close(fd); errno = saved; return KPB_ERR_SYSTEM;
+    }
+#else
+    if (!(flags & O_NONBLOCK)) { close(fd); errno = ENOTSUP; return KPB_ERR_SYSTEM; }
+#endif
+    connection->fd = fd;
+    copy_string(connection->session_id, sizeof connection->session_id, session_id);
+    return KPB_OK;
+}
+
 kpb_result
 kpb_attach_timeout(
     const char *runtime_dir,
@@ -3540,7 +3657,7 @@ kpb_attach_timeout(
     size.columns = htons(columns);
     size.xpixel = htons(xpixel);
     size.ypixel = htons(ypixel);
-    result = send_frame(fd, KPB_FRAME_ATTACH, &size, sizeof size);
+    result = send_frame_until(fd, KPB_FRAME_ATTACH, &size, sizeof size, &deadline, NULL);
     if (result != KPB_OK) {
         close(fd);
         return result;
@@ -3595,9 +3712,7 @@ kpb_attach_timeout(
             (void)poll(NULL, 0, remaining < 5 ? (int)remaining : 5);
         }
     }
-    connection->fd = fd;
-    copy_string(connection->session_id, sizeof connection->session_id, session_id);
-    return KPB_OK;
+    return attach_export(fd, session_id, connection, &deadline);
 }
 
 kpb_result
@@ -3706,10 +3821,10 @@ kpb_attach_with_options_timeout(
     request.resume_epoch = host_to_be64(options->resume_epoch);
     request.resume_offset = host_to_be64(options->resume_offset);
 
-    outcome = send_frame(
+    outcome = send_frame_until(
         fd,
         observing ? (uint16_t)KPB_FRAME_OBSERVE : (uint16_t)KPB_FRAME_ATTACH,
-        &request, sizeof request);
+        &request, sizeof request, &deadline, NULL);
     if (outcome != KPB_OK) {
         close(fd);
         return outcome;
@@ -3749,9 +3864,7 @@ kpb_attach_with_options_timeout(
         result->journal_epoch = be64_to_host(reply.journal_epoch);
         result->journal_offset = be64_to_host(reply.journal_offset);
     }
-    connection->fd = fd;
-    copy_string(connection->session_id, sizeof connection->session_id, session_id);
-    return KPB_OK;
+    return attach_export(fd, session_id, connection, &deadline);
 }
 
 kpb_result
@@ -3770,9 +3883,13 @@ kpb_observe(
 
 kpb_result
 kpb_send_input(kpb_connection *connection, const void *data, size_t size) {
+    kpb_result result;
     if (!connection || connection->fd < 0 || (!data && size)) return KPB_ERR_INVALID;
     if (size > KPB_IO_CHUNK) return KPB_ERR_INVALID;
-    return send_frame(connection->fd, KPB_FRAME_INPUT, data, (uint32_t)size);
+    result = send_frame(connection->fd, KPB_FRAME_INPUT, data, (uint32_t)size);
+    /* A partial failed frame cannot be followed by another framed request. */
+    if (result != KPB_OK) { close(connection->fd); connection->fd = -1; }
+    return result;
 }
 
 kpb_result
@@ -3784,12 +3901,15 @@ kpb_resize(
     unsigned short ypixel
 ) {
     kpb_wire_winsize size;
+    kpb_result result;
     if (!connection || connection->fd < 0) return KPB_ERR_INVALID;
     size.rows = htons(rows);
     size.columns = htons(columns);
     size.xpixel = htons(xpixel);
     size.ypixel = htons(ypixel);
-    return send_frame(connection->fd, KPB_FRAME_RESIZE, &size, sizeof size);
+    result = send_frame(connection->fd, KPB_FRAME_RESIZE, &size, sizeof size);
+    if (result != KPB_OK) { close(connection->fd); connection->fd = -1; }
+    return result;
 }
 
 kpb_result
@@ -3900,27 +4020,25 @@ kpb_detach(kpb_connection *connection) {
     connection->fd = -1;
 }
 
-kpb_result
-kpb_query_status_timeout(
+static kpb_result
+query_status_until(
     const char *runtime_dir,
     const char *session_id,
     kpb_status *status,
-    int timeout_millis
+    const struct timespec *deadline
 ) {
     kpb_wire_status wire;
-    struct timespec deadline;
     uint16_t type;
     uint32_t payload_size;
     int fd;
     kpb_result result;
     if (!status) return KPB_ERR_INVALID;
-    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
-    result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
+    result = connect_session_until(runtime_dir, session_id, &fd, deadline);
     if (result != KPB_OK) return result;
-    result = send_frame(fd, KPB_FRAME_STATUS, NULL, 0);
+    result = send_frame_until(fd, KPB_FRAME_STATUS, NULL, 0, deadline, NULL);
     if (result == KPB_OK) {
         result = receive_frame_bounded(
-            fd, &type, &wire, sizeof wire, &payload_size, &deadline);
+            fd, &type, &wire, sizeof wire, &payload_size, deadline);
         if (result == KPB_OK &&
             (type != KPB_FRAME_STATUS_REPLY || payload_size != sizeof wire)) {
             result = KPB_ERR_PROTOCOL;
@@ -3928,6 +4046,14 @@ kpb_query_status_timeout(
     }
     close(fd);
     return result == KPB_OK ? wire_to_status(&wire, status) : result;
+}
+
+kpb_result
+kpb_query_status_timeout(const char *runtime_dir, const char *session_id,
+                         kpb_status *status, int timeout_millis) {
+    struct timespec deadline;
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
+    return query_status_until(runtime_dir, session_id, status, &deadline);
 }
 
 kpb_result
@@ -3950,6 +4076,7 @@ kpb_terminate_timeout(
     uint16_t type;
     uint32_t payload_size;
     int fd;
+    bool may_have_sent = false;
     kpb_result result;
     deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
     result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
@@ -3957,7 +4084,8 @@ kpb_terminate_timeout(
      * timeout after sending, which may yet be acted on. */
     if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
-    result = send_frame(fd, KPB_FRAME_TERMINATE, NULL, 0);
+    result = send_frame_until(fd, KPB_FRAME_TERMINATE, NULL, 0, &deadline, &may_have_sent);
+    if (result == KPB_ERR_TIMEOUT && !may_have_sent) result = KPB_ERR_NOT_SENT;
     if (result == KPB_OK) {
         result = receive_frame_bounded(
             fd, &type, payload, sizeof payload, &payload_size, &deadline);
@@ -3982,13 +4110,15 @@ kpb_terminate_expect(
     uint16_t type = 0;
     uint32_t payload_size = 0;
     int fd;
+    bool may_have_sent = false;
     kpb_result result;
     deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
     result = connect_session_until(runtime_dir, session_id, &fd, &deadline);
     if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
     request.expected_started_millis = host_to_be64(expected_started_millis);
-    result = send_frame(fd, KPB_FRAME_TERMINATE, &request, sizeof request);
+    result = send_frame_until(fd, KPB_FRAME_TERMINATE, &request, sizeof request, &deadline, &may_have_sent);
+    if (result == KPB_ERR_TIMEOUT && !may_have_sent) result = KPB_ERR_NOT_SENT;
     if (result == KPB_OK) {
         result = receive_frame_bounded(
             fd, &type, payload, sizeof payload, &payload_size, &deadline);
@@ -4120,7 +4250,7 @@ kpb_read_cwd_now(pid_t child_pid, char *output, size_t capacity) {
  * started when the deadline passes are reported as timed out. */
 #define KPB_LIST_WINDOW 128
 
-typedef enum { LIST_PENDING = 0, LIST_ACTIVE, LIST_DONE } list_state;
+typedef enum { LIST_PENDING = 0, LIST_SENDING, LIST_ACTIVE, LIST_DONE } list_state;
 
 typedef enum { REAP_NOT_STALE = 0, REAP_DONE, REAP_FAILED } reap_outcome;
 
@@ -4129,6 +4259,8 @@ typedef struct {
     list_state state;
     kpb_result error;
     int fd;
+    kpb_frame_header request;
+    size_t sent;
     size_t received;
     unsigned char *buffer;
     kpb_status *status;
@@ -4150,7 +4282,7 @@ list_finish(list_slot *slot, kpb_result error) {
 }
 
 /* Begin one status query without waiting: connect (non-blocking), check the
- * peer, send the request.  Returns -1 only when descriptors ran out and the
+ * peer, prepare the request. Returns -1 only when descriptors ran out and the
  * caller should retry once an in-flight query finishes. */
 static int
 list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
@@ -4189,18 +4321,44 @@ list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
         list_finish(slot, KPB_ERR_SECURITY);
         return 0;
     }
-    if (send_frame(fd, KPB_FRAME_STATUS, NULL, 0) != KPB_OK) {
-        list_finish(slot, KPB_ERR_SYSTEM);
-        return 0;
-    }
     slot->buffer = malloc(LIST_REPLY_SIZE);
     if (!slot->buffer) {
         list_finish(slot, KPB_ERR_SYSTEM);
         return 0;
     }
     slot->received = 0;
-    slot->state = LIST_ACTIVE;
+    slot->sent = 0;
+    slot->request.magic = htonl(KPB_PROTOCOL_MAGIC);
+    slot->request.version = htons(KPB_PROTOCOL_VERSION);
+    slot->request.type = htons(KPB_FRAME_STATUS);
+    slot->request.payload_size = 0;
+    slot->state = LIST_SENDING;
     return 0;
+}
+
+/* Never wait on one row's write: healthy rows keep progressing in the shared
+ * poll window. Retain a partial header until the next writable event. */
+static void
+list_send(list_slot *slot, const struct timespec *deadline) {
+    while (slot->sent < sizeof slot->request) {
+        struct iovec vector = {.iov_base = (unsigned char *)&slot->request + slot->sent,
+                              .iov_len = sizeof slot->request - slot->sent};
+        struct msghdr message;
+        ssize_t count;
+        if (millis_until(deadline) <= 0) { list_finish(slot, KPB_ERR_TIMEOUT); return; }
+        memset(&message, 0, sizeof message);
+        message.msg_iov = &vector; message.msg_iovlen = 1;
+        count = sendmsg_nonblocking(slot->fd, &message);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            list_finish(slot, KPB_ERR_SYSTEM); return;
+        }
+        if (count == 0) { errno = EPIPE; list_finish(slot, KPB_ERR_SYSTEM); return; }
+        slot->sent += (size_t)count;
+    }
+    if (millis_until(deadline) <= 0) { list_finish(slot, KPB_ERR_TIMEOUT); return; }
+    slot->state = LIST_ACTIVE;
 }
 
 /* Take whatever the broker has sent so far; finish the slot when it is
@@ -4217,10 +4375,11 @@ list_start(const char *runtime_dir, list_slot *slot, bool can_defer) {
  * unreachable row with a reason.  A connection that ends MID-reply is a failure
  * either way. */
 static void
-list_receive(list_slot *slot) {
+list_receive(list_slot *slot, const struct timespec *deadline) {
     for (;;) {
         ssize_t count;
         if (slot->received >= LIST_REPLY_SIZE) break;
+        if (millis_until(deadline) <= 0) { list_finish(slot, KPB_ERR_TIMEOUT); return; }
         count = recv(
             slot->fd, slot->buffer + slot->received,
             LIST_REPLY_SIZE - slot->received, MSG_DONTWAIT);
@@ -4264,6 +4423,7 @@ list_receive(list_slot *slot) {
             return;
         }
         result = wire_to_status(&wire, slot->status);
+        if (millis_until(deadline) <= 0) result = KPB_ERR_TIMEOUT;
         if (result != KPB_OK) {
             free(slot->status);
             slot->status = NULL;
@@ -4295,8 +4455,10 @@ list_query_all(
         size_t polled = 0;
         long remaining;
         int ready;
+        if (millis_until(deadline) <= 0) goto expired;
         while (next < count && in_flight < KPB_LIST_WINDOW) {
             list_slot *slot = &slots[next];
+            if (millis_until(deadline) <= 0) goto expired;
             if (list_start(runtime_dir, slot, in_flight > 0) < 0) break;
             next++;
             if (slot->state == LIST_DONE) finished++;
@@ -4305,8 +4467,9 @@ list_query_all(
         if (in_flight == 0) continue;
         remaining = millis_until(deadline);
         if (remaining <= 0) {
+expired:
             for (index = 0; index < count; index++) {
-                if (slots[index].state == LIST_ACTIVE) {
+                if (slots[index].state == LIST_ACTIVE || slots[index].state == LIST_SENDING) {
                     list_finish(&slots[index], KPB_ERR_TIMEOUT);
                 } else if (slots[index].state == LIST_PENDING) {
                     slots[index].error = KPB_ERR_TIMEOUT;
@@ -4316,10 +4479,10 @@ list_query_all(
             return;
         }
         for (index = 0; index < next; index++) {
-            if (slots[index].state != LIST_ACTIVE) continue;
+            if (slots[index].state != LIST_ACTIVE && slots[index].state != LIST_SENDING) continue;
             active[polled] = &slots[index];
             descriptors[polled].fd = slots[index].fd;
-            descriptors[polled].events = POLLIN;
+            descriptors[polled].events = slots[index].state == LIST_SENDING ? POLLOUT : POLLIN;
             descriptors[polled].revents = 0;
             polled++;
         }
@@ -4332,8 +4495,10 @@ list_query_all(
             continue;
         }
         for (index = 0; index < polled; index++) {
-            if (!(descriptors[index].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            list_receive(active[index]);
+            if (!(descriptors[index].revents & (POLLIN | POLLOUT | POLLHUP | POLLERR | POLLNVAL))) continue;
+            if (descriptors[index].revents & POLLNVAL) list_finish(active[index], KPB_ERR_SYSTEM);
+            else if (active[index]->state == LIST_SENDING) list_send(active[index], deadline);
+            else list_receive(active[index], deadline);
             if (active[index]->state == LIST_DONE) {
                 finished++;
                 in_flight--;

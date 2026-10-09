@@ -90,10 +90,9 @@ typedef enum {
      * identity-bound terminate and could not check; nothing was done. */
     KPB_ERR_MISMATCH = 12,
     KPB_ERR_UNSUPPORTED = 13,
-    /* kpb_terminate_timeout / kpb_terminate_expect only: the deadline passed
-     * while still CONNECTING, so the request was never sent and nothing was or
-     * will be done.  Contrast KPB_ERR_TIMEOUT, which for those calls means the
-     * request WAS sent and may still be acted on. */
+    /* Termination only: the deadline passed before ANY frame byte was sent,
+     * while connecting or waiting to write. Contrast KPB_ERR_TIMEOUT, which
+     * after partial or complete transmission cannot exclude later action. */
     KPB_ERR_NOT_SENT = 14,
     /* Selector operations only. Appended, never sent as wire result codes. */
     KPB_ERR_ATTACHMENT = 15,
@@ -326,6 +325,9 @@ kpb_result kpb_spawn_timeout(
     kpb_status *status,
     int timeout_millis
 );
+/* Newly attached descriptors are blocking where MSG_DONTWAIT is available.
+ * On the fallback platform they remain O_NONBLOCK for bounded writes; wait for
+ * readability before receiving, as for any nonblocking connection. */
 kpb_result kpb_attach(
     const char *runtime_dir,
     const char *session_id,
@@ -342,7 +344,7 @@ kpb_result kpb_attach_with_options(
     kpb_connection *connection,
     kpb_attach_result *result
 );
-/* The same attaches with an explicit bound on connecting and on the broker's
+/* The same attaches with one explicit bound on connecting, sending and the broker's
  * first answer.  A plain version-1 attach has no reply frame, so the answer it
  * waits for is the first frame of the replay, which a live broker sends
  * immediately; nothing is consumed.  Returns KPB_ERR_TIMEOUT when it expires.
@@ -371,6 +373,12 @@ kpb_result kpb_observe(
     kpb_connection *connection,
     kpb_attach_result *result
 );
+/* Input/resize frame writes use KPB_DEFAULT_TIMEOUT_MILLIS, including retries
+ * and backpressure. A transport failure closes the connection and sets fd=-1,
+ * since a partial frame cannot safely be followed by another. Descriptor flags
+ * are never changed by these writes. Without per-call MSG_DONTWAIT support the
+ * descriptor must already be O_NONBLOCK; a blocking descriptor refuses safely.
+ * detach makes a bounded best-effort frame send, then always closes. */
 kpb_result kpb_send_input(kpb_connection *connection, const void *data, size_t size);
 kpb_result kpb_resize(
     kpb_connection *connection,
@@ -413,9 +421,9 @@ kpb_result kpb_query_status(
 kpb_result kpb_terminate(const char *runtime_dir, const char *session_id);
 /* Bounded forms (KPB_ERR_TIMEOUT on expiry); the plain forms above use
  * KPB_DEFAULT_TIMEOUT_MILLIS.  A terminate that times out after its request
- * was sent (KPB_ERR_TIMEOUT) may still be acted on by the broker later; one
- * that times out while still connecting returns KPB_ERR_NOT_SENT instead, and
- * nothing was done. */
+ * was partially or completely sent (KPB_ERR_TIMEOUT) may still be acted on by
+ * the broker later; proven zero-byte expiry returns KPB_ERR_NOT_SENT instead.
+ * This transport result grants no fresh durable operation/key admission. */
 kpb_result kpb_query_status_timeout(
     const char *runtime_dir,
     const char *session_id,
@@ -443,8 +451,8 @@ kpb_result kpb_terminate_timeout(
  *   KPB_ERR_TIMEOUT   as for kpb_terminate_timeout: the request may still be
  *                     acted on, and if it is, it is still identity-checked.
  *
- *   KPB_ERR_NOT_SENT  the deadline passed while still connecting: nothing was
- *                     sent, so nothing was or will be done (safe to retry).
+ *   KPB_ERR_NOT_SENT  the deadline passed before any request byte was sent;
+ *                     no partial/complete transmission is reported as unsent.
  *
  * `expected_started_millis` is compared as given: 0 is not "no expectation". */
 kpb_result kpb_terminate_expect(

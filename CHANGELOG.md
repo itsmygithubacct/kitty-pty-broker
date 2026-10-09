@@ -1,5 +1,17 @@
 # Changelog
 
+## Bounded request transport successor
+
+Connect, send and response now share the caller's absolute monotonic deadline,
+including selector census/recheck and send/connect EINTR. Nonblocking partial
+header/payload writes retain progress; listing drives request writes alongside
+responses under its one shared budget. Broker replies use their handshake
+budget. Zero-byte terminate expiry remains NOT_SENT; partial/complete writes
+remain uncertain without an accepted reply. No wire/receipt/API layout changes.
+Input/resize writes are bounded and invalidate a failed connection; CLI resize
+failure exits that attachment. Existing output queues and persistent stream
+waiting are preserved. See README for per-call nonblocking/platform fallback.
+
 ## 0.4.0
 
 Additive library API; the frame-format version stays 1 and no existing wire struct changed.

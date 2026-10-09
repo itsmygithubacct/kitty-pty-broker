@@ -1,0 +1,445 @@
+#define _GNU_SOURCE
+#include "kitty_pty_broker.h"
+#include "protocol.h"
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <time.h>
+#ifdef TEST_NO_DONTWAIT
+#undef MSG_DONTWAIT
+#endif
+/* Expected capability comes from the real headers, independently of the
+ * product feature tag under mutation. A false product tag must not pass. */
+#ifdef MSG_DONTWAIT
+#define INERT_PLATFORM_HAS_DONTWAIT 1
+#else
+#define INERT_PLATFORM_HAS_DONTWAIT 0
+#endif
+@FEATURES@
+#define OLD_SOURCE @OLD@
+@TYPES@
+
+/* Literal memory only. Every native effect name below is substituted before
+ * the selected product bodies. The unchanged runner wraps/denies native
+ * imports and audits the final executable's undefined symbols as well. */
+typedef struct {
+    int open, flags, blocked, read_interrupts;
+    unsigned char output[65536], input[sizeof(kpb_frame_header)+sizeof(kpb_wire_status)+64];
+    size_t written, available, read_at;
+} memory_fd;
+static memory_fd memory_fds[256];
+static struct timespec now;
+static int next_fd, closes, writes, connects, polls, flag_changes, blocking_attempts;
+static int connect_errno, connect_retries, connect_step, connect_pending_error;
+static int send_errno, send_retries, send_step, send_after, partial, partial_calls;
+static int poll_errno, poll_retries, poll_step, poll_nval, poll_spurious;
+static int reply_type, reply_error, lost_reply, peer_ok, clock_error, clock_calls, deadline_origins;
+static int read_step, receive_chunks, decoded, checks, failures, cases;
+static int fallback_flags, live_fds, build_error;
+static const char *case_name;
+static const struct timespec *selector_budget_seen;
+static const char *caller_id, *resolved_id;
+static uint64_t resolved_start;
+static int recheck_match;
+
+static void advance(long milliseconds) {
+    now.tv_sec += milliseconds / 1000L;
+    now.tv_nsec += milliseconds % 1000L * 1000000L;
+    if (now.tv_nsec >= 1000000000L) { now.tv_sec++; now.tv_nsec -= 1000000000L; }
+}
+static uint16_t memory_htons(uint16_t n) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap16(n);
+#else
+    return n;
+#endif
+}
+static uint32_t memory_htonl(uint32_t n) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap32(n);
+#else
+    return n;
+#endif
+}
+static int memory_memcmp(const void *a, const void *b, size_t n) {
+    const unsigned char *x=a, *y=b;
+    for (size_t i=0;i<n;i++) if (x[i]!=y[i]) return x[i]<y[i] ? -1 : 1;
+    return 0;
+}
+static void reset(const char *name) {
+    case_name=name; cases++;
+    memset(memory_fds,0,sizeof memory_fds); memset(&now,0,sizeof now);
+    next_fd=32; closes=writes=connects=polls=flag_changes=blocking_attempts=0;
+    connect_errno=connect_retries=connect_step=connect_pending_error=0;
+    send_errno=send_retries=send_step=send_after=partial=partial_calls=0;
+    poll_errno=poll_retries=poll_step=poll_nval=poll_spurious=0;
+    reply_type=KPB_FRAME_ACK; reply_error=lost_reply=0; peer_ok=1; clock_error=clock_calls=deadline_origins=0;
+    read_step=receive_chunks=decoded=0; fallback_flags=O_NONBLOCK; live_fds=build_error=0;
+    selector_budget_seen=NULL;
+    caller_id="caller";resolved_id="target";resolved_start=123;recheck_match=1;
+}
+static void check(int ok, const char *claim) {
+    checks++; if (!ok) failures++;
+    printf("{\"case\":\"%s\",\"claim\":\"%s\",\"passed\":%s}\n",case_name,claim,ok ? "true":"false");
+}
+#define CHECK(c) check((c),#c)
+static int memory_close(int fd) {
+    if (fd>=0 && fd<256 && memory_fds[fd].open) { memory_fds[fd].open=0; live_fds--; }
+    closes++; return 0;
+}
+static int memory_clock(clockid_t id,struct timespec *out) {
+    (void)id; clock_calls++; if (clock_error) { errno=EIO; return -1; }
+    *out=now; return 0;
+}
+static void set_reply(int fd) {
+    kpb_frame_header h;
+    if (lost_reply) { memory_fds[fd].available=0; return; }
+    unsigned char *p=memory_fds[fd].input+sizeof h;
+    uint32_t size=0;
+    if (reply_type==KPB_FRAME_STATUS_REPLY) {
+        kpb_wire_status s; memset(&s,0,sizeof s); memcpy(p,&s,sizeof s); size=sizeof s;
+    } else if (reply_type==KPB_FRAME_ATTACH_REPLY) {
+        kpb_wire_attach_reply a; memset(&a,0,sizeof a); a.version=memory_htons(2);
+        memcpy(p,&a,sizeof a); size=sizeof a;
+    } else if (reply_type==KPB_FRAME_ERROR) {
+        const char *s=reply_error==1 ? KPB_ERROR_IDENTITY_MISMATCH : reply_error==2 ? KPB_ERROR_ATTACHMENT_MISMATCH : reply_error==4 ? "identity mismatch extra" : KPB_ERROR_INVALID;
+        size=(uint32_t)strlen(s); memcpy(p,s,size);
+    }
+    h.magic=memory_htonl(KPB_PROTOCOL_MAGIC); h.version=memory_htons(KPB_PROTOCOL_VERSION);
+    h.type=memory_htons((uint16_t)reply_type); h.payload_size=memory_htonl(size);
+    memcpy(memory_fds[fd].input,&h,sizeof h); memory_fds[fd].available=sizeof h+size;
+}
+static int memory_socket(int domain,int type,int protocol) {
+    (void)domain;(void)protocol;
+    if (next_fd>=255) { errno=EMFILE;return -1; }
+    int fd=next_fd++; memory_fds[fd].open=1; live_fds++;
+    memory_fds[fd].flags=type & SOCK_NONBLOCK ? O_NONBLOCK : 0;
+    set_reply(fd); return fd;
+}
+static int memory_connect(int fd,const struct sockaddr *a,socklen_t n) {
+    (void)fd;(void)a;(void)n; connects++; advance(connect_step);
+    if (connect_retries) { connect_retries--; errno=connect_errno;return -1; }
+    return 0;
+}
+static int memory_getsockopt(int fd,int level,int opt,void *out,socklen_t *n) {
+    (void)fd;(void)level;(void)opt;(void)n; *(int *)out=connect_pending_error; return 0;
+}
+static int memory_fcntl(int fd,int operation,...) {
+    if (operation==F_GETFL) return memory_fds[fd].flags;
+    va_list ap; va_start(ap,operation); int f=va_arg(ap,int); va_end(ap);
+    memory_fds[fd].flags=f; flag_changes++; return 0;
+}
+static ssize_t memory_sendmsg(int fd,const struct msghdr *msg,int flags) {
+    memory_fd *f=&memory_fds[fd]; writes++; advance(send_step);
+    if (!(flags & MSG_NOSIGNAL) || (!(flags & MSG_DONTWAIT) && !(f->flags & O_NONBLOCK))) blocking_attempts++;
+    if (send_retries && writes>send_after) { send_retries--; errno=send_errno; return -1; }
+    if (f->blocked) { errno=EAGAIN; return -1; }
+    size_t total=0; for(size_t i=0;i<msg->msg_iovlen;i++) total+=msg->msg_iov[i].iov_len;
+    size_t wanted=total;
+    if (partial_calls) { partial_calls--; wanted=(size_t)partial; if(wanted>total)wanted=total; }
+    if (wanted>sizeof f->output-f->written) { errno=EIO;return -1; }
+    size_t left=wanted;
+    for(size_t i=0;i<msg->msg_iovlen && left;i++) {
+        size_t n=msg->msg_iov[i].iov_len<left ? msg->msg_iov[i].iov_len : left;
+        memcpy(f->output+f->written,msg->msg_iov[i].iov_base,n); f->written+=n;left-=n;
+    }
+    return (ssize_t)wanted;
+}
+static int memory_poll(struct pollfd *fds,nfds_t count,int timeout) {
+    polls++;
+    if (timeout<0) { errno=EINVAL;return -1; }
+    if (poll_retries) { poll_retries--; advance(poll_step); errno=poll_errno;return -1; }
+    int ready=0;
+    for(nfds_t i=0;i<count;i++) {
+        memory_fd *f=&memory_fds[fds[i].fd]; fds[i].revents=0;
+        if (poll_nval) fds[i].revents=POLLNVAL;
+        else if (poll_spurious) fds[i].revents=POLLOUT;
+        else {
+            if ((fds[i].events & POLLOUT) && !f->blocked) fds[i].revents|=POLLOUT;
+            if ((fds[i].events & POLLIN) && f->available>f->read_at) fds[i].revents|=POLLIN;
+        }
+        if (fds[i].revents) ready++;
+    }
+    advance(ready ? poll_step : timeout); return ready;
+}
+static ssize_t memory_recv(int fd,void *out,size_t cap,int flags) {
+    memory_fd *f=&memory_fds[fd]; advance(read_step);
+    if (f->read_interrupts) { f->read_interrupts--; errno=EINTR;return -1; }
+    if (f->read_at==f->available) { errno=EAGAIN;return -1; }
+    size_t n=f->available-f->read_at; if(n>cap)n=cap;
+    if (receive_chunks && n>(size_t)receive_chunks)n=(size_t)receive_chunks;
+    memcpy(out,f->input+f->read_at,n); if(!(flags & MSG_PEEK))f->read_at+=n; return (ssize_t)n;
+}
+static ssize_t memory_read(int fd,void *out,size_t n) { return memory_recv(fd,out,n,0); }
+static ssize_t read_all_fd(int fd,void *out,size_t n) { return memory_read(fd,out,n); }
+static kpb_result build_paths(const char *r,const char *id,session_paths *out) {
+    (void)r;(void)id;memset(out,0,sizeof *out);strcpy(out->socket_path,"/memory/control.sock");
+    return (kpb_result)build_error;
+}
+static bool peer_is_owner(int fd) { (void)fd;return peer_ok!=0; }
+static kpb_result wire_to_status(const kpb_wire_status *w,kpb_status *s) {
+    (void)w;decoded++;memset(s,0,sizeof *s);strcpy(s->session_id,"target");s->started_millis=123;return KPB_OK;
+}
+static const char *memory_getenv(const char *name) { (void)name;return caller_id; }
+static bool valid_selector(const kpb_selector *s) { return s!=NULL; }
+static int selector_open_directory(int parent,const char *path) { (void)parent;(void)path;return 200; }
+static int selector_match(const kpb_selector *s,const char *id,const kpb_status *live,int d) {
+    (void)s;(void)id;(void)live;(void)d;return recheck_match;
+}
+#define htons memory_htons
+#define ntohs memory_htons
+#define htonl memory_htonl
+#define ntohl memory_htonl
+#define memcmp memory_memcmp
+#define close memory_close
+#define clock_gettime memory_clock
+#define socket memory_socket
+#define connect memory_connect
+#define getsockopt memory_getsockopt
+#define sendmsg memory_sendmsg
+#define recv memory_recv
+#define read memory_read
+#define poll memory_poll
+#define fcntl memory_fcntl
+#define getenv memory_getenv
+
+@BASE@
+@SEND@
+@READ@
+@CONNECT@
+@STATUS@
+@APIS@
+@LIST@
+
+static kpb_result memory_resolve(kpb_selector_result *out) {
+    memset(out,0,sizeof *out);out->complete=out->actionable=1;out->matches=1;
+    strcpy(out->candidate.session_id,resolved_id);out->candidate.started_millis=resolved_start;
+    advance(3);return KPB_OK;
+}
+#if OLD_SOURCE
+kpb_result kpb_resolve_selector(const char *r,const kpb_selector *s,int t,kpb_selector_result *out) {
+    (void)r;(void)s;(void)t;return memory_resolve(out);
+}
+#else
+static kpb_result selector_resolve_until(const char *r,const kpb_selector *s,const struct timespec *d,kpb_selector_result *out) {
+    (void)r;(void)s;selector_budget_seen=d;return memory_resolve(out);
+}
+#endif
+@SELECTOR@
+
+static int owned(void) { return memory_socket(AF_UNIX,SOCK_STREAM|SOCK_NONBLOCK,0); }
+static int exported_flags(int fd) {
+#if INERT_PLATFORM_HAS_DONTWAIT
+    return !(memory_fds[fd].flags & O_NONBLOCK);
+#else
+    return (memory_fds[fd].flags & O_NONBLOCK)!=0;
+#endif
+}
+static void balanced(void) { CHECK(live_fds==0); }
+static void send_tests(void) {
+    unsigned char payload[256]; for(size_t i=0;i<sizeof payload;i++)payload[i]=(unsigned char)i;
+    for(int step=1;step<=17;step++) {
+        reset("partial-binary-positive");int fd=owned();bool sent=false;struct timespec d;
+        deadline_in(&d,100);partial=step;partial_calls=1000;
+        kpb_result r=send_frame_until(fd,KPB_FRAME_INPUT,payload,sizeof payload,&d,&sent);
+        kpb_frame_header h;memcpy(&h,memory_fds[fd].output,sizeof h);
+        CHECK(r==KPB_OK && sent);CHECK(memory_fds[fd].written==sizeof h+sizeof payload);
+        CHECK(ntohl(h.magic)==KPB_PROTOCOL_MAGIC && ntohs(h.type)==KPB_FRAME_INPUT && ntohl(h.payload_size)==sizeof payload);
+        CHECK(memcmp(memory_fds[fd].output+sizeof h,payload,sizeof payload)==0);
+        CHECK(blocking_attempts==0 && flag_changes==0);memory_close(fd);balanced();
+    }
+    reset("shared-description-positive");int fd=owned();memory_fds[fd].flags=0;
+    bool sent=false;struct timespec d;deadline_in(&d,5);
+    kpb_result r=send_frame_until(fd,KPB_FRAME_INPUT,payload,7,&d,&sent);
+#if INERT_PLATFORM_HAS_DONTWAIT
+    CHECK(r==KPB_OK && sent && blocking_attempts==0);
+#else
+    CHECK(r==KPB_ERR_SYSTEM && !sent && memory_fds[fd].written==0);
+#endif
+    CHECK(memory_fds[fd].flags==0 && flag_changes==0);memory_close(fd);balanced();
+    reset("expired-proven-zero");fd=owned();d=now;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && !sent && writes==0);memory_close(fd);balanced();
+    reset("send-eintr-deadline");fd=owned();deadline_in(&d,5);send_errno=EINTR;send_retries=8;send_step=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && !sent && writes<=5);memory_close(fd);balanced();
+    reset("ready-then-again");fd=owned();deadline_in(&d,5);send_errno=EAGAIN;send_retries=8;poll_step=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && !sent && memory_fds[fd].written==0);memory_close(fd);balanced();
+    reset("eagain-healthy-positive");fd=owned();deadline_in(&d,10);send_errno=EAGAIN;send_retries=2;poll_step=1;
+    r=send_frame_until(fd,KPB_FRAME_INPUT,payload,7,&d,&sent);
+    CHECK(r==KPB_OK && sent && memory_fds[fd].written==sizeof(kpb_frame_header)+7);memory_close(fd);balanced();
+    reset("poll-eintr-deadline");fd=owned();deadline_in(&d,5);send_errno=EAGAIN;send_retries=8;poll_errno=EINTR;poll_retries=8;poll_step=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && !sent);memory_close(fd);balanced();
+    reset("partial-transmission-timeout");fd=owned();deadline_in(&d,5);partial=1;partial_calls=8;send_step=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && sent && memory_fds[fd].written>0 && memory_fds[fd].written<sizeof(kpb_frame_header));memory_close(fd);balanced();
+    reset("zero-send-error");fd=owned();deadline_in(&d,5);partial=0;partial_calls=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_SYSTEM && !sent && errno==EPIPE);memory_close(fd);balanced();
+    reset("negative-send-error");fd=owned();deadline_in(&d,5);send_errno=EPIPE;send_retries=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_SYSTEM && !sent);memory_close(fd);balanced();
+    reset("post-ready-expiry");fd=owned();deadline_in(&d,5);send_errno=EAGAIN;send_retries=1;poll_step=6;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && !sent && writes==1);memory_close(fd);balanced();
+    reset("poll-nval");fd=owned();deadline_in(&d,5);send_errno=EAGAIN;send_retries=1;poll_nval=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_SYSTEM && !sent && memory_fds[fd].written==0);memory_close(fd);balanced();
+    reset("partial-eagain-unicode-positive");fd=owned();deadline_in(&d,10);
+    const unsigned char utf8[]={0xf0,0x9f,0x92,0xa1,0,0xc3,0xa9,0xff};
+    partial=3;partial_calls=1;send_after=1;send_errno=EAGAIN;send_retries=2;poll_step=1;
+    r=send_frame_until(fd,KPB_FRAME_INPUT,utf8,sizeof utf8,&d,&sent);
+    CHECK(r==KPB_OK && sent && memory_fds[fd].written==sizeof(kpb_frame_header)+sizeof utf8);
+    CHECK(memcmp(memory_fds[fd].output+sizeof(kpb_frame_header),utf8,sizeof utf8)==0);memory_close(fd);balanced();
+    reset("partial-system-error-knowledge");fd=owned();deadline_in(&d,10);
+    partial=3;partial_calls=1;send_after=1;send_errno=EPIPE;send_retries=1;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_SYSTEM && sent && memory_fds[fd].written==3);memory_close(fd);balanced();
+    reset("complete-send-late");fd=owned();deadline_in(&d,5);send_step=6;
+    r=send_frame_until(fd,KPB_FRAME_TERMINATE,NULL,0,&d,&sent);
+    CHECK(r==KPB_ERR_TIMEOUT && sent && memory_fds[fd].written==sizeof(kpb_frame_header));memory_close(fd);balanced();
+}
+static void clock_tests(void) {
+    reset("precision-borrow");now.tv_sec=10;now.tv_nsec=999900000;
+    struct timespec d={11,100000};CHECK(millis_until(&d)==1);
+    d=now;CHECK(millis_until(&d)==0);d.tv_nsec--;CHECK(millis_until(&d)==0);
+    reset("overflow-poll-clamp");d.tv_sec=(time_t)INT_MAX;d.tv_nsec=0;CHECK(millis_until(&d)==INT_MAX);
+    reset("overflow-deadline");now.tv_sec=(time_t)(UINTMAX_MAX >> ((sizeof(uintmax_t)-sizeof(time_t))*CHAR_BIT+((time_t)-1<0)));
+    deadline_in(&d,1000);CHECK(d.tv_sec==0 && d.tv_nsec==0);
+    reset("clock-error");clock_error=1;deadline_in(&d,10);CHECK(d.tv_sec==0 && d.tv_nsec==0);CHECK(millis_until(&d)==0);
+}
+static void api_tests(void) {
+    struct timespec d;int fd;bool sent;kpb_result r;kpb_status s;kpb_selector_result out;
+    for(int e=0;e<2;e++) {
+        reset("connect-retry-deadline");deadline_in(&d,5);connect_errno=e?EAGAIN:EINTR;connect_retries=8;connect_step=1;
+        r=connect_session_until("/memory","target",&fd,&d);CHECK(r==KPB_ERR_TIMEOUT);CHECK(connects<=5);balanced();
+    }
+    reset("connect-pending-positive");deadline_in(&d,5);connect_errno=EINPROGRESS;connect_retries=1;
+    r=connect_session_until("/memory","target",&fd,&d);CHECK(r==KPB_OK);if(r==KPB_OK)memory_close(fd);balanced();
+    reset("connect-flags-private");deadline_in(&d,5);r=connect_session_until("/memory","target",&fd,&d);
+    CHECK(r==KPB_OK && (memory_fds[fd].flags & O_NONBLOCK) && flag_changes==0);memory_close(fd);balanced();
+    reset("status-shared-budget");reply_type=KPB_FRAME_STATUS_REPLY;connect_step=2;send_step=2;read_step=2;
+    r=kpb_query_status_timeout("/memory","target",&s,5);CHECK(r==KPB_ERR_TIMEOUT);balanced();
+    reset("status-healthy-positive");reply_type=KPB_FRAME_STATUS_REPLY;
+    r=kpb_query_status_timeout("/memory","target",&s,5);CHECK(r==KPB_OK && decoded==1 && writes>0);balanced();
+    reset("receive-eintr-budget");reply_type=KPB_FRAME_STATUS_REPLY;read_step=1;
+    fd=owned();memory_fds[fd].read_interrupts=8;deadline_in(&d,5);uint16_t type;uint32_t size;unsigned char b[32];
+    r=receive_frame_bounded(fd,&type,b,sizeof b,&size,&d);CHECK(r==KPB_ERR_TIMEOUT);memory_close(fd);balanced();
+    for(int e=0;e<3;e++) {
+        reset("termination-zero-deadline");send_errno=EAGAIN;send_retries=8;poll_step=1;
+        if(e==0)r=kpb_terminate_timeout("/memory","target",5);
+        else if(e==1)r=kpb_terminate_expect("/memory","target",123,5);
+        else { memset(&out,0,sizeof out);deadline_in(&d,5);r=selector_terminate("/memory","target",123,0,&d,&out);CHECK(out.may_have_sent==0); }
+        CHECK(r==KPB_ERR_NOT_SENT);balanced();
+        reset("termination-partial-uncertain");send_step=1;partial=1;partial_calls=8;
+        if(e==0)r=kpb_terminate_timeout("/memory","target",5);
+        else if(e==1)r=kpb_terminate_expect("/memory","target",123,5);
+        else { memset(&out,0,sizeof out);deadline_in(&d,5);r=selector_terminate("/memory","target",123,0,&d,&out);CHECK(out.may_have_sent==1 && !out.receiver_refused); }
+        CHECK(r==KPB_ERR_TIMEOUT);balanced();
+        reset("termination-ack-positive");
+        if(e==0)r=kpb_terminate_timeout("/memory","target",5);
+        else if(e==1)r=kpb_terminate_expect("/memory","target",123,5);
+        else { memset(&out,0,sizeof out);deadline_in(&d,5);r=selector_terminate("/memory","target",123,0,&d,&out);CHECK(out.may_have_sent==1 && !out.receiver_refused); }
+        CHECK(r==KPB_OK);balanced();
+        kpb_frame_header h;memcpy(&h,memory_fds[32].output,sizeof h);
+        size_t expected=e==0?0:e==1?sizeof(kpb_wire_terminate):sizeof(kpb_wire_terminate_condition);
+        CHECK(ntohs(h.type)==KPB_FRAME_TERMINATE && ntohl(h.payload_size)==expected && memory_fds[32].written==sizeof h+expected);
+        if(e) { uint64_t started;memcpy(&started,memory_fds[32].output+sizeof h,sizeof started);CHECK(be64_to_host(started)==123); }
+        if(e==2) { kpb_wire_terminate_condition request;memcpy(&request,memory_fds[32].output+sizeof h,sizeof request);CHECK(ntohl(request.expected_attached)==0 && request.reserved==0); }
+        reset("termination-complete-lost-ack");lost_reply=1;
+        if(e==0)r=kpb_terminate_timeout("/memory","target",5);
+        else if(e==1)r=kpb_terminate_expect("/memory","target",123,5);
+        else { memset(&out,0,sizeof out);deadline_in(&d,5);r=selector_terminate("/memory","target",123,0,&d,&out);CHECK(out.may_have_sent==1 && !out.receiver_refused); }
+        CHECK(r==KPB_ERR_TIMEOUT && writes==1 && memory_fds[32].written==sizeof(kpb_frame_header)+expected);balanced();
+    }
+    for(int e=1;e<=3;e++) {
+        reset("selector-negative-ack");reply_type=KPB_FRAME_ERROR;reply_error=e;memset(&out,0,sizeof out);deadline_in(&d,5);
+        r=selector_terminate("/memory","target",123,0,&d,&out);
+        CHECK(r==(e==1?KPB_ERR_MISMATCH:e==2?KPB_ERR_ATTACHMENT:KPB_ERR_UNSUPPORTED));CHECK(out.may_have_sent==1 && out.receiver_refused==1);balanced();
+    }
+    reset("selector-unknown-negative-ack");reply_type=KPB_FRAME_ERROR;reply_error=4;memset(&out,0,sizeof out);deadline_in(&d,5);
+    r=selector_terminate("/memory","target",123,0,&d,&out);
+    CHECK(r==KPB_ERR_PROTOCOL && out.may_have_sent && !out.receiver_refused && writes==1);balanced();
+    for(int attached=-1;attached<=1;attached+=2) {
+        reset("selector-termination-wire-positive");memset(&out,0,sizeof out);deadline_in(&d,5);
+        r=selector_terminate("/memory","target",123,attached,&d,&out);
+        kpb_frame_header h;memcpy(&h,memory_fds[32].output,sizeof h);
+        CHECK(r==KPB_OK && out.may_have_sent && !out.receiver_refused && ntohl(h.payload_size)==(attached==-1?8U:16U));
+        if(attached==1) { kpb_wire_terminate_condition request;memcpy(&request,memory_fds[32].output+sizeof h,sizeof request);CHECK(be64_to_host(request.expected_started_millis)==123 && ntohl(request.expected_attached)==1 && request.reserved==0); }
+        balanced();
+    }
+    reset("selector-no-renewed-budget");reply_type=KPB_FRAME_STATUS_REPLY;connect_step=1;send_step=1;read_step=1;
+    kpb_selector selector={.kind=KPB_SELECTOR_ID,.reference="target",.attached=-1};
+    r=kpb_end_selector("/memory",&selector,"target",123,5,&out);CHECK(r==KPB_ERR_TIMEOUT && !out.may_have_sent && decoded==0);balanced();
+    for(int fault=0;fault<5;fault++) {
+        reset("end-before-mutation-guard");reply_type=KPB_FRAME_STATUS_REPLY;
+        if(fault==0)caller_id=NULL;
+        if(fault==1)caller_id="..";
+        if(fault==2)caller_id="target";
+        if(fault==3)resolved_id="replacement";
+        if(fault==4)resolved_start=124;
+        r=kpb_end_selector("/memory",&selector,"target",123,20,&out);
+        CHECK(r==(fault<3 ? KPB_ERR_CALLER : KPB_ERR_MISMATCH));CHECK(!out.may_have_sent && writes==0);balanced();
+    }
+    reset("end-unsent-recheck");reply_type=KPB_FRAME_STATUS_REPLY;recheck_match=0;
+    r=kpb_end_selector("/memory",&selector,"target",123,20,&out);
+    CHECK(r==KPB_ERR_UNRESOLVED && !out.may_have_sent && out.actionable && writes==1);balanced();
+    reset("attach-v1-positive");kpb_connection c;r=kpb_attach_timeout("/memory","target",24,80,0,0,&c,5);
+    CHECK(r==KPB_OK && c.fd>=0 && exported_flags(c.fd));kpb_detach(&c);CHECK(c.fd==-1);balanced();
+    reset("attach-v2-positive");reply_type=KPB_FRAME_ATTACH_REPLY;kpb_attach_options a={.rows=24,.columns=80,.max_version=2};kpb_attach_result ar;
+    r=kpb_attach_with_options_timeout("/memory","target",&a,&c,&ar,5);CHECK(r==KPB_OK && ar.version==2 && c.fd>=0 && exported_flags(c.fd));kpb_detach(&c);balanced();
+    reset("attach-input-resize-detach-positive");r=kpb_attach_timeout("/memory","target",24,80,0,0,&c,5);
+    CHECK(r==KPB_OK && c.fd>=0 && exported_flags(c.fd));
+    if(r==KPB_OK) {
+        int stream=c.fd, flags=memory_fds[stream].flags, changes=flag_changes;
+        size_t start=memory_fds[stream].written;
+        const unsigned char bytes[]={0xc3,0xa9,0,0xf0,0x9f,0x98,0x80,0xff};partial=1;partial_calls=100;
+        r=kpb_send_input(&c,bytes,sizeof bytes);
+        CHECK(r==KPB_OK && c.fd==stream && memory_fds[stream].written==start+sizeof(kpb_frame_header)+sizeof bytes);
+        CHECK(memcmp(memory_fds[stream].output+start+sizeof(kpb_frame_header),bytes,sizeof bytes)==0);
+        r=kpb_resize(&c,40,120,0,0);CHECK(r==KPB_OK && c.fd==stream);
+        CHECK(memory_fds[stream].flags==flags && flag_changes==changes && blocking_attempts==0);
+        kpb_detach(&c);CHECK(c.fd==-1);
+    }
+    balanced();
+    reset("input-partial-close");c.fd=owned();send_step=1000;partial=1;partial_calls=8;
+    r=kpb_send_input(&c,"hello",5);CHECK(r==KPB_ERR_TIMEOUT && c.fd==-1);if(c.fd>=0)memory_close(c.fd);balanced();
+    reset("resize-positive");c.fd=owned();r=kpb_resize(&c,24,80,0,0);CHECK(r==KPB_OK && memory_fds[c.fd].written==sizeof(kpb_frame_header)+sizeof(kpb_wire_winsize));kpb_detach(&c);balanced();
+    (void)sent;
+}
+static void list_tests(void) {
+    reset("list-two-row-progress");list_slot slots[2];memset(slots,0,sizeof slots);
+    strcpy(slots[0].id,"blocked");strcpy(slots[1].id,"healthy");reply_type=KPB_FRAME_STATUS_REPLY;
+    /* The first row's socket is known in memory before production startup. */
+    memory_fds[32].blocked=1;struct timespec d;deadline_in(&d,5);list_query_all("/memory",slots,2,&d);
+    CHECK(slots[0].state==LIST_DONE && slots[0].error==KPB_ERR_TIMEOUT);
+    CHECK(slots[1].state==LIST_DONE && slots[1].error==KPB_OK && slots[1].status!=NULL);
+    for(int i=0;i<2;i++) free(slots[i].status);
+    balanced();
+    reset("list-partial-positive");list_slot slot;memset(&slot,0,sizeof slot);strcpy(slot.id,"healthy");reply_type=KPB_FRAME_STATUS_REPLY;
+    partial=1;partial_calls=8;deadline_in(&d,10);list_query_all("/memory",&slot,1,&d);
+    CHECK(slot.error==KPB_OK && memory_fds[32].written==sizeof(kpb_frame_header));free(slot.status);balanced();
+    reset("list-send-eintr-deadline");memset(&slot,0,sizeof slot);strcpy(slot.id,"healthy");reply_type=KPB_FRAME_STATUS_REPLY;
+    send_errno=EINTR;send_retries=8;send_step=1;deadline_in(&d,5);list_query_all("/memory",&slot,1,&d);
+    CHECK(slot.error==KPB_ERR_TIMEOUT && writes<=5);free(slot.status);balanced();
+}
+int main(void) {
+    (void)memory_getsockopt;
+    send_tests();clock_tests();api_tests();list_tests();
+    printf("{\"summary\":true,\"cases\":%d,\"checks\":%d,\"failed_checks\":%d,\"real_dispatches\":0}\n",cases,checks,failures);
+    return failures ? 1 : 0;
+}

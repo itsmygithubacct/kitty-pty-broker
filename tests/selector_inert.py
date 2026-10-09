@@ -53,14 +53,14 @@ def main():
         raise FileExistsError(args.output)
     args.output.mkdir(mode=0o700, parents=True)
     files = {name: (args.source / name).read_bytes() for name in
-             ('src/kitty_pty_broker.c', 'src/selector.inc', 'include/kitty_pty_broker.h')}
+             ('src/kitty_pty_broker.c', 'src/selector.inc', 'src/protocol.h', 'include/kitty_pty_broker.h')}
     core, selector = (files[name].decode() for name in ('src/kitty_pty_broker.c', 'src/selector.inc'))
     blocks = {}
     for name in ('copy_string', 'valid_component', 'utf8_character_size', 'deadline_in', 'millis_until',
                  'deadline_from_timeout', 'list_finish', 'list_query_all'):
         blocks[name] = function(core, name)
     for name in ('valid_selector', 'selector_space', 'selector_word_match', 'selector_match',
-                 'selector_open_directory', 'kpb_resolve_selector'):
+                 'selector_open_directory', 'selector_resolve_until', 'kpb_resolve_selector'):
         blocks[name] = function(selector, name)
     original_blocks = dict(blocks)
     if args.mutant == 'separator':
@@ -70,8 +70,16 @@ def main():
     if args.mutant == 'deadline':
         assert args.baseline_source is not None
         old = (args.baseline_source / 'src/selector.inc').read_text()
-        blocks['kpb_resolve_selector'] = function(old, 'kpb_resolve_selector')
-        assert original_blocks['kpb_resolve_selector'] != blocks['kpb_resolve_selector']
+        previous = function(old, 'kpb_resolve_selector')
+        body = previous[previous.index('{') + 1:]
+        assert body.count('    struct timespec deadline;\n') == 1
+        body = body.replace('    struct timespec deadline;\n', '', 1)
+        setup = '    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);\n'
+        assert body.count(setup) == 1
+        body = body.replace(setup, '', 1).replace('&deadline', 'deadline')
+        current = blocks['selector_resolve_until']
+        blocks['selector_resolve_until'] = current[:current.index('{') + 1] + body
+        assert original_blocks['selector_resolve_until'] != blocks['selector_resolve_until']
     slots = core[core.index('typedef enum { LIST_PENDING'):core.index('#define LIST_REPLY_SIZE')]
     window = re.search(r'(?m)^#define KPB_LIST_WINDOW \d+$', core).group()
     replacements = {
@@ -79,7 +87,7 @@ def main():
                                                'deadline_in', 'millis_until', 'deadline_from_timeout')) + '\n' + window + '\n' + slots,
         'FINISH': blocks['list_finish'], 'QUERY': blocks['list_query_all'],
         'SELECTOR': '\n\n'.join(blocks[n] for n in ('valid_selector', 'selector_space', 'selector_word_match',
-                                                   'selector_match', 'selector_open_directory', 'kpb_resolve_selector'))}
+                                                   'selector_match', 'selector_open_directory', 'selector_resolve_until', 'kpb_resolve_selector'))}
     fixture = Path(__file__).with_name('selector_inert.c.in').read_text()
     for key, value in replacements.items():
         assert fixture.count('@' + key + '@') == 1
@@ -87,6 +95,7 @@ def main():
     assert 'selector_terminate(' not in fixture and 'kpb_end_selector(' not in fixture
     (args.output / 'fixture.c').write_text(fixture)
     (args.output / 'kitty_pty_broker.h').write_bytes(files['include/kitty_pty_broker.h'])
+    (args.output / 'protocol.h').write_bytes(files['src/protocol.h'])
     (args.output / 'selected-functions.json').write_text(json.dumps({
         'schema': 'selector-inert-selected-c/v1', 'mutant': args.mutant,
         'source_sha256': {k: hashlib.sha256(v).hexdigest() for k, v in files.items()},

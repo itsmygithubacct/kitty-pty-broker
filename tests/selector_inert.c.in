@@ -2,10 +2,12 @@
  * No operational broker/end/backend is linked. stdout is the only native output. */
 #define _GNU_SOURCE
 #include "kitty_pty_broker.h"
+#include "protocol.h"
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -163,7 +165,14 @@ static int list_start(const char *runtime, list_slot *slot, bool can_defer) {
     }
     return 0;
 }
-static void list_receive(list_slot *slot) {
+static void list_send(list_slot *slot, const struct timespec *deadline) {
+    (void)deadline;
+    /* list_start above substitutes a completed request; a sending slot is
+     * never produced by this census-only memory adapter. */
+    list_finish(slot, KPB_ERR_SYSTEM);
+}
+static void list_receive(list_slot *slot, const struct timespec *deadline) {
+    (void)deadline;
     int index = find_node(slot->id);
     assert(index >= 0 && nodes[index].status_kind == 3);
     now_millis = 100; /* the final reply's decoding consumes the remaining budget */

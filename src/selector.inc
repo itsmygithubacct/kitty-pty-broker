@@ -198,26 +198,24 @@ selector_match(const kpb_selector *selector, const char *id, const kpb_status *l
     return discriminator == 2 || attachment == 2 ? 2 : 1;
 }
 
-kpb_result
-kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int timeout_millis,
-                     kpb_selector_result *output) {
+static kpb_result
+selector_resolve_until(const char *runtime_dir, const kpb_selector *selector,
+                       const struct timespec *deadline, kpb_selector_result *output) {
     list_slot *slots = NULL;
     int *directories = NULL;
     int runtime = -1, sessions = -1;
     DIR *walk = NULL;
     size_t count = 0, index;
-    struct timespec deadline;
     kpb_result result = KPB_OK;
     if (!output) return KPB_ERR_INVALID;
     memset(output, 0, sizeof *output);
     if (!valid_selector(selector) || !runtime_dir || runtime_dir[0] != '/') return KPB_ERR_INVALID;
-    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);
     runtime = selector_open_directory(AT_FDCWD, runtime_dir);
     if (runtime < 0) return KPB_ERR_SECURITY;
     sessions = selector_open_directory(runtime, "sessions");
     if (sessions < 0) {
         result = errno == ENOENT ? KPB_OK : KPB_ERR_SECURITY;
-        if (result == KPB_OK && millis_until(&deadline) <= 0) result = KPB_ERR_TIMEOUT;
+        if (result == KPB_OK && millis_until(deadline) <= 0) result = KPB_ERR_TIMEOUT;
         output->complete = result == KPB_OK;
         close(runtime); return result;
     }
@@ -234,7 +232,7 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         if (!valid_component(entry->d_name)) { result = KPB_ERR_SECURITY; break; }
         if (count == KPB_SELECTOR_CENSUS_MAX) { result = KPB_ERR_BUFFER; break; }
-        if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; break; }
+        if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; break; }
         copy_string(slots[count].id, sizeof slots[count].id, entry->d_name);
         slots[count].fd = -1;
         directories[count] = selector_open_directory(sessions, entry->d_name);
@@ -243,19 +241,19 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
     closedir(walk); walk = NULL;
     output->census_count = count;
     if (result != KPB_OK) goto out;
-    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
-    list_query_all(runtime_dir, slots, count, &deadline);
+    if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+    list_query_all(runtime_dir, slots, count, deadline);
     /* A prompt per-row timeout can prove a nonmatch; exhaustion of the shared
      * census budget cannot certify a complete observation. This also covers
      * decoding the final status after the query engine's last clock check. */
-    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+    if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
     for (index = 0; index < count; index++) {
         list_slot *slot = &slots[index];
         struct stat pinned, current;
         kpb_status *live = slot->error == KPB_OK ? slot->status : NULL;
         bool stable;
         int match;
-        if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+        if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
         stable = directories[index] >= 0 && fstat(directories[index], &pinned) == 0 &&
             fstatat(sessions, slot->id, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
             pinned.st_dev == current.st_dev && pinned.st_ino == current.st_ino &&
@@ -268,7 +266,7 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
         match = selector_match(selector, slot->id, live, directories[index]);
         /* Metadata and pinned-directory checks consume the same budget, even
          * for a row whose predicates ultimately prove it cannot match. */
-        if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+        if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
         if (!match) continue;
         if (match == 2) output->possible++;
         else {
@@ -281,7 +279,7 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
             row->reachable = live != NULL; row->possible = match == 2;
         }
     }
-    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+    if (millis_until(deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
     output->complete = 1;
     output->actionable = output->matches == 1 && output->possible == 0 && output->candidate.started_millis > 0;
 out:
@@ -295,6 +293,14 @@ out:
     return result;
 }
 
+kpb_result
+kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int timeout_millis,
+                     kpb_selector_result *output) {
+    struct timespec deadline;
+    deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_LIST_TIMEOUT_MILLIS);
+    return selector_resolve_until(runtime_dir, selector, &deadline, output);
+}
+
 static kpb_result
 selector_terminate(const char *runtime_dir, const char *id, uint64_t started, int attached,
                    const struct timespec *deadline, kpb_selector_result *output) {
@@ -303,15 +309,17 @@ selector_terminate(const char *runtime_dir, const char *id, uint64_t started, in
     uint16_t type = 0;
     uint32_t size = 0;
     int fd;
+    bool may_have_sent = false;
     kpb_result result = connect_session_until(runtime_dir, id, &fd, deadline);
     if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
     memset(&request, 0, sizeof request);
     request.expected_started_millis = host_to_be64(started);
     request.expected_attached = htonl((uint32_t)attached);
-    output->may_have_sent = 1;
-    result = send_frame(fd, KPB_FRAME_TERMINATE, &request,
-                        attached == -1 ? sizeof(kpb_wire_terminate) : sizeof request);
+    result = send_frame_until(fd, KPB_FRAME_TERMINATE, &request,
+                        attached == -1 ? sizeof(kpb_wire_terminate) : sizeof request, deadline, &may_have_sent);
+    output->may_have_sent = may_have_sent;
+    if (result == KPB_ERR_TIMEOUT && !may_have_sent) result = KPB_ERR_NOT_SENT;
     if (result == KPB_OK) result = receive_frame_bounded(fd, &type, payload, sizeof payload, &size, deadline);
     close(fd);
     if (result != KPB_OK) return result;
@@ -336,7 +344,6 @@ kpb_end_selector(const char *runtime_dir, const kpb_selector *selector, const ch
     const char *caller = getenv("KITTY_PTY_BROKER_SESSION");
     struct timespec deadline;
     kpb_status now;
-    long remaining;
     int runtime, sessions, directory, match;
     kpb_result result;
     if (!output) return KPB_ERR_INVALID;
@@ -344,16 +351,15 @@ kpb_end_selector(const char *runtime_dir, const kpb_selector *selector, const ch
     if (!valid_selector(selector) || !valid_component(resolved_id) || !expected_started_millis) return KPB_ERR_INVALID;
     if (!valid_component(caller)) return KPB_ERR_CALLER;
     deadline_from_timeout(&deadline, timeout_millis, KPB_DEFAULT_TIMEOUT_MILLIS);
-    result = kpb_resolve_selector(runtime_dir, selector, timeout_millis, output);
+    result = selector_resolve_until(runtime_dir, selector, &deadline, output);
     if (result != KPB_OK) return result;
     if (output->matches + output->possible > 1) return KPB_ERR_AMBIGUOUS;
     if (!output->actionable) return KPB_ERR_UNRESOLVED;
     if (!strcmp(output->candidate.session_id, caller)) return KPB_ERR_CALLER;
     if (strcmp(output->candidate.session_id, resolved_id) || output->candidate.started_millis != expected_started_millis)
         return KPB_ERR_MISMATCH;
-    remaining = millis_until(&deadline);
-    if (remaining <= 0) return KPB_ERR_TIMEOUT;
-    result = kpb_query_status_timeout(runtime_dir, resolved_id, &now, (int)remaining);
+    if (millis_until(&deadline) <= 0) return KPB_ERR_TIMEOUT;
+    result = query_status_until(runtime_dir, resolved_id, &now, &deadline);
     if (result != KPB_OK) return result;
     if (strcmp(now.session_id, resolved_id) || now.started_millis != expected_started_millis) return KPB_ERR_MISMATCH;
     runtime = selector_open_directory(AT_FDCWD, runtime_dir);

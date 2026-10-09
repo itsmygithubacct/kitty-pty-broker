@@ -159,14 +159,35 @@ once a frame has started arriving, the rest of it must follow within 2 seconds.
 `--timeout SECONDS` (a decimal number of **seconds**, 0.1 to 60, given with
 `--runtime-dir` before the command, in either order) bounds each wait: the
 default is 2 seconds per operation, and 1 second for `list` and `tui`.
+Connect, frame writes and the response share one absolute monotonic deadline,
+including partial transfers, interrupted calls and spurious readiness. Selector
+end also shares it with its census and final status recheck. Listing drives
+partial request writes concurrently, so a blocked writer cannot consume a
+separate budget or prevent a healthy row from progressing.
+
+Input, resize and best-effort detach frame writes use the default 2-second
+budget. Input/resize transport failure closes that connection, because a
+partial frame cannot be followed by another request. Backpressure within that
+budget preserves every byte. The broker's existing output queues and their
+PTY backpressure/drop policies are unchanged; persistent stream and terminal
+output waits are not short request transactions. Writes use `MSG_DONTWAIT`
+without changing shared descriptor flags. Where that flag is unavailable,
+bounded writes require an already nonblocking descriptor; blocking descriptors
+refuse before writing. Private request/reply sockets stay nonblocking. Attach
+exports its normal blocking connection where per-call nonblocking writes are
+available, and retains nonblocking mode otherwise so input/resize/detach remain
+usable. A caller receiving on that fallback connection waits for readability
+before calling `kpb_receive`, as for any nonblocking connection.
 
 A session that does not answer in time, or that fails for any reason other than
 "nothing is listening", is **unreachable**. `kill` says which kind of timeout it
 was: one that expired after the request was sent says `kill session: timed out;
 the broker may still act on the request` and exits 1 - it did not necessarily
-fail - while one that expired before the request could be sent (the broker is not
-accepting connections) says `timed out before the request was sent ... nothing
-was done` and exits 6, and is safe to retry. `run` waits for the sessions lock no
+fail - while one that expired with zero request bytes sent (during connect or
+write backpressure) says `timed out before the request was sent ... nothing
+was done` and exits 6. A partial write remains uncertain. Durable selector ends
+still retain their operation key and never acquire automatic retry permission.
+`run` waits for the sessions lock no
 longer than `--timeout`, and for the new broker to come up at least 10 seconds;
 if either runs out it says so and exits 1. A spawn that times out on the lock created
 nothing. One that times out on the new broker means *the broker did not answer in
@@ -322,7 +343,7 @@ raw terminal output: replay it in a terminal, not on your own.
 | 2 | usage error |
 | 3 | `kill --expect-started`: refused, the id now names a different session; nothing was done |
 | 5 | `kill --expect-started`: the broker predates the check and cannot verify; nothing was done |
-| 6 | `kill`: timed out while still connecting, so the request was never sent; nothing was done |
+| 6 | `kill`: timed out before any request byte was sent; nothing was done |
 
 `run` and `attach` return the pane command's own exit status once it exits
 (`128+N` if it died from signal `N`), and 1 if they could not attach.

@@ -221,9 +221,14 @@ bridge(
             /* An observer must never resize the pane it is watching. */
             if (!observing) {
                 get_size(&size);
-                (void)kpb_resize(
+                result = kpb_resize(
                     &connection, size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel
                 );
+                if (result != KPB_OK) {
+                    exit_code = 1;
+                    snprintf(reason, sizeof reason, "lost the connection to the broker while resizing");
+                    break;
+                }
             }
         }
         descriptors[0].fd = connection.fd;
@@ -1157,12 +1162,11 @@ main(int argc, char **argv) {
             result = kpb_terminate_timeout(runtime_dir, session_id, timeout_millis);
         }
         if (result == KPB_ERR_NOT_SENT) {
-            /* Still connecting when the time ran out: nothing was sent, so
-             * nothing was or will be done and it is safe to try again. */
+            /* Zero bytes sent, whether connect or write exhausted the budget. */
             fprintf(
                 stderr,
                 "kitty-pty-broker: kill session: timed out before the request was sent "
-                "(the broker is not accepting connections); nothing was done\n");
+                "(connect or write deadline expired); nothing was done\n");
             return 6;
         }
         if (result == KPB_ERR_TIMEOUT) {
