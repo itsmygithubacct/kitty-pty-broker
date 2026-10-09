@@ -25,7 +25,7 @@ valid_selector(const kpb_selector *selector) {
             if (bytes > KPB_SELECTOR_MAX_BYTES) return false;
             word += size;
         }
-        if (++bytes > KPB_SELECTOR_MAX_BYTES) return false;
+        if (index + 1 < selector->word_count && ++bytes > KPB_SELECTOR_MAX_BYTES) return false;
     }
     return true;
 }
@@ -217,6 +217,7 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
     sessions = selector_open_directory(runtime, "sessions");
     if (sessions < 0) {
         result = errno == ENOENT ? KPB_OK : KPB_ERR_SECURITY;
+        if (result == KPB_OK && millis_until(&deadline) <= 0) result = KPB_ERR_TIMEOUT;
         output->complete = result == KPB_OK;
         close(runtime); return result;
     }
@@ -242,22 +243,32 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
     closedir(walk); walk = NULL;
     output->census_count = count;
     if (result != KPB_OK) goto out;
+    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
     list_query_all(runtime_dir, slots, count, &deadline);
+    /* A prompt per-row timeout can prove a nonmatch; exhaustion of the shared
+     * census budget cannot certify a complete observation. This also covers
+     * decoding the final status after the query engine's last clock check. */
+    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
     for (index = 0; index < count; index++) {
         list_slot *slot = &slots[index];
         struct stat pinned, current;
         kpb_status *live = slot->error == KPB_OK ? slot->status : NULL;
-        bool stable = directories[index] >= 0 && fstat(directories[index], &pinned) == 0 &&
+        bool stable;
+        int match;
+        if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
+        stable = directories[index] >= 0 && fstat(directories[index], &pinned) == 0 &&
             fstatat(sessions, slot->id, &current, AT_SYMLINK_NOFOLLOW) == 0 &&
             pinned.st_dev == current.st_dev && pinned.st_ino == current.st_ino &&
             pinned.st_uid == geteuid() && !(pinned.st_mode & 077);
-        int match;
         if (!stable || (live && strcmp(live->session_id, slot->id))) {
             live = NULL;
             if (directories[index] >= 0) close(directories[index]);
             directories[index] = -1;
         }
         match = selector_match(selector, slot->id, live, directories[index]);
+        /* Metadata and pinned-directory checks consume the same budget, even
+         * for a row whose predicates ultimately prove it cannot match. */
+        if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
         if (!match) continue;
         if (match == 2) output->possible++;
         else {
@@ -270,6 +281,7 @@ kpb_resolve_selector(const char *runtime_dir, const kpb_selector *selector, int 
             row->reachable = live != NULL; row->possible = match == 2;
         }
     }
+    if (millis_until(&deadline) <= 0) { result = KPB_ERR_TIMEOUT; goto out; }
     output->complete = 1;
     output->actionable = output->matches == 1 && output->possible == 0 && output->candidate.started_millis > 0;
 out:

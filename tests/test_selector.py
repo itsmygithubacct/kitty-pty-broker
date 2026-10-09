@@ -48,6 +48,20 @@ def ticks(pid):
         return None
 
 
+def restore_proxy_files(path, moved, metadata, original):
+    """Restore a surviving fixture; an ended session has removed its directory."""
+    try:
+        path.unlink(missing_ok=True)
+        moved.rename(path)
+        metadata.write_bytes(original)
+    except FileNotFoundError:
+        try:
+            path.parent.stat()
+        except FileNotFoundError:
+            return
+        raise
+
+
 class RealBroker(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="sel-")
@@ -314,8 +328,7 @@ class RealBroker(unittest.TestCase):
             self.assertFalse(failures)
         finally:
             stopped.set(); worker.join(timeout=3); listener.close()
-            path.unlink(); moved.rename(path)
-            metadata.write_bytes(original)
+            restore_proxy_files(path, moved, metadata, original)
         self.assertTrue(self.alive("probe"))
         self.assertEqual(status["started_millis"], self.started["probe"]["started_millis"])
 
@@ -376,8 +389,9 @@ class RealBroker(unittest.TestCase):
         self.assertFalse(preview["actionable"])
         self.assertEqual(preview["result"], "error")
 
-    @unittest.skipUnless(OLD, "provide the committed old receiver binary")
     def test_older_receiver_refuses_required_attachment_without_fallback(self):
+        if not OLD:
+            self.skipTest("provide the committed old receiver binary")
         self.start("old", cli=OLD)
         code, result = self.end({"id": "old", "attached": False}, "old")
         self.assertEqual((code, result["reason"], result["request_sent"], result["receiver_refused"]),

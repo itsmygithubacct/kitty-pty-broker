@@ -1,0 +1,325 @@
+/* Selected actual resolver/status predicates with deterministic memory adapters.
+ * No operational broker/end/backend is linked. stdout is the only native output. */
+#define _GNU_SOURCE
+#include "kitty_pty_broker.h"
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#define NODE_MAX 1030
+#define FD_MAX 20000
+static struct {
+    struct dirent entry;
+    int status_kind; /* 0 healthy prompt, 1 wedged, 2 prompt per-row timeout, 3 decode */
+    int attached, recorded;
+    const char *text;
+} nodes[NODE_MAX];
+static size_t node_count, walk_index;
+static unsigned char fd_open[FD_MAX];
+static long now_millis;
+static int metadata_expiry, stat_expiry, empty_expiry, missing_sessions, immediate_decode_expiry;
+static int statuses_started, metadata_reads, polls, expiry_enum, unstable_row, invalid_reply_row;
+static char memory_walk;
+
+static int find_node(const char *name) {
+    size_t index;
+    for (index = 0; index < node_count; index++)
+        if (!strcmp(nodes[index].entry.d_name, name)) return (int)index;
+    return -1;
+}
+static int memory_fd(int fd) {
+    assert(fd >= 0 && fd < FD_MAX && !fd_open[fd]);
+    fd_open[fd] = 1;
+    return fd;
+}
+static int memory_close(int fd) {
+    assert(fd >= 0 && fd < FD_MAX && fd_open[fd]);
+    fd_open[fd] = 0;
+    return 0;
+}
+static int memory_openat(int parent, const char *name, int flags) {
+    int index;
+    assert((flags & O_NOFOLLOW) && (flags & O_DIRECTORY));
+    if (parent == AT_FDCWD) {
+        assert(!strcmp(name, "/memory-runtime"));
+        return memory_fd(10);
+    }
+    if (parent == 10) {
+        assert(!strcmp(name, "sessions"));
+        if (missing_sessions) {
+            if (empty_expiry) now_millis = 100;
+            errno = ENOENT;
+            return -1;
+        }
+        return memory_fd(11);
+    }
+    assert(parent == 11);
+    index = find_node(name);
+    assert(index >= 0);
+    return memory_fd(100 + index);
+}
+static uid_t memory_geteuid(void) { return 1000; }
+static int memory_fstat(int fd, struct stat *out) {
+    assert(fd_open[fd]);
+    memset(out, 0, sizeof *out);
+    out->st_uid = 1000;
+    out->st_mode = S_IFDIR | 0700;
+    out->st_dev = 1;
+    out->st_ino = (ino_t)fd;
+    return 0;
+}
+static int memory_fstatat(int parent, const char *name, struct stat *out, int flags) {
+    int index = find_node(name);
+    assert(parent == 11 && flags == AT_SYMLINK_NOFOLLOW && index >= 0);
+    memory_fstat(100 + index, out);
+    if (stat_expiry == index) now_millis = 100;
+    if (unstable_row == index) out->st_ino++;
+    return 0;
+}
+static int memory_dup(int fd) { assert(fd == 11 && fd_open[fd]); return memory_fd(12); }
+static DIR *memory_fdopendir(int fd) {
+    assert(fd == 12 && fd_open[fd]); walk_index = 0; return (DIR *)&memory_walk;
+}
+static struct dirent *memory_readdir(DIR *directory) {
+    assert(directory == (DIR *)&memory_walk);
+    if (walk_index == node_count) {
+        if (empty_expiry) now_millis = 100;
+        return NULL;
+    }
+    if (expiry_enum && walk_index == 1) now_millis = 100;
+    return &nodes[walk_index++].entry;
+}
+static int memory_closedir(DIR *directory) {
+    assert(directory == (DIR *)&memory_walk); return memory_close(12);
+}
+static int memory_clock_gettime(clockid_t which, struct timespec *out) {
+    assert(which == CLOCK_MONOTONIC);
+    out->tv_sec = now_millis / 1000;
+    out->tv_nsec = (now_millis % 1000) * 1000000;
+    return 0;
+}
+static int memory_poll(struct pollfd *fds, nfds_t count, int timeout) {
+    nfds_t index;
+    int ready = 0;
+    assert(timeout > 0 && timeout <= 1000);
+    polls++;
+    for (index = 0; index < count; index++) {
+        int row = fds[index].fd - 10000;
+        assert(row >= 0 && (size_t)row < node_count);
+        if (nodes[row].status_kind == 3) { fds[index].revents = POLLIN; ready++; }
+    }
+    if (ready) now_millis++;
+    else now_millis += timeout;
+    return ready;
+}
+#define openat memory_openat
+#define close memory_close
+#define geteuid memory_geteuid
+#define fstat memory_fstat
+#define fstatat memory_fstatat
+#define dup memory_dup
+#define fdopendir memory_fdopendir
+#define readdir memory_readdir
+#define closedir memory_closedir
+#define clock_gettime memory_clock_gettime
+#define poll memory_poll
+
+@BASE@
+
+@FINISH@
+
+static void memory_status(list_slot *slot, int index) {
+    slot->status = calloc(1, sizeof *slot->status);
+    assert(slot->status);
+    copy_string(slot->status->session_id, sizeof slot->status->session_id,
+                invalid_reply_row == index ? "wrong-incarnation-id" : slot->id);
+    slot->status->started_millis = 123;
+    slot->status->broker_pid = 456;
+    slot->status->attached = nodes[index].attached;
+    list_finish(slot, KPB_OK);
+}
+static int list_start(const char *runtime, list_slot *slot, bool can_defer) {
+    int index = find_node(slot->id);
+    (void)can_defer;
+    assert(!strcmp(runtime, "/memory-runtime") && index >= 0);
+    statuses_started++;
+    if (nodes[index].status_kind == 2) {
+        list_finish(slot, KPB_ERR_TIMEOUT); /* prompt EAGAIN/backlog outcome, no budget exhaustion */
+    } else if (nodes[index].status_kind == 0) {
+        memory_status(slot, index);
+        if (immediate_decode_expiry && (size_t)index + 1 == node_count) now_millis = 100;
+    } else {
+        slot->state = LIST_ACTIVE;
+        slot->fd = memory_fd(10000 + index);
+    }
+    return 0;
+}
+static void list_receive(list_slot *slot) {
+    int index = find_node(slot->id);
+    assert(index >= 0 && nodes[index].status_kind == 3);
+    now_millis = 100; /* the final reply's decoding consumes the remaining budget */
+    memory_status(slot, index);
+}
+
+@QUERY@
+
+/* These two adapters supply already validated startup text in memory. The
+ * shipping metadata reader/JSON decoder is not compiled or claimed qualified. */
+static bool selector_recorded(int directory, const char *id, const kpb_status *live,
+                              kpb_recorded_command *recorded) {
+    int index = find_node(id);
+    (void)live;
+    assert(index >= 0);
+    metadata_reads++;
+    if (metadata_expiry == index) now_millis = 100;
+    if (directory < 0 || !nodes[index].recorded) return false;
+    memset(recorded, 0, sizeof *recorded);
+    return copy_string(recorded->argv_json, sizeof recorded->argv_json, nodes[index].text) == 0;
+}
+static bool selector_startup_text(const char *text, char output[KPB_RECORDED_ARGV_MAX + 1]) {
+    return copy_string(output, KPB_RECORDED_ARGV_MAX + 1, text) == 0;
+}
+
+@SELECTOR@
+
+/* Explicit link-time effect denials backstop the adapters. */
+#define DENY(name) _Noreturn void __wrap_##name(void) { abort(); }
+DENY(socket) DENY(connect) DENY(send) DENY(sendto) DENY(sendmsg) DENY(recv) DENY(recvfrom) DENY(recvmsg)
+DENY(kill) DENY(killpg) DENY(fork) DENY(vfork) DENY(execve) DENY(system) DENY(posix_spawn) DENY(posix_spawnp)
+DENY(open) DENY(openat) DENY(opendir) DENY(fdopendir) DENY(readdir) DENY(closedir)
+DENY(fstat) DENY(fstatat) DENY(stat) DENY(lstat) DENY(readlink) DENY(read) DENY(dup) DENY(close)
+DENY(clock_gettime) DENY(poll) DENY(waitpid) DENY(ioctl) DENY(flock) DENY(unlink) DENY(rename)
+#undef DENY
+
+static unsigned checks, failures, cases_run;
+static void check(bool value) { checks++; if (!value) failures++; }
+static void reset(size_t count) {
+    size_t index;
+    memset(nodes, 0, sizeof nodes); memset(fd_open, 0, sizeof fd_open);
+    node_count = count; now_millis = 0;
+    metadata_expiry = stat_expiry = unstable_row = invalid_reply_row = -1;
+    empty_expiry = missing_sessions = immediate_decode_expiry = expiry_enum = 0;
+    statuses_started = metadata_reads = polls = 0;
+    for (index = 0; index < count; index++) {
+        snprintf(nodes[index].entry.d_name, sizeof nodes[index].entry.d_name, "group.%04zu", index);
+        nodes[index].recorded = 1;
+        nodes[index].text = index ? "run other" : "run build 42";
+    }
+    if (count) strcpy(nodes[0].entry.d_name, "group.target");
+}
+static void observe(const char *name, kpb_selector *selector, kpb_result expected, int complete, int actionable) {
+    kpb_selector_result out;
+    kpb_result result = kpb_resolve_selector("/memory-runtime", selector, 100, &out);
+    unsigned effect_counter = result == KPB_OK && out.complete && out.actionable ? 1 : 0;
+    size_t index;
+    unsigned leaked = 0;
+    for (index = 0; index < sizeof fd_open; index++) if (fd_open[index]) leaked++;
+    check(result == expected); check(out.complete == complete); check(out.actionable == actionable);
+    check(effect_counter == (unsigned)actionable); check(!out.may_have_sent); check(!out.receiver_refused); check(!leaked);
+    cases_run++;
+    printf("{\"case\":\"%s\",\"result\":%d,\"complete\":%d,\"actionable\":%d,\"matches\":%zu,"
+           "\"possible\":%zu,\"clock_ms\":%ld,\"statuses\":%d,\"metadata_reads\":%d,\"polls\":%d,"
+           "\"inert_eligibility_counter\":%u,\"real_dispatches\":0,\"leaked_memory_descriptors\":%u}\n",
+           name, result, out.complete, out.actionable, out.matches, out.possible, now_millis,
+           statuses_started, metadata_reads, polls, effect_counter, leaked);
+}
+static void syntax(void) {
+    char word[5000], first[2100], last[5000];
+    const char *words[65];
+    kpb_selector selector = {KPB_SELECTOR_STARTUP_WORDS, NULL, words, 1, -1};
+    int size, variant;
+    for (size = 4095; size <= 4097; size++) {
+        for (variant = 0; variant < 4; variant++) {
+            if (!variant) {
+                memset(word, 'a', (size_t)size); word[size] = 0;
+                words[0] = word; selector.word_count = 1;
+            } else {
+                size_t bytes = variant == 1 ? 1 : variant == 2 ? 1024 : 512;
+                size_t index;
+                if (variant == 1) strcpy(first, "a");
+                if (variant == 2) for (index = 0; index < 512; index++) memcpy(first + 2 * index, "\xc3\xa9", 2);
+                if (variant == 3) for (index = 0; index < 128; index++) memcpy(first + 4 * index, "\xf0\x9f\x9a\x80", 4);
+                first[bytes] = 0;
+                memset(last, 'b', (size_t)size - bytes - 1); last[(size_t)size - bytes - 1] = 0;
+                words[0] = first; words[1] = last; selector.word_count = 2;
+            }
+            bool accepted = valid_selector(&selector);
+            check(accepted == (size <= 4096));
+            printf("{\"syntax_bytes\":%d,\"variant\":%d,\"accepted\":%s}\n", size, variant, accepted ? "true" : "false");
+        }
+    }
+    for (size = 0; size < 65; size++) words[size] = "x";
+    selector.word_count = 64; check(valid_selector(&selector));
+    selector.word_count = 65; check(!valid_selector(&selector));
+    selector.word_count = 0; check(!valid_selector(&selector));
+    selector.word_count = 1;
+    const char *invalid[] = {"", "a b", "a\tb", "\x1b", "\x7f", "\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80"};
+    for (size = 0; size < (int)(sizeof invalid / sizeof invalid[0]); size++) {
+        words[0] = invalid[size]; check(!valid_selector(&selector));
+    }
+    selector.kind = KPB_SELECTOR_ID; selector.words = NULL; selector.word_count = 0;
+    selector.reference = "-Ab_9"; check(valid_selector(&selector));
+    selector.reference = ".."; check(!valid_selector(&selector));
+    selector.kind = KPB_SELECTOR_PREFIX; check(valid_selector(&selector));
+    selector.attached = 2; check(!valid_selector(&selector));
+}
+int main(void) {
+    const char *words[] = {"build", "42"};
+    kpb_selector id = {KPB_SELECTOR_ID, "group.target", NULL, 0, -1};
+    kpb_selector prefix = {KPB_SELECTOR_PREFIX, "group.", NULL, 0, -1};
+    kpb_selector startup = {KPB_SELECTOR_STARTUP_WORDS, NULL, words, 2, -1};
+    syntax();
+    reset(2); nodes[1].status_kind = 1;
+    observe("fast_target_unrelated_wedged", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(130); for (size_t i = 1; i < node_count; i++) nodes[i].status_kind = 1;
+    observe("deadline_active_and_pending_slots", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(1); nodes[0].status_kind = 3;
+    observe("final_status_decode_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(2); immediate_decode_expiry = 1;
+    observe("all_statuses_prompt_post_status_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(2); metadata_expiry = 0;
+    observe("metadata_matching_row_expiry", &startup, KPB_ERR_TIMEOUT, 0, 0);
+    reset(2); metadata_expiry = 1;
+    observe("metadata_proven_nonmatch_expiry", &startup, KPB_ERR_TIMEOUT, 0, 0);
+    reset(2); stat_expiry = 0;
+    observe("pinned_row_stat_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(2); nodes[1].status_kind = 2;
+    observe("prompt_timeout_proven_id_nonmatch", &id, KPB_OK, 1, 1);
+    reset(2); nodes[1].status_kind = 2;
+    observe("prompt_timeout_matching_prefix", &prefix, KPB_OK, 1, 0);
+    reset(1); nodes[0].status_kind = 2;
+    observe("prompt_timeout_only_target_unreachable", &id, KPB_OK, 1, 0);
+    reset(2); nodes[1].recorded = 0; nodes[1].attached = 1; startup.attached = 0;
+    observe("prompt_attachment_nonmatch_unknown_startup", &startup, KPB_OK, 1, 1);
+    startup.attached = -1;
+    reset(2); nodes[1].recorded = 0;
+    observe("prompt_possible_startup_row", &startup, KPB_OK, 1, 0);
+    reset(2); expiry_enum = 1;
+    observe("enumeration_budget_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(0); empty_expiry = 1;
+    observe("empty_enumeration_budget_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(0); missing_sessions = 1; empty_expiry = 1;
+    observe("missing_sessions_budget_expiry", &id, KPB_ERR_TIMEOUT, 0, 0);
+    reset(0);
+    observe("ordinary_empty_census", &id, KPB_OK, 1, 0);
+    reset(1025);
+    observe("census_capacity_refusal", &id, KPB_ERR_BUFFER, 0, 0);
+    reset(2); strcpy(nodes[1].entry.d_name, "../unsafe");
+    observe("unsafe_entry_refusal", &id, KPB_ERR_SECURITY, 0, 0);
+    reset(1); unstable_row = 0;
+    observe("pinned_directory_replacement_nonactionable", &id, KPB_OK, 1, 0);
+    reset(1); invalid_reply_row = 0;
+    observe("status_id_mismatch_nonactionable", &id, KPB_OK, 1, 0);
+    printf("{\"summary\":true,\"checks\":%u,\"failed_checks\":%u,\"census_cases\":%u,\"native_broker_linked\":false,"
+           "\"termination_linked\":false,\"real_dispatches\":0}\n", checks, failures, cases_run);
+    return failures ? 1 : 0;
+}
