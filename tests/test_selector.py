@@ -219,9 +219,24 @@ class RealBroker(unittest.TestCase):
         self.assertTrue(sock.parent.exists())
         saved.rename(sock)
         os.kill(decoy["broker_pid"], signal.SIGSTOP)
+        try:
+            # A stopped peer consumes the shared census deadline. The later
+            # deadline fix must refuse even when its metadata looks disjoint.
+            for selector in ({"startup_words": ["sleep", "56"]},
+                             {"startup_words": ["/bin/sleep", "60"], "attached": False}):
+                preview = self.resolve(selector)
+                self.assertFalse(preview["complete"])
+                self.assertFalse(preview["actionable"])
+                self.assertIsNone(preview["resolved"])
+                self.assertFalse(preview["request_sent"])
+                self.assertEqual(preview["reason"], "read_timed_out")
+            code, result = self.end({"startup_words": ["sleep", "56"]}, "goal")
+            self.assertNotEqual(code, 0)
+            self.assertFalse(result["request_sent"])
+            self.assertTrue(self.alive("goal"))
+        finally:
+            os.kill(decoy["broker_pid"], signal.SIGCONT)
         self.assertEqual(self.resolve({"startup_words": ["sleep", "56"]})["resolved"]["id"], "goal")
-        self.assertEqual(self.resolve({"startup_words": ["/bin/sleep", "60"], "attached": False})["possible"], 1)
-        os.kill(decoy["broker_pid"], signal.SIGCONT)
         provisional = self.runtime / "sessions/newborn"
         provisional.mkdir(mode=0o700)
         (provisional / ".spawn-metadata").write_text(f"broker_pid={os.getpid()}\n")
