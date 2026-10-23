@@ -540,6 +540,11 @@ checkpoints through a future protocol extension.
 
 ## Scope
 
+Selector validation preserves and checks the selector supplied by the caller.
+It does not authenticate the user's original intent. A consumer must preserve
+that intent through its own request path and qualify its behavior separately;
+local broker tests do not establish end-to-end consumer acceptance.
+
 This library protects panes from frontend loss. It cannot survive the broker
 itself being sent `SIGKILL`, the OOM killer, a reboot, or loss of the user
 session. Threads are deliberately not used as a lifetime boundary because all
