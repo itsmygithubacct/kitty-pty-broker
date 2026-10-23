@@ -63,6 +63,7 @@ typedef struct {
     char session_dir[KPB_PATH_MAX];
     char socket_path[KPB_PATH_MAX];
     char journal_path[KPB_PATH_MAX];
+    char journal_time_path[KPB_PATH_MAX];
     char metadata_path[KPB_PATH_MAX];
     /* The two temporary names a session directory can hold: the broker's own
      * (written, fsynced, renamed over metadata) and the spawning caller's (written,
@@ -131,12 +132,14 @@ typedef struct {
     int listener_fd;
     int pty_fd;
     int journal_fd;
+    int journal_time_fd;
     int transcript_fd;
     int client_fd;
     pid_t child_pid;
     uint64_t started_millis;
     uint64_t journal_bytes;
     uint64_t journal_epoch;
+    unsigned int journal_time_records;
     uint64_t journal_limit;
     bool journal_complete;
     uint64_t transcript_bytes;
@@ -304,6 +307,7 @@ build_paths(const char *runtime_dir, const char *session_id, session_paths *path
     if (join_path(paths->session_dir, sizeof paths->session_dir, paths->sessions_dir, session_id) != 0 ||
         join_path(paths->socket_path, sizeof paths->socket_path, paths->session_dir, "control.sock") != 0 ||
         join_path(paths->journal_path, sizeof paths->journal_path, paths->session_dir, "journal.bin") != 0 ||
+        join_path(paths->journal_time_path, sizeof paths->journal_time_path, paths->session_dir, "journal.time") != 0 ||
         join_path(paths->metadata_path, sizeof paths->metadata_path, paths->session_dir, "metadata") != 0 ||
         join_path(paths->metadata_tmp_path, sizeof paths->metadata_tmp_path, paths->session_dir, "metadata.tmp") != 0 ||
         join_path(paths->provisional_path, sizeof paths->provisional_path, paths->session_dir, "metadata.provisional") != 0) {
@@ -1299,21 +1303,42 @@ observers_send(
 static int
 append_journal(server_state *server, const unsigned char *data, size_t size) {
     static const unsigned char reset_sequence[] = "\033c";
+    uint64_t begin, end, observed_ns;
+    struct timespec observed;
+    char record[160];
+    int length;
+    /* A read may hold a shared lock briefly. Never stall PTY forwarding for
+     * timing metadata: an unindexed interval simply makes ranking unknown. */
+    bool locked = server->journal_time_fd >= 0 &&
+                  flock(server->journal_time_fd, LOCK_EX | LOCK_NB) == 0;
+    bool indexed = locked;
+    begin = server->journal_bytes;
     if (server->journal_limit && server->journal_bytes + size > server->journal_limit) {
         size_t keep = size;
         if (ftruncate(server->journal_fd, 0) != 0 ||
             lseek(server->journal_fd, 0, SEEK_SET) < 0 ||
             write_all_fd(server->journal_fd, reset_sequence, sizeof reset_sequence - 1) < 0) {
+            if (locked) (void)flock(server->journal_time_fd, LOCK_UN);
             return -1;
         }
         server->journal_bytes = sizeof reset_sequence - 1;
         server->journal_epoch++;
         server->journal_complete = false;
+        if (indexed) {
+            if (ftruncate(server->journal_time_fd, 0) != 0 ||
+                lseek(server->journal_time_fd, 0, SEEK_SET) < 0) {
+                indexed = false;
+            }
+            server->journal_time_records = 0;
+        }
+        begin = server->journal_bytes;
         if (server->journal_limit <= server->journal_bytes) {
             if (ftruncate(server->journal_fd, (off_t)server->journal_limit) != 0) {
+                if (locked) (void)flock(server->journal_time_fd, LOCK_UN);
                 return -1;
             }
             server->journal_bytes = server->journal_limit;
+            if (locked) (void)flock(server->journal_time_fd, LOCK_UN);
             return 0;
         }
         if (keep > server->journal_limit - server->journal_bytes) {
@@ -1322,8 +1347,30 @@ append_journal(server_state *server, const unsigned char *data, size_t size) {
             size = keep;
         }
     }
-    if (write_all_fd(server->journal_fd, data, size) < 0) return -1;
+    if (write_all_fd(server->journal_fd, data, size) < 0) {
+        if (locked) (void)flock(server->journal_time_fd, LOCK_UN);
+        return -1;
+    }
     server->journal_bytes += size;
+    end = server->journal_bytes;
+    /* The sidecar is best-effort. A missing, partial or capped interval makes
+     * chronology unknown; it must never stop the live PTY. Hold one lock over
+     * journal and index commit so a read sees a consistent watermark. */
+    if (indexed && server->journal_time_records < 4096 &&
+        clock_gettime(CLOCK_MONOTONIC, &observed) == 0 &&
+        observed.tv_sec >= 0 && observed.tv_nsec >= 0) {
+        observed_ns = (uint64_t)observed.tv_sec * 1000000000U + (uint64_t)observed.tv_nsec;
+        length = snprintf(record, sizeof record, "%llu %llu %llu %llu %llu\n",
+                          (unsigned long long)server->started_millis,
+                          (unsigned long long)server->journal_epoch,
+                          (unsigned long long)begin, (unsigned long long)end,
+                          (unsigned long long)observed_ns);
+        if (length > 0 && (size_t)length < sizeof record &&
+            write_all_fd(server->journal_time_fd, record, (size_t)length) == 0) {
+            server->journal_time_records++;
+        }
+    }
+    if (locked) (void)flock(server->journal_time_fd, LOCK_UN);
     return 0;
 }
 
@@ -2518,6 +2565,7 @@ static bool
 known_session_entry(const char *name) {
     return strcmp(name, "metadata") == 0 || strcmp(name, "metadata.tmp") == 0 ||
            strcmp(name, "metadata.provisional") == 0 || strcmp(name, "journal.bin") == 0 ||
+           strcmp(name, "journal.time") == 0 ||
            strcmp(name, "control.sock") == 0;
 }
 
@@ -2587,7 +2635,7 @@ static int
 remove_session_files(const session_paths *paths, const char *proof) {
     const char *others[] = {
         paths->metadata_tmp_path, paths->provisional_path, paths->socket_path,
-        paths->journal_path, paths->metadata_path,
+        paths->journal_time_path, paths->journal_path, paths->metadata_path,
     };
     size_t index;
     for (index = 0; index < sizeof others / sizeof others[0]; index++) {
@@ -2608,6 +2656,7 @@ cleanup_server(server_state *server) {
     if (server->pty_fd >= 0) close(server->pty_fd);
     if (server->listener_fd >= 0) close(server->listener_fd);
     if (server->journal_fd >= 0) close(server->journal_fd);
+    if (server->journal_time_fd >= 0) close(server->journal_time_fd);
     if (server->transcript_fd >= 0) close(server->transcript_fd);
     free(server->input_buffer);
     (void)remove_session_files(&server->paths, server->paths.metadata_path);
@@ -2664,6 +2713,7 @@ static bool
 server_owns_fd(const server_state *server, int ready_fd, int fd) {
     return fd <= STDERR_FILENO || fd == ready_fd || fd == server->listener_fd ||
         fd == server->pty_fd || fd == server->journal_fd ||
+        fd == server->journal_time_fd ||
         fd == server->transcript_fd;
 }
 
@@ -2713,6 +2763,7 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     int exit_code = 255;
     memset(&server, 0, sizeof server);
     server.listener_fd = server.pty_fd = server.journal_fd = server.client_fd = -1;
+    server.journal_time_fd = -1;
     server.transcript_fd = -1;
     {
         /* Before the first goto fail: memset leaves these at 0, and
@@ -2755,6 +2806,9 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         0600
     );
     if (server.journal_fd < 0) goto fail;
+    /* Absence of timing evidence does not prevent a shell from starting. */
+    server.journal_time_fd = open(server.paths.journal_time_path,
+                                  O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (options->transcript_path && options->transcript_path[0] == '/') {
         /* Existing transcripts are continued rather than replaced, so a
          * recovered pane keeps its history.  Deliberately NOT O_APPEND: on

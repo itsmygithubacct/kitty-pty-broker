@@ -82,7 +82,8 @@ class RecordedTests(unittest.TestCase):
         self.assertLessEqual(len(fields["argv_json"].encode()), 1024)
         self.assertLessEqual(len(fields["cwd_json"].encode()), 512)
         self.assertEqual(self.metadata().stat().st_mode & 0o777, 0o600)
-        self.assertEqual({path.name for path in self.metadata().parent.iterdir()}, {"metadata", "control.sock", "journal.bin"})
+        self.assertEqual({path.name for path in self.metadata().parent.iterdir()},
+                         {"metadata", "control.sock", "journal.bin", "journal.time"})
         recorded = self.stopped_row(live)["recorded"]
         self.assertEqual(recorded, {"argv": argv, "cwd": str(cwd), "started_millis": live["started_millis"], "truncated": False})
         hidden = self.document("--timeout", "0.1", "list", "--json")
