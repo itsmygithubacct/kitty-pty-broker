@@ -11,10 +11,32 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 CLI = str(Path(__file__).resolve().parents[1] / "build/kitty-pty-broker")
 OLD = None
+class FixtureCleanupTests(unittest.TestCase):
+    def test_exit_during_proc_read_is_absent_but_permission_errors_propagate(self):
+        with mock.patch.object(Path, "read_text", side_effect=ProcessLookupError()):
+            self.assertIsNone(ticks(123))
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError()):
+            with self.assertRaises(PermissionError):
+                ticks(123)
+
+    def test_exit_after_identity_check_still_cleans_fixture(self):
+        fixture = SimpleNamespace(
+            sockets=[], started={"owned": {"broker_pid": 123, "start_ticks": 456,
+                                           "started_millis": 789}},
+            call=mock.Mock(), temporary=SimpleNamespace(cleanup=mock.Mock()))
+        with mock.patch.dict(RealBroker.tearDown.__globals__, ticks=lambda pid: 456), \
+                mock.patch.object(os, "kill", side_effect=ProcessLookupError()):
+            RealBroker.tearDown(fixture)
+        fixture.call.assert_called_once_with("kill", "owned", "--expect-started", "789")
+        fixture.temporary.cleanup.assert_called_once_with()
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         CLI = str(Path(sys.argv.pop(1)).resolve())
@@ -44,7 +66,7 @@ def receive(sock):
 def ticks(pid):
     try:
         return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
-    except (FileNotFoundError, IndexError):
+    except (FileNotFoundError, ProcessLookupError, IndexError):
         return None
 
 
@@ -144,7 +166,10 @@ class RealBroker(unittest.TestCase):
         for ident, status in self.started.items():
             pid = status["broker_pid"]
             if ticks(pid) == status["start_ticks"]:
-                os.kill(pid, signal.SIGCONT)
+                try:
+                    os.kill(pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass  # The owned fixture exited after its identity check.
             self.call("kill", ident, "--expect-started", str(status["started_millis"]))
         self.temporary.cleanup()
 
