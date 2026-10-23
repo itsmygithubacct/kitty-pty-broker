@@ -27,7 +27,7 @@ FUZZ_PARSERS := $(BUILD_DIR)/fuzz-parsers
 FUZZ_SECONDS ?= 15
 SANITIZE_BUILD_DIR ?= $(BUILD_DIR)/sanitize
 
-.PHONY: all benchmark clean compatibility fuzz install sanitize test
+.PHONY: all benchmark clean compatibility fuzz install sanitize test test-install
 
 all: $(STATIC_LIB) $(SHARED_LIB) $(CLI)
 
@@ -55,8 +55,8 @@ $(STATIC_LIB): $(LIB_OBJECT)
 $(SHARED_LIB): $(LIB_OBJECT)
 	$(CC) -shared $(LDFLAGS) -Wl,-soname,libkitty-pty-broker.so -o "$@" "$<" $(LDLIBS)
 
-$(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB)
-	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(CLI_OBJECT) $(TUI_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
+$(CLI): $(CLI_OBJECT) $(TUI_OBJECT) $(SHARED_LIB) Makefile
+	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib' -o "$@" $(CLI_OBJECT) $(TUI_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
 $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(TEST_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
@@ -141,3 +141,7 @@ install: all
 
 clean:
 	rm -rf -- "$(BUILD_DIR)"
+
+# Exercise the installed layout without a system library search path override.
+test-install: all
+	python3 tests/test_install.py "$(abspath $(BUILD_DIR))"
