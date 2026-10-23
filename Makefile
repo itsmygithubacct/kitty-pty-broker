@@ -73,6 +73,7 @@ $(SELECTOR_TRANSPORT): tests/selector_transport.c src/kitty_pty_broker.c src/sel
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/selector_transport.c -o "$@" $(LDLIBS)
 
 test: $(TEST) $(RECORDED_TEST) $(SELECTOR_TRANSPORT) $(CLI)
+	python3 tests/test_sanitizer_gate.py
 	sh tests/test_docs.sh
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(RECORDED_TEST)"
@@ -115,15 +116,21 @@ sanitize:
 		LDFLAGS="-fsanitize=address,undefined" \
 		TEST_ENVIRONMENT="ASAN_OPTIONS=log_path=$(SANITIZE_BUILD_DIR)/asan UBSAN_OPTIONS=log_path=$(SANITIZE_BUILD_DIR)/ubsan:halt_on_error=1:print_stacktrace=1" \
 		test
-	@if ls $(SANITIZE_BUILD_DIR)/asan.* $(SANITIZE_BUILD_DIR)/ubsan.* >/dev/null 2>&1; then \
-		echo "sanitizer reports were produced:" >&2; \
-		for report in $(SANITIZE_BUILD_DIR)/asan.* $(SANITIZE_BUILD_DIR)/ubsan.*; do \
-			[ -e "$$report" ] || continue; \
-			echo "--- $$report" >&2; cat "$$report" >&2; \
-		done; \
-		exit 1; \
-	fi
+	$(MAKE) check-sanitizer-reports SANITIZE_BUILD_DIR="$(SANITIZE_BUILD_DIR)"
+
+.PHONY: check-sanitizer-reports test-sanitizer-gate
+check-sanitizer-reports:
+	@found=0; \
+	for report in "$(SANITIZE_BUILD_DIR)"/asan.* "$(SANITIZE_BUILD_DIR)"/ubsan.*; do \
+		[ -e "$$report" ] || continue; \
+		found=1; \
+		echo "sanitizer report: $$report" >&2; cat "$$report" >&2; \
+	done; \
+	[ "$$found" -eq 0 ] || exit 1
 	@echo "no sanitizer reports"
+
+test-sanitizer-gate:
+	python3 tests/test_sanitizer_gate.py
 
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib" "$(DESTDIR)$(PREFIX)/bin"
