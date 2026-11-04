@@ -79,6 +79,7 @@ test: $(TEST) $(RECORDED_TEST) $(SELECTOR_TRANSPORT) $(CLI)
 	$(TEST_ENVIRONMENT) "$(RECORDED_TEST)"
 	$(TEST_ENVIRONMENT) python3 tests/test_recorded.py "$(CLI)"
 	$(TEST_ENVIRONMENT) python3 tests/test_selector.py "$(CLI)"
+	$(TEST_ENVIRONMENT) python3 tests/test_drain.py "$(CLI)"
 	sh tests/test_cli.sh "$(CLI)"
 
 benchmark: $(BENCHMARK)

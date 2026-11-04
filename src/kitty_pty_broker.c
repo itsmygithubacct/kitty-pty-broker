@@ -20,6 +20,8 @@
 #include <sys/ioctl.h>
 #ifdef __linux__
 #include <sys/random.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #endif
 #include <sys/file.h>
 #include <sys/socket.h>
@@ -149,6 +151,12 @@ typedef struct {
     uint64_t transcript_elided;
     bool terminate_requested;
     uint64_t terminate_deadline;
+    bool tracks_descendants;
+    bool drain_requested;
+    bool drain_complete;
+    bool child_reaped;
+    int child_wait_status;
+    uint64_t drain_kill_after;
     frame_queue client_out;
     bool client_replay_active;
     uint64_t client_replay_at;
@@ -1863,10 +1871,84 @@ signal_child_session(pid_t session_id, int signal_number) {
 
 static void
 request_termination(server_state *server) {
-    if (server->terminate_requested) return;
+    if (server->terminate_requested || server->drain_requested) return;
     server->terminate_requested = true;
     server->terminate_deadline = monotonic_millis() + 1500;
     signal_child_session(server->child_pid, SIGTERM);
+}
+
+/* The server is single-threaded and never reaps while reading this list.
+ * Every listed PID remains our direct child (possibly a zombie) until we
+ * wait for it, so it cannot be recycled between enumeration and pidfd_open.
+ * Killing direct children makes their detached descendants become our direct
+ * children through the subreaper boundary established before forkpty. */
+static int
+signal_owned_children(int signo, uint64_t until) {
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    char path[96];
+    FILE *children;
+    long pid;
+    unsigned int count = 0;
+    snprintf(path, sizeof path, "/proc/self/task/%ld/children", (long)getpid());
+    children = fopen(path, "re");
+    if (!children) return -1;
+    while (count++ < 4096 && monotonic_millis() < until &&
+           fscanf(children, "%ld", &pid) == 1) {
+        int fd;
+        if (pid <= 0 || pid > INT_MAX) { fclose(children); return -1; }
+        fd = (int)syscall(SYS_pidfd_open, (pid_t)pid, 0);
+        if (fd < 0) {
+            if (errno == ESRCH) continue;
+            fclose(children); return -1;
+        }
+        if (syscall(SYS_pidfd_send_signal, fd, signo, NULL, 0) < 0 && errno != ESRCH) {
+            close(fd); fclose(children); return -1;
+        }
+        close(fd);
+    }
+    if (ferror(children)) { fclose(children); return -1; }
+    fclose(children);
+    return 0;
+#else
+    (void)signo; (void)until;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static bool
+reap_owned_children(server_state *server, uint64_t until) {
+    while (monotonic_millis() < until) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            if (pid == server->child_pid) {
+                server->child_reaped = true;
+                server->child_wait_status = status;
+            }
+            continue;
+        }
+        if (pid < 0 && errno == EINTR) continue;
+        if (pid < 0 && errno == ECHILD && server->child_reaped) {
+            server->drain_complete = true;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static bool
+drain_owned_children(server_state *server, uint64_t until) {
+    while (monotonic_millis() < until) {
+        struct timespec pause = {0, 10000000L};
+        int signo = monotonic_millis() >= server->drain_kill_after ? SIGKILL : SIGTERM;
+        if (reap_owned_children(server, until)) return true;
+        if (signal_owned_children(signo, until) != 0) return false;
+        if (reap_owned_children(server, until)) return true;
+        nanosleep(&pause, NULL);
+    }
+    return false;
 }
 
 static int
@@ -2098,6 +2180,33 @@ handle_new_connection(server_state *server) {
         kpb_wire_status status;
         status_to_wire(server, &status);
         (void)send_frame_until(fd, KPB_FRAME_STATUS_REPLY, &status, sizeof status, &deadline, NULL);
+        close(fd);
+        return;
+    }
+    if (type == KPB_FRAME_DRAIN && payload_size == sizeof(kpb_wire_terminate)) {
+        kpb_wire_terminate request;
+        memcpy(&request, payload, sizeof request);
+        if (!server->tracks_descendants) {
+            (void)send_error(fd, KPB_ERROR_INVALID, &deadline);
+        } else if (be64_to_host(request.expected_started_millis) != server->started_millis) {
+            (void)send_error(fd, KPB_ERROR_IDENTITY_MISMATCH, &deadline);
+        } else {
+            if (!server->drain_requested) {
+                server->drain_requested = true;
+                server->terminate_requested = false;
+                server->drain_kill_after = monotonic_millis() + 1500;
+            }
+            /* Parsing keeps its original 500ms bound. The validated drain
+             * phase has a separate fixed 2500ms ceiling, then at most 100ms
+             * to publish the answer. A timeout never earns an ACK. */
+            if (drain_owned_children(server, monotonic_millis() + 2500)) {
+                deadline_in(&deadline, 100);
+                (void)send_frame_until(fd, KPB_FRAME_ACK, NULL, 0, &deadline, NULL);
+            } else {
+                deadline_in(&deadline, 100);
+                (void)send_error(fd, KPB_ERROR_CESSATION_PENDING, &deadline);
+            }
+        }
         close(fd);
         return;
     }
@@ -2419,7 +2528,7 @@ server_loop(server_state *server) {
     unsigned char buffer[KPB_IO_CHUNK];
     int child_status = 0;
     bool child_exited = false;
-    while (!child_exited) {
+    while (!child_exited || (server->drain_requested && !server->drain_complete)) {
         struct pollfd descriptors[3 + KPB_OBSERVER_MAX];
         struct timespec timeout;
         struct timespec *timeout_pointer = NULL;
@@ -2427,11 +2536,25 @@ server_loop(server_state *server) {
         uint32_t generations[KPB_OBSERVER_MAX];
         size_t slot;
         int result;
-        pid_t waited = waitpid(server->child_pid, &child_status, WNOHANG);
-        if (waited == server->child_pid) child_exited = true;
-        else if (waited < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        if (!server->child_reaped) {
+            pid_t waited = waitpid(server->child_pid, &child_status, WNOHANG);
+            if (waited == server->child_pid) {
+                server->child_reaped = true;
+                server->child_wait_status = child_status;
+            } else if (waited < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+        }
+        child_exited = server->child_reaped;
+        child_status = server->child_wait_status;
+        if (server->drain_requested && !server->drain_complete) {
+            /* A caller timeout/disconnect cannot relinquish ownership of
+             * surviving descendants. Keep this broker as their subreaper
+             * and continue bounded cleanup, without claiming cessation. */
+            (void)drain_owned_children(server, monotonic_millis() + 20);
+            child_exited = server->child_reaped;
+            child_status = server->child_wait_status;
         }
         if (server->terminate_requested && monotonic_millis() >= server->terminate_deadline) {
             signal_child_session(server->child_pid, SIGKILL);
@@ -2441,7 +2564,7 @@ server_loop(server_state *server) {
         descriptors[0].fd = server->listener_fd;
         descriptors[0].events = POLLIN;
         descriptors[0].revents = 0;
-        descriptors[1].fd = server->pty_fd;
+        descriptors[1].fd = child_exited && server->drain_requested ? -1 : server->pty_fd;
         /* Reading the PTY is gated on the client's backlog: past the
          * high-water mark the kernel PTY buffer is left to fill, which is
          * what stops the shell when a frontend stops reading.  Everything
@@ -2470,7 +2593,11 @@ server_loop(server_state *server) {
             descriptors[3 + slot].revents = 0;
             generations[slot] = observer->generation;
         }
-        if (child_exited) {
+        if (server->drain_requested && !server->drain_complete) {
+            timeout.tv_sec = 0;
+            timeout.tv_nsec = 100000000L;
+            timeout_pointer = &timeout;
+        } else if (child_exited) {
             timeout.tv_sec = 0;
             timeout.tv_nsec = 0;
             timeout_pointer = &timeout;
@@ -2846,6 +2973,18 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
         }
         record_transcript_size(&server);
     }
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    {
+        int probe = (int)syscall(SYS_pidfd_open, getpid(), 0);
+        if (probe >= 0) {
+            if (syscall(SYS_pidfd_send_signal, probe, 0, NULL, 0) == 0 &&
+                prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0) {
+                server.tracks_descendants = true;
+            }
+            close(probe);
+        }
+    }
+#endif
     server.child_pid = forkpty(&server.pty_fd, NULL, NULL, &server.size);
     if (server.child_pid < 0) goto fail;
     if (server.child_pid == 0) {
@@ -2874,11 +3013,19 @@ server_main(const kpb_spawn_options *options, const char *session_id, int ready_
     if (write_all_fd(ready_fd, &ready, sizeof ready) < 0) goto fail_after_ready;
     close(ready_fd);
     exit_code = server_loop(&server);
-    if (exit_code < 0 && server.child_pid > 0) {
+    if (exit_code < 0 && server.child_pid > 0 && !server.child_reaped) {
         signal_child_session(server.child_pid, SIGKILL);
         while (waitpid(server.child_pid, NULL, 0) < 0 && errno == EINTR) {
             /* retry */
         }
+        server.child_reaped = true;
+    }
+    while (server.drain_requested && !server.drain_complete) {
+        /* Even a transport/PTY failure must not orphan a pending drain's
+         * writers. No success was reported; retain the ownership boundary. */
+        struct timespec pause = {0, 100000000L};
+        (void)drain_owned_children(&server, monotonic_millis() + 1000);
+        if (!server.drain_complete) nanosleep(&pause, NULL);
     }
     cleanup_server(&server);
     return exit_code < 0 ? 255 : exit_code;
@@ -4151,12 +4298,13 @@ kpb_terminate_timeout(
     return result;
 }
 
-kpb_result
-kpb_terminate_expect(
+static kpb_result
+terminate_checked(
     const char *runtime_dir,
     const char *session_id,
     uint64_t expected_started_millis,
-    int timeout_millis
+    int timeout_millis,
+    uint16_t request_type
 ) {
     unsigned char payload[128];
     kpb_wire_terminate request;
@@ -4171,7 +4319,7 @@ kpb_terminate_expect(
     if (result == KPB_ERR_TIMEOUT) return KPB_ERR_NOT_SENT;
     if (result != KPB_OK) return result;
     request.expected_started_millis = host_to_be64(expected_started_millis);
-    result = send_frame_until(fd, KPB_FRAME_TERMINATE, &request, sizeof request, &deadline, &may_have_sent);
+    result = send_frame_until(fd, request_type, &request, sizeof request, &deadline, &may_have_sent);
     if (result == KPB_ERR_TIMEOUT && !may_have_sent) result = KPB_ERR_NOT_SENT;
     if (result == KPB_OK) {
         result = receive_frame_bounded(
@@ -4191,8 +4339,27 @@ kpb_terminate_expect(
             memcmp(payload, KPB_ERROR_INVALID, payload_size) == 0) {
             return KPB_ERR_UNSUPPORTED;
         }
+        if (request_type == KPB_FRAME_DRAIN &&
+            payload_size == strlen(KPB_ERROR_CESSATION_PENDING) &&
+            memcmp(payload, KPB_ERROR_CESSATION_PENDING, payload_size) == 0) {
+            return KPB_ERR_TIMEOUT;
+        }
     }
     return KPB_ERR_PROTOCOL;
+}
+
+kpb_result
+kpb_terminate_expect(const char *runtime_dir, const char *session_id,
+                     uint64_t expected_started_millis, int timeout_millis) {
+    return terminate_checked(runtime_dir, session_id, expected_started_millis,
+                             timeout_millis, KPB_FRAME_TERMINATE);
+}
+
+kpb_result
+kpb_drain_expect(const char *runtime_dir, const char *session_id,
+                 uint64_t expected_started_millis, int timeout_millis) {
+    return terminate_checked(runtime_dir, session_id, expected_started_millis,
+                             timeout_millis > 0 ? timeout_millis : 3500, KPB_FRAME_DRAIN);
 }
 
 kpb_result

@@ -412,6 +412,35 @@ the broker cannot check; plain `kill ID` is unchanged. The TUI binds its `x`/`y`
 confirmation the same way, to the session that was on screen when `x` was
 pressed.
 
+### Descendant cessation
+
+`drain ID --expect-started MILLIS` and `kpb_drain_expect` provide a stronger,
+opt-in result for transferring ownership of a conversation. Exit 0 means the
+broker has reaped every child in its descendant domain. This includes children
+created after inspection, detached sessions and double-forked descendants.
+Ordinary `kill` still acknowledges the request before termination finishes.
+
+On Linux, a new broker establishes a subreaper boundary before spawning its
+command. Drain requires that boundary and pidfd support. It signals direct
+children through pidfds; when their parents exit, descendants are adopted into
+the same boundary. Only `waitpid(-1, WNOHANG)` reporting `ECHILD`, after the
+original command was reaped, permits an acknowledgment. A snapshot of process
+IDs or disappearance of the original process group is insufficient.
+
+The appended wire frame `DRAIN` (16) carries the existing 8-byte start identity.
+Old brokers refuse it without terminating anything; there is no legacy fallback.
+Identity mismatch exits 3, unsupported operation exits 5, and a request that was
+never sent exits 6. A timeout or transport failure is an unknown outcome, never
+permission to start another writer. The C API defaults to a 3500ms caller bound;
+an explicit shorter timeout remains authoritative.
+
+The validated server operation gives TERM a 1500ms grace period and bounds its
+initial cleanup phase to 2500ms. If cessation cannot be established, it reports
+failure and retains its descendant ownership while continuing cleanup. Caller
+timeout or disconnection does not release that ownership. Killing the broker
+itself can defeat containment, so an EOF without the cessation acknowledgment
+must remain unqualified.
+
 ### Resume
 
 Within one epoch the journal is strictly append-only, so a resume offset only

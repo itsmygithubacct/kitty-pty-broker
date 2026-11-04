@@ -48,7 +48,10 @@ enum kpb_frame_type {
      * every consumer that counts received bytes two ahead of the truth, so a
      * later resume from that offset silently skipped two bytes of real
      * output. */
-    KPB_FRAME_RESET = 15
+    KPB_FRAME_RESET = 15,
+    /* Opt-in, identity-bound termination. ACK means all owned descendants
+     * have exited, unlike the legacy TERMINATE request acknowledgment. */
+    KPB_FRAME_DRAIN = 16
 };
 
 /* Attach modes, carried in kpb_wire_attach.mode. */
@@ -74,6 +77,7 @@ enum kpb_frame_type {
 #define KPB_ERROR_NEEDS_V2 "observe requires protocol 2"
 #define KPB_ERROR_IDENTITY_MISMATCH "identity mismatch"
 #define KPB_ERROR_ATTACHMENT_MISMATCH "attachment mismatch"
+#define KPB_ERROR_CESSATION_PENDING "descendant cessation unconfirmed"
 
 typedef struct {
     uint32_t magic;

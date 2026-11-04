@@ -419,6 +419,17 @@ kpb_result kpb_query_status(
     kpb_status *status
 );
 kpb_result kpb_terminate(const char *runtime_dir, const char *session_id);
+/* Opt-in descendant cessation, bound to the session's started_millis.
+ * KPB_OK proves the broker's pre-established descendant domain has no live
+ * children, including adopted setsid/double-fork descendants. Legacy brokers
+ * return KPB_ERR_UNSUPPORTED without falling back to ordinary termination.
+ * A timeout/disconnect is UNKNOWN, never permission to start a replacement.
+ * timeout_millis <= 0 selects 3500ms. The server retains pending descendants
+ * after a failed/expired caller request and continues cleanup independently. */
+kpb_result kpb_drain_expect(
+    const char *runtime_dir, const char *session_id,
+    uint64_t expected_started_millis, int timeout_millis
+);
 /* Bounded forms (KPB_ERR_TIMEOUT on expiry); the plain forms above use
  * KPB_DEFAULT_TIMEOUT_MILLIS.  A terminate that times out after its request
  * was partially or completely sent (KPB_ERR_TIMEOUT) may still be acted on by

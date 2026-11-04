@@ -653,6 +653,7 @@ usage(FILE *stream) {
         "  kitty-pty-broker [GLOBAL OPTIONS] list [--json] [--all]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] status ID [--json]\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] kill ID [--expect-started MILLIS]\n"
+        "  kitty-pty-broker [GLOBAL OPTIONS] drain ID --expect-started MILLIS\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] resolve SELECTOR [--attached|--detached] --json\n"
         "  kitty-pty-broker [GLOBAL OPTIONS] end SELECTOR [--attached|--detached] --json\n"
         "                   --resolved-id ID --expect-started MILLIS (reserved frontend transport)\n"
@@ -677,6 +678,9 @@ usage(FILE *stream) {
         "            only the session that started then, atomically: exit 3 if the id now\n"
         "            names a different session, 5 if the broker is too old to check; either\n"
         "            way nothing was done\n"
+        "  drain     identity-bound termination with descendant cessation acknowledgment;\n"
+        "            exit 0 only after all owned descendants have exited. Old brokers\n"
+        "            refuse with exit 5; a timeout is unconfirmed, never safe to resume.\n"
         "  reaped    journals kept from sessions whose broker died; `reaped path ID` prints\n"
         "            the newest journal for ID\n"
         "  tui       interactive session manager (Enter attach, o observe, x end, q quit)\n"
@@ -1120,6 +1124,31 @@ main(int argc, char **argv) {
     }
     if (strcmp(command, "resolve") == 0 || strcmp(command, "end") == 0) {
         return selector_command(command, runtime_dir, argc, argv, index);
+    }
+    if (strcmp(command, "drain") == 0) {
+        kpb_result result;
+        uint64_t expected;
+        const char *end;
+        const char *session_id;
+        if (index + 3 != argc || strcmp(argv[index + 1], "--expect-started") != 0 ||
+            parse_u64_prefix(argv[index + 2], &expected, &end) != 0 || *end != '\0') {
+            usage(stderr);
+            return 2;
+        }
+        session_id = argv[index];
+        if (require_runtime(runtime_dir) != 0) return 1;
+        result = kpb_drain_expect(runtime_dir, session_id, expected, timeout_millis);
+        if (result == KPB_ERR_MISMATCH) return 3;
+        if (result == KPB_ERR_UNSUPPORTED) {
+            fprintf(stderr, "kitty-pty-broker: descendant cessation unsupported; nothing was done\n");
+            return 5;
+        }
+        if (result == KPB_ERR_NOT_SENT) return 6;
+        if (result == KPB_ERR_TIMEOUT) {
+            fprintf(stderr, "kitty-pty-broker: descendant cessation unconfirmed; do not start a replacement\n");
+            return 1;
+        }
+        return report_session_result("drain session", runtime_dir, session_id, result);
     }
     if (strcmp(command, "kill") == 0) {
         kpb_result result;
