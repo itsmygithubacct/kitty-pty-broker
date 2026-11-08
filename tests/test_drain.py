@@ -227,5 +227,91 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(self.cli('drain', 'owned', '--expect-started', 'bad').returncode, 2)
 
 
+ORPHANS = r'''
+import os,sys,time
+from pathlib import Path
+root=Path(sys.argv[1]); count=int(sys.argv[2])
+for index in range(count):
+ middle=os.fork()
+ if middle==0:
+  if os.fork()==0:
+   time.sleep(.2)
+   (root/('orphan-%d'%index)).write_text('%d %d'%(os.getpid(),os.getppid()))
+   os._exit(0)
+  os._exit(0)
+ os.waitpid(middle,0)
+(root/'command.pid').write_text(str(os.getpid()))
+time.sleep(30)
+'''
+
+
+@unittest.skipUnless(sys.platform.startswith('linux') and hasattr(os, 'pidfd_open'), 'Linux pidfds required')
+class AdoptedDescendantTests(unittest.TestCase):
+    """A live session reaps the descendants its subreaper boundary adopts."""
+    COUNT = 16
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='kpbreap-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.rt = self.root / 'rt'
+        self.rt.mkdir(mode=0o700)
+        self.env = {'PATH': '/usr/bin:/bin', 'HOME': str(self.root), 'LANG': 'C.UTF-8'}
+        self.broker = None
+        self.addCleanup(self.stop)
+
+    def cli(self, *args):
+        return subprocess.run([CLI, '--runtime-dir', str(self.rt), *args],
+                              env=self.env, stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=6)
+
+    def stop(self):
+        if self.broker is None:
+            return
+        self.cli('kill', 'orphans')
+        if not select.select([self.broker], [], [], 5)[0]:
+            signal.pidfd_send_signal(self.broker, signal.SIGKILL)
+            assert select.select([self.broker], [], [], 5)[0], 'owned broker cessation unconfirmed'
+        os.close(self.broker)
+
+    @staticmethod
+    def state(pid):
+        try:
+            return Path('/proc', str(pid), 'stat').read_text().rsplit(') ', 1)[1].split()[0]
+        except FileNotFoundError:
+            return None
+
+    def zombies(self, broker_pid):
+        path = Path('/proc', str(broker_pid), 'task', str(broker_pid), 'children')
+        return [pid for pid in map(int, path.read_text().split()) if self.state(pid) == 'Z']
+
+    def test_adopted_descendants_are_reaped_while_the_session_lives(self):
+        result = self.cli('run', '--id', 'orphans', '--', sys.executable, '-c', ORPHANS,
+                          str(self.root), str(self.COUNT))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.cli('status', 'orphans', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        broker_pid = json.loads(result.stdout)['broker_pid']
+        self.broker = os.pidfd_open(broker_pid)
+        until = time.monotonic() + 5
+        orphans = [self.root / ('orphan-%d' % index) for index in range(self.COUNT)]
+        while time.monotonic() < until and not all(path.exists() for path in orphans):
+            time.sleep(.02)
+        records = [tuple(map(int, path.read_text().split())) for path in orphans]
+        # Control: every orphan really was adopted by this broker, not by init.
+        self.assertEqual({parent for _, parent in records}, {broker_pid})
+        command = int((self.root / 'command.pid').read_text())
+        # Each orphan exits right after writing its record. Reaped means gone from
+        # /proc altogether; a broker that only waits for its command leaves them 'Z'.
+        until = time.monotonic() + 3
+        while time.monotonic() < until and any(self.state(pid) for pid, _ in records):
+            time.sleep(.02)
+        self.assertEqual({pid: self.state(pid) for pid, _ in records if self.state(pid)}, {})
+        self.assertEqual(self.zombies(broker_pid), [])
+        # Reaping adopted descendants leaves the original command running.
+        self.assertIn(self.state(command), ('S', 'R'))
+        self.assertEqual(self.cli('status', 'orphans').returncode, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

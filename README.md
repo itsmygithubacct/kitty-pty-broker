@@ -427,6 +427,11 @@ the same boundary. Only `waitpid(-1, WNOHANG)` reporting `ECHILD`, after the
 original command was reaped, permits an acknowledgment. A snapshot of process
 IDs or disappearance of the original process group is insufficient.
 
+The same boundary means a live session adopts descendants whose parents exit
+first. The broker reaps each one as it exits, while the session runs, so none
+is left a zombie; living descendants stay in the domain until they exit or are
+drained.
+
 The appended wire frame `DRAIN` (16) carries the existing 8-byte start identity.
 Old brokers refuse it without terminating anything; there is no legacy fallback.
 Identity mismatch exits 3, unsupported operation exits 5, and a request that was

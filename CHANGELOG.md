@@ -1,5 +1,18 @@
 # Changelog
 
+## Live sessions reap adopted descendants
+
+A Linux broker establishes a subreaper boundary before spawning its command, so
+a descendant whose parent exits first (a backgrounded job, a tool's helper, a
+double-forked daemon) is adopted by the broker. The server loop waited only for
+the original command, so every adopted descendant stayed a zombie until the
+session ended: one per orphaned command, without bound, for the life of the
+pane (about 12,600 under one long-lived agent pane). The loop now collects every
+exited child without waiting, still records the original command's status, and
+leaves living descendants alone, so drain's cessation test is unchanged. No
+wire, API or metadata changes. `AdoptedDescendantTests` in tests/test_drain.py
+fails on the old loop with 16 zombies.
+
 ## Bounded request transport successor
 
 Connect, send and response now share the caller's absolute monotonic deadline,

@@ -1938,6 +1938,38 @@ reap_owned_children(server_state *server, uint64_t until) {
     return false;
 }
 
+/* Collect every child that has already exited, without waiting.  Behind the
+ * subreaper boundary, a descendant whose parent exits first (a backgrounded
+ * job, a tool's helper, a double-forked daemon) is adopted by this broker.
+ * Waiting only for the original command left each adopted descendant a
+ * zombie until the session ended: one per orphaned command, without bound,
+ * for the life of the pane.  The original command's status is recorded
+ * exactly as before.  This runs only from the server loop, never inside
+ * signal_owned_children's enumeration, so a listed PID still cannot be
+ * recycled before its pidfd is opened; living descendants are untouched, so
+ * drain's ECHILD test still means the whole domain has ceased.  Without the
+ * boundary nothing is adopted, and only the original command is waited for. */
+static int
+reap_exited_children(server_state *server) {
+    for (;;) {
+        int status;
+        pid_t pid;
+        if (!server->tracks_descendants && server->child_reaped) return 0;
+        pid = waitpid(server->tracks_descendants ? -1 : server->child_pid, &status, WNOHANG);
+        if (pid > 0) {
+            if (pid == server->child_pid) {
+                server->child_reaped = true;
+                server->child_wait_status = status;
+            }
+            continue;
+        }
+        if (pid == 0) return 0;
+        if (errno == EINTR) continue;
+        if (errno == ECHILD && server->child_reaped) return 0;
+        return -1;
+    }
+}
+
 static bool
 drain_owned_children(server_state *server, uint64_t until) {
     while (monotonic_millis() < until) {
@@ -2536,16 +2568,7 @@ server_loop(server_state *server) {
         uint32_t generations[KPB_OBSERVER_MAX];
         size_t slot;
         int result;
-        if (!server->child_reaped) {
-            pid_t waited = waitpid(server->child_pid, &child_status, WNOHANG);
-            if (waited == server->child_pid) {
-                server->child_reaped = true;
-                server->child_wait_status = child_status;
-            } else if (waited < 0) {
-                if (errno == EINTR) continue;
-                return -1;
-            }
-        }
+        if (reap_exited_children(server) != 0) return -1;
         child_exited = server->child_reaped;
         child_status = server->child_wait_status;
         if (server->drain_requested && !server->drain_complete) {
