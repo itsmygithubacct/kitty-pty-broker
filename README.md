@@ -7,8 +7,8 @@ placing a terminal multiplexer in the byte stream.
 Ships in Plebian-OS 0.2.3 as a submodule of
 [Kilix](https://github.com/itsmygithubacct/kilix#readme)
 (`third_party/kitty-pty-broker`). Kilix builds it on demand and runs each
-pane under a broker, so closing or crashing Kilix detaches panes instead of
-ending them; `kilix pty` is the user-facing command.
+normal pane under a broker, so closing or crashing Kilix detaches panes instead
+of ending them; `kilix pty` is the user-facing command.
 
 ## What it does
 
@@ -172,7 +172,8 @@ install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme
 running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
 desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
 It ships inside Kilix as the `third_party/kitty-pty-broker` submodule and keeps
-every Kilix pane alive across frontend restarts. The map of every repository
+each normal Kilix pane alive across frontend restarts (`KILIX_PTY_BROKER=0`
+turns this off). The map of every repository
 and how it ships is on the
 [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
