@@ -121,6 +121,8 @@ Global options `--runtime-dir DIR` and `--timeout SECONDS` go before the
 command. The runtime directory, on-disk layout, timeouts, JSON fields, the
 TUI keys, reaped journals and exit statuses are in [docs/cli.md](docs/cli.md).
 
+![`kilix pty` listing the broker sessions behind four panes](docs/images/kilix-pty-list.png)
+
 ## How it works
 
 ```
