@@ -23,9 +23,11 @@ def mark(name):
  (root/name).write_text(json.dumps({'pid':os.getpid(),'start':int(fields[19])}))
 def writer():
  signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ signal.signal(signal.SIGHUP,signal.SIG_IGN)
  os.setsid()
  if mode=='double' and os.fork(): os._exit(0)
  mark('writer.json')
+ if mode=='stopped': os.kill(os.getpid(),signal.SIGSTOP)
  until=time.monotonic()+20
  while time.monotonic()<until:
   with (root/'writes').open('a') as out: out.write('x');out.flush()
@@ -39,7 +41,7 @@ signal.signal(signal.SIGTERM,late if mode=='late' else signal.SIG_IGN)
 mark('ready.json')
 until=time.monotonic()+20
 while time.monotonic()<until:
- if mode in ('detached','double') and (root/'fork-now').exists():
+ if mode in ('detached','double','stopped') and (root/'fork-now').exists():
   if not os.fork(): writer()
   break
  time.sleep(.01)
@@ -180,6 +182,27 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(self.cli('kill', 'owned').returncode, 0)
         self.assertFalse(select.select([self.initial], [], [], 0)[0])
         self.assertEqual(self.drain(started).returncode, 0)
+
+    def test_legacy_kill_reaps_stopped_and_detached_descendants(self):
+        # Each case owns its runtime, PID records and cleanup pidfds.
+        for mode in ('detached', 'double', 'stopped'):
+            with self.subTest(mode=mode):
+                self.spawn(mode)
+                (self.root / 'fork-now').touch()
+                writer = self.capture(wait_file(self.root / 'writer.json'))
+                self.assertIsNotNone(writer)
+                self.assertEqual(self.cli('kill', 'owned').returncode, 0)
+                self.assertTrue(select.select([writer], [], [], 5)[0],
+                                'legacy close left a descendant alive')
+                self.assertTrue(select.select([self.broker], [], [], 5)[0])
+                # Exit is insufficient: the owning broker must reap it too.
+                record = json.loads((self.root / 'writer.json').read_text())
+                self.assertFalse(Path('/proc', str(record['pid'])).exists())
+                self.cleanup_owned()
+                self.pidfds = []
+                self.broker = None
+                for name in ('fork-now', 'writer.json', 'ready.json', 'writes'):
+                    (self.root / name).unlink(missing_ok=True)
 
     def test_legacy_peer_refuses_new_frame_without_fallback(self):
         directory = self.rt / 'sessions' / 'owned'

@@ -1872,9 +1872,16 @@ signal_child_session(pid_t session_id, int signal_number) {
 static void
 request_termination(server_state *server) {
     if (server->terminate_requested || server->drain_requested) return;
-    server->terminate_requested = true;
-    server->terminate_deadline = monotonic_millis() + 1500;
-    signal_child_session(server->child_pid, SIGTERM);
+    if (server->tracks_descendants) {
+        /* Legacy kill still acknowledges the request immediately, but keep the
+         * subreaper alive until detached and stopped descendants are reaped. */
+        server->drain_requested = true;
+        server->drain_kill_after = monotonic_millis() + 1500;
+    } else {
+        server->terminate_requested = true;
+        server->terminate_deadline = monotonic_millis() + 1500;
+        signal_child_session(server->child_pid, SIGTERM);
+    }
 }
 
 /* The server is single-threaded and never reaps while reading this list.
