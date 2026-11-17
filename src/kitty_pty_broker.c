@@ -1889,6 +1889,81 @@ request_termination(server_state *server) {
  * wait for it, so it cannot be recycled between enumeration and pidfd_open.
  * Killing direct children makes their detached descendants become our direct
  * children through the subreaper boundary established before forkpty. */
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+/* Tests only: take the /proc scan below even where the children file exists.
+ * Nothing in the library or the CLI sets it. */
+static bool force_child_scan;
+
+static int
+signal_one_owned_child(long pid, int signo) {
+    int fd;
+    if (pid <= 0 || pid > INT_MAX) { errno = EINVAL; return -1; }
+    fd = (int)syscall(SYS_pidfd_open, (pid_t)pid, 0);
+    if (fd < 0) return errno == ESRCH ? 0 : -1;
+    if (syscall(SYS_pidfd_send_signal, fd, signo, NULL, 0) < 0 && errno != ESRCH) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+/* The parent field of /proc/<pid>/stat.  The command name is in parentheses
+ * and may itself contain ')', so the fields start after the LAST one. */
+static int
+read_parent_pid(long pid, long *parent) {
+    char path[64], buffer[512];
+    const char *fields;
+    ssize_t length;
+    char state;
+    int fd;
+    snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    length = read(fd, buffer, sizeof buffer - 1);
+    close(fd);
+    if (length <= 0) return -1;
+    buffer[length] = '\0';
+    fields = strrchr(buffer, ')');
+    if (!fields || sscanf(fields + 1, " %c %ld", &state, parent) != 2) return -1;
+    return 0;
+}
+
+/* Kernels built without CONFIG_PROC_CHILDREN (some vendor board kernels)
+ * have no children file.  The same set is then every process in /proc whose
+ * parent is this broker.  The guarantee the children file gives still holds:
+ * a process whose parent is us is our child, and it stays one (at worst a
+ * zombie) until we reap it, which never happens during this enumeration, so
+ * the PID cannot be recycled before pidfd_open names it.  The broker is
+ * single-threaded, so the thread-group parent recorded in stat is us. */
+static int
+signal_owned_children_by_scan(int signo, uint64_t until) {
+    DIR *directory = opendir("/proc");
+    struct dirent *entry;
+    long self = (long)getpid();
+    unsigned int count = 0;
+    if (!directory) return -1;
+    while (count < 4096 && monotonic_millis() < until) {
+        char *end = NULL;
+        long pid, parent;
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno) { closedir(directory); return -1; }
+            break;
+        }
+        errno = 0;
+        pid = strtol(entry->d_name, &end, 10);
+        if (errno || !end || *end || pid <= 0 || pid > INT_MAX) continue;
+        if (read_parent_pid(pid, &parent) != 0 || parent != self) continue;
+        count++;
+        if (signal_one_owned_child(pid, signo) != 0) { closedir(directory); return -1; }
+    }
+    closedir(directory);
+    return 0;
+}
+#endif
+
 static int
 signal_owned_children(int signo, uint64_t until) {
 #if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
@@ -1896,22 +1971,16 @@ signal_owned_children(int signo, uint64_t until) {
     FILE *children;
     long pid;
     unsigned int count = 0;
+    if (force_child_scan) return signal_owned_children_by_scan(signo, until);
     snprintf(path, sizeof path, "/proc/self/task/%ld/children", (long)getpid());
     children = fopen(path, "re");
-    if (!children) return -1;
+    if (!children) {
+        if (errno == ENOENT) return signal_owned_children_by_scan(signo, until);
+        return -1;
+    }
     while (count++ < 4096 && monotonic_millis() < until &&
            fscanf(children, "%ld", &pid) == 1) {
-        int fd;
-        if (pid <= 0 || pid > INT_MAX) { fclose(children); return -1; }
-        fd = (int)syscall(SYS_pidfd_open, (pid_t)pid, 0);
-        if (fd < 0) {
-            if (errno == ESRCH) continue;
-            fclose(children); return -1;
-        }
-        if (syscall(SYS_pidfd_send_signal, fd, signo, NULL, 0) < 0 && errno != ESRCH) {
-            close(fd); fclose(children); return -1;
-        }
-        close(fd);
+        if (signal_one_owned_child(pid, signo) != 0) { fclose(children); return -1; }
     }
     if (ferror(children)) { fclose(children); return -1; }
     fclose(children);

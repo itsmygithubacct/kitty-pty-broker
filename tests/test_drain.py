@@ -304,9 +304,24 @@ class AdoptedDescendantTests(unittest.TestCase):
         except FileNotFoundError:
             return None
 
-    def zombies(self, broker_pid):
+    @staticmethod
+    def parent(pid):
+        try:
+            return int(Path('/proc', str(pid), 'stat').read_text().rsplit(') ', 1)[1].split()[1])
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def children(self, broker_pid):
+        # Kernels without CONFIG_PROC_CHILDREN have no children file; the same
+        # set is every process whose parent is the broker, as the broker finds it.
         path = Path('/proc', str(broker_pid), 'task', str(broker_pid), 'children')
-        return [pid for pid in map(int, path.read_text().split()) if self.state(pid) == 'Z']
+        if path.exists():
+            return list(map(int, path.read_text().split()))
+        return [int(entry.name) for entry in Path('/proc').iterdir()
+                if entry.name.isdigit() and self.parent(int(entry.name)) == broker_pid]
+
+    def zombies(self, broker_pid):
+        return [pid for pid in self.children(broker_pid) if self.state(pid) == 'Z']
 
     def test_adopted_descendants_are_reaped_while_the_session_lives(self):
         result = self.cli('run', '--id', 'orphans', '--', sys.executable, '-c', ORPHANS,

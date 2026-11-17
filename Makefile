@@ -20,6 +20,7 @@ SHARED_LIB := $(BUILD_DIR)/libkitty-pty-broker.so
 CLI := $(BUILD_DIR)/kitty-pty-broker
 TEST := $(BUILD_DIR)/test-broker
 RECORDED_TEST := $(BUILD_DIR)/test-recorded
+CHILDREN_TEST := $(BUILD_DIR)/test-children
 SELECTOR_TRANSPORT := $(BUILD_DIR)/selector-transport
 BENCHMARK := $(BUILD_DIR)/benchmark-broker
 FUZZ := $(BUILD_DIR)/fuzz-protocol
@@ -64,6 +65,9 @@ $(TEST): $(TEST_OBJECT) $(SHARED_LIB)
 $(RECORDED_TEST): tests/test_recorded.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_recorded.c -o "$@" $(LDLIBS)
 
+$(CHILDREN_TEST): tests/test_children.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_children.c -o "$@" $(LDLIBS)
+
 $(BENCHMARK): $(BENCHMARK_OBJECT) $(SHARED_LIB)
 	$(CC) $(LDFLAGS) -Wl,-rpath,'$$ORIGIN' -o "$@" $(BENCHMARK_OBJECT) -L$(BUILD_DIR) -lkitty-pty-broker $(LDLIBS)
 
@@ -72,11 +76,12 @@ TEST_ENVIRONMENT ?=
 $(SELECTOR_TRANSPORT): tests/selector_transport.c src/kitty_pty_broker.c src/selector.inc src/internal.h src/protocol.h include/kitty_pty_broker.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/selector_transport.c -o "$@" $(LDLIBS)
 
-test: $(TEST) $(RECORDED_TEST) $(SELECTOR_TRANSPORT) $(CLI)
+test: $(TEST) $(RECORDED_TEST) $(CHILDREN_TEST) $(SELECTOR_TRANSPORT) $(CLI)
 	python3 tests/test_sanitizer_gate.py
 	sh tests/test_docs.sh
 	$(TEST_ENVIRONMENT) "$(TEST)"
 	$(TEST_ENVIRONMENT) "$(RECORDED_TEST)"
+	$(TEST_ENVIRONMENT) "$(CHILDREN_TEST)"
 	$(TEST_ENVIRONMENT) python3 tests/test_recorded.py "$(CLI)"
 	$(TEST_ENVIRONMENT) python3 tests/test_selector.py "$(CLI)"
 	$(TEST_ENVIRONMENT) python3 tests/test_drain.py "$(CLI)"
