@@ -35,6 +35,10 @@ def writer():
  os._exit(0)
 def late(signum,frame):
  signal.signal(signal.SIGTERM,signal.SIG_IGN)
+ # Before the fork: this process leads the pane's session, so its exit below
+ # hangs up the foreground group, which still holds the new child until it
+ # calls setsid(). A child that had not yet ignored SIGHUP died of it.
+ signal.signal(signal.SIGHUP,signal.SIG_IGN)
  if not os.fork(): writer()
  os._exit(0)
 signal.signal(signal.SIGTERM,late if mode=='late' else signal.SIG_IGN)

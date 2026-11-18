@@ -1484,6 +1484,9 @@ test_v1_peer_sees_only_version_1_headers(void) {
     size_t index;
     bool saw_exit = false;
     bool first = true;
+    bool sent_eot = false;
+    unsigned char echoed[64];
+    size_t echoed_size = 0;
     int fd;
 
     spawn_echo_session("rawv1", 0);
@@ -1499,9 +1502,13 @@ test_v1_peer_sees_only_version_1_headers(void) {
     raw_send_frame(fd, KPB_FRAME_ATTACH, &size, sizeof size);
     /* Drive the pane to completion so this terminates without a timeout: one
      * line to echo, then EOT to close the child's stdin.  Half-closing the
-     * socket instead would make the broker drop us as a departed client. */
+     * socket instead would make the broker drop us as a departed client.
+     * EOT goes only after the pane has echoed the line.  Sent together, the
+     * broker writes both in one write(), and some kernels (seen on 5.10.43)
+     * lose an EOF that arrives with the preceding line when the reader takes
+     * one byte at a time, as the shell's `read` does: the pane then never
+     * exits and this test hangs. */
     raw_send_frame(fd, KPB_FRAME_INPUT, "done\n", 5);
-    raw_send_frame(fd, KPB_FRAME_INPUT, "\004", 1);
 
     while (!saw_exit) {
         kpb_frame_header header;
@@ -1523,9 +1530,25 @@ test_v1_peer_sees_only_version_1_headers(void) {
             size_t wanted = payload_size < sizeof scratch ? payload_size : sizeof scratch;
             CHECK(raw_read_exactly(fd, scratch, wanted));
             payload_size -= (uint32_t)wanted;
+            if (type == KPB_FRAME_OUTPUT && !sent_eot) {
+                /* Keep the newest output, enough to see the echo across frames. */
+                size_t keep = wanted < sizeof echoed ? wanted : sizeof echoed;
+                if (echoed_size + keep > sizeof echoed) {
+                    size_t drop = echoed_size + keep - sizeof echoed;
+                    memmove(echoed, echoed + drop, echoed_size - drop);
+                    echoed_size -= drop;
+                }
+                memcpy(echoed + echoed_size, scratch + wanted - keep, keep);
+                echoed_size += keep;
+                if (memmem(echoed, echoed_size, "GOT=done:", 9)) {
+                    raw_send_frame(fd, KPB_FRAME_INPUT, "\004", 1);
+                    sent_eot = true;
+                }
+            }
         }
         if (type == KPB_FRAME_EXIT) saw_exit = true;
     }
+    CHECK(sent_eot);
     close(fd);
     for (index = 0; index < 3; index++) kpb_detach(&watchers[index]);
     /* This pane was driven to exit, so it reaps itself; asking the broker to
