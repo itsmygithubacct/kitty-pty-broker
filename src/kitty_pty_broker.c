@@ -10,7 +10,13 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+#include <libutil.h>
+#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -28,6 +34,10 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#endif
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -681,6 +691,10 @@ create_listener(const char *socket_path) {
     return fd;
 }
 
+/* The control socket's 0700 directory is the first barrier; the peer's
+ * credentials are the second, and must never be skipped: a platform without
+ * SO_PEERCRED (FreeBSD, macOS, the other BSDs) answers through getpeereid(),
+ * and a peer whose credentials cannot be read is refused. */
 static bool
 peer_is_owner(int fd) {
 #ifdef SO_PEERCRED
@@ -689,8 +703,10 @@ peer_is_owner(int fd) {
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) != 0) return false;
     return credentials.uid == geteuid();
 #else
-    (void)fd;
-    return true;
+    uid_t uid;
+    gid_t gid;
+    if (getpeereid(fd, &uid, &gid) != 0) return false;
+    return uid == geteuid();
 #endif
 }
 
@@ -1366,25 +1382,58 @@ apply_size(server_state *server, const kpb_wire_winsize *wire) {
     }
 }
 
+/* Signal every process of the shell's session, not only its process group:
+ * job control moves pipelines into their own groups.  Linux enumerates /proc;
+ * FreeBSD (no procfs by default) asks the kernel for the session's members. */
 static void
 signal_child_session(pid_t session_id, int signal_number) {
-    DIR *directory;
-    struct dirent *entry;
     if (session_id <= 0) return;
-    directory = opendir("/proc");
-    if (directory) {
-        while ((entry = readdir(directory))) {
-            char *end = NULL;
-            long value;
-            errno = 0;
-            value = strtol(entry->d_name, &end, 10);
-            if (errno || !end || *end || value <= 0 || value > INT32_MAX) continue;
-            if (getsid((pid_t)value) == session_id) {
-                (void)kill((pid_t)value, signal_number);
+#if defined(__FreeBSD__)
+    {
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, (int)session_id};
+        struct kinfo_proc *processes = NULL;
+        size_t length = 0;
+        int attempt;
+        for (attempt = 0; attempt < 4; attempt++) {
+            struct kinfo_proc *grown;
+            if (sysctl(mib, 4, NULL, &length, NULL, 0) != 0) break;
+            length += length / 4 + sizeof *processes;
+            grown = realloc(processes, length);
+            if (!grown) break;
+            processes = grown;
+            if (sysctl(mib, 4, processes, &length, NULL, 0) == 0) {
+                size_t index, count = length / sizeof *processes;
+                for (index = 0; index < count; index++) {
+                    if (processes[index].ki_sid == session_id &&
+                        processes[index].ki_pid > 0) {
+                        (void)kill(processes[index].ki_pid, signal_number);
+                    }
+                }
+                break;
             }
+            if (errno != ENOMEM) break;
         }
-        closedir(directory);
+        free(processes);
     }
+#else
+    {
+        DIR *directory = opendir("/proc");
+        struct dirent *entry;
+        if (directory) {
+            while ((entry = readdir(directory))) {
+                char *end = NULL;
+                long value;
+                errno = 0;
+                value = strtol(entry->d_name, &end, 10);
+                if (errno || !end || *end || value <= 0 || value > INT32_MAX) continue;
+                if (getsid((pid_t)value) == session_id) {
+                    (void)kill((pid_t)value, signal_number);
+                }
+            }
+            closedir(directory);
+        }
+    }
+#endif
     (void)killpg(session_id, signal_number);
 }
 

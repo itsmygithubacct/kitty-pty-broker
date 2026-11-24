@@ -1,4 +1,9 @@
+/* The BSDs expose SIGWINCH (and the other non-POSIX names this file needs)
+ * only while no strict-POSIX feature macro is set; glibc exposes it either way. */
+#if !defined(__FreeBSD__) && !defined(__DragonFly__) && !defined(__NetBSD__) && \
+    !defined(__OpenBSD__) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "tui.h"
 

@@ -68,10 +68,10 @@ git -C "$root" worktree add --detach "$old_tree" "$base" >/dev/null 2>&1 || {
     echo "could not create a worktree at $base" >&2
     exit 2
 }
-make -C "$root" BUILD_DIR="$new_build" --silent >/dev/null || {
+"${MAKE:-make}" -C "$root" BUILD_DIR="$new_build" --silent >/dev/null || {
     echo "current build failed" >&2; exit 2;
 }
-make -C "$old_tree" BUILD_DIR="$old_build" --silent >/dev/null || {
+"${MAKE:-make}" -C "$old_tree" BUILD_DIR="$old_build" --silent >/dev/null || {
     echo "base build failed" >&2; exit 2;
 }
 

@@ -8,7 +8,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#if defined(__FreeBSD__) || defined(__DragonFly__)
+#include <libutil.h>
+#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <util.h>
+#else
 #include <pty.h>
+#endif
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
